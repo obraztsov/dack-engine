@@ -51,3 +51,15 @@ reflect_schedule: "0 4 * * *"           # nightly 04:00 — "sleep-with-dreams"
 soul_repo: "."                          # the actor bundle on the box (holds stimuli/, SOUL.md, …)
 db_path: "dack.sqlite"                  # embedded SQLite queue (ephemeral; losing it loses only the queue)
 webhook_addr: "127.0.0.1:8787"          # localhost-only webhook listener (nothing public without a proxy)
+
+# Runtime bridge (Phase 4): the harness spawns `bun run bridge.ts` in this project per
+# invocation and drives it over stdio; the wall stays in the Rust responder. The bridge is a
+# small TS project that depends on `@gitlawb/openclaude` from npm (run `bun install` there).
+bridge_dir: "openclaude-bridge"
+# model: leave UNSET for an OpenAI-compatible gateway (opengateway/mimo, Ollama, …) — set the
+# model via OPENAI_MODEL in the env instead. `model:` here is only for SDK-catalog (Anthropic)
+# models; a gateway name passed as options.model is rejected by the SDK's model catalog.
+# model: "claude-haiku-4-5"
+# Env var NAMES forwarded into the bridge (values come from the harness env, never the YAML).
+# For opengateway: export OPENAI_API_KEY=ogw_live_…  OPENAI_BASE_URL=https://opengateway.gitlawb.com/v1  OPENAI_MODEL=mimo-v2.5-pro
+runtime_env: [OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL]

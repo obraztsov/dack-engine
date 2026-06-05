@@ -17,6 +17,7 @@
 //!   6. Express acts via skills, writes memory, returns; harness logs the outcome
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::bus::Bus;
 use crate::config::DackConfig;
@@ -24,6 +25,7 @@ use crate::error::Result;
 use crate::identity::IdentityProvider;
 use crate::model::baton::Baton;
 use crate::model::proposal::AgentOutput;
+use crate::model::runlog::{Outcome, RunLogEntry};
 use crate::model::stimulus::Stimulus;
 use crate::queue::Queue;
 use crate::repo::RepoHost;
@@ -51,14 +53,20 @@ impl Harness {
     /// (architecture §3). SCAFFOLD: the body wires the real calls; the runtime stub
     /// (`todo!`) lands in Phase 4.
     pub async fn run(&self) -> Result<()> {
-        while let Some(stimulus) = self.queue.next().await? {
-            if let Err(e) = self.dispatch(stimulus).await {
-                // logging-not-rollback (PRD §7.5): a failed run is a tagged RunLog entry,
-                // never a crash of the loop. Phase 7 records the error entry here.
-                eprintln!("dispatch error: {e}");
+        loop {
+            match self.queue.next().await? {
+                Some(stimulus) => {
+                    if let Err(e) = self.dispatch(stimulus).await {
+                        // logging-not-rollback (PRD §7.5): a failed run is a logged line,
+                        // never a crash of the loop. Phase 7 records a tagged error entry.
+                        eprintln!("dispatch error: {e}");
+                    }
+                }
+                // Daemon: the duck sleeps between stimuli, it doesn't exit. Poll the queue
+                // (single-flight, so a tight wake-on-enqueue isn't needed at this scale).
+                None => tokio::time::sleep(Duration::from_millis(500)).await,
             }
         }
-        Ok(())
     }
 
     async fn dispatch(&self, stimulus: Stimulus) -> Result<()> {
@@ -142,20 +150,29 @@ impl Harness {
 
     async fn write_perceive_runlog(
         &self,
-        _stimulus: &Stimulus,
-        _out: &AgentOutput,
+        stimulus: &Stimulus,
+        out: &AgentOutput,
     ) -> Result<String> {
-        // Phase 7: assemble RunLogEntry (raw stimulus in a delimited-untrusted block),
-        // append via the harness-authored writer, return its runlog_ref.
-        self.runlog
-            .append(&todo_entry())
-            .await
+        // The harness authors the record (PRD §7.5) — the agent never writes its own runlog.
+        // Phase 7 enriches this (raw stimulus in a delimited-untrusted block, captured
+        // tool-call decisions, error tagging); Phase 4 records the essential mapping.
+        let entry = RunLogEntry {
+            run_id: format!("run-{}", stimulus.id.0),
+            stimulus_id: stimulus.id.clone(),
+            state: ConsciousnessState::Perceive,
+            context_summary: format!(
+                "source={} type={} directive_tier={:?} payload_tier={:?}",
+                stimulus.source, stimulus.type_, stimulus.directive_tier, stimulus.payload_tier
+            ),
+            baton: None,
+            raw_stimulus: stimulus.payload.to_string(),
+            tool_calls: Vec::new(),
+            output: Some(out.clone()),
+            outcome: Outcome::Ok,
+            timestamp: stimulus.received_at,
+        };
+        self.runlog.append(&entry).await
     }
-}
-
-// Placeholder until Phase 7 builds the real entry; isolated so `dispatch` reads cleanly.
-fn todo_entry() -> crate::model::runlog::RunLogEntry {
-    todo!("Phase 7: construct the RunLogEntry from stimulus + output")
 }
 
 /// Build the Baton from Perceive's output (PRD §6.4). Pure + testable: the firebreak's
@@ -244,5 +261,74 @@ mod tests {
         assert_eq!(baton.payload_tier, TrustTier::Public);
         assert_eq!(baton.directive_tier, TrustTier::SelfTier);
         assert_eq!(baton.refs.get("in_reply_to").unwrap(), "tweet_123");
+    }
+
+    /// The dispatch wiring (Phase 4), offline against a mock bridge: a stimulus runs
+    /// Perceive, the harness authors a runlog, and a Perceive that proposes a transition
+    /// opens a **fresh** Express invocation. The mock counts invocations via a file.
+    #[tokio::test]
+    async fn dispatch_runs_perceive_then_opens_express_and_logs() {
+        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::queue::InMemoryQueue;
+        use crate::repo::git::PlainGitRepo;
+        use crate::runlog::FileRunLog;
+        use crate::runtime::openclaude::OpenClaudeClient;
+        use std::collections::HashMap;
+
+        let tmp = std::env::temp_dir().join(format!("dack-dispatch-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        let counter = tmp.join("invocations");
+        let script = tmp.join("mock.sh");
+        // Each spawn bumps the counter, then submits a result proposing Perceive→Express.
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n\
+             echo x >> \"$MOCK_COUNTER\"\n\
+             read invoke\n\
+             printf '{\"kind\":\"result\",\"output\":{\"thought\":\"t\",\"proposal\":{\"intent\":\"reply\",\"gist\":\"g\"},\"transition\":{\"to_state\":\"express\"}}}\\n'\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let mut env = HashMap::new();
+        env.insert("MOCK_COUNTER".to_string(), counter.to_string_lossy().to_string());
+        if let Ok(p) = std::env::var("PATH") {
+            env.insert("PATH".to_string(), p);
+        }
+
+        let config = Arc::new(DackConfig::from_yaml("operator_did: \"did:x\"").unwrap());
+        let queue: Arc<dyn Queue> = Arc::new(InMemoryQueue::new());
+        let harness = Harness {
+            config: config.clone(),
+            queue: queue.clone(),
+            bus: Arc::new(Bus::new(config.clone(), queue.clone())),
+            runtime: Arc::new(OpenClaudeClient {
+                command: vec!["/bin/sh".into(), script.to_string_lossy().into()],
+                cwd: None,
+                env,
+                model: None,
+            }),
+            repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
+            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
+        };
+
+        harness.dispatch(poisoned_stimulus()).await.unwrap();
+
+        // Perceive AND a fresh Express both fired (the transition was honored).
+        let invocations = std::fs::read_to_string(&counter).unwrap().lines().count();
+        assert_eq!(invocations, 2, "Perceive then a fresh Express");
+        // The harness authored a runlog entry for the Perceive run.
+        assert!(
+            std::fs::read_dir(tmp.join("runlogs")).unwrap().next().is_some(),
+            "a runlog file was written"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }

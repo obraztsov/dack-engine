@@ -5,6 +5,7 @@
 //! `operator_signed` tier, signed by the operator DID — so the trust model is uniform
 //! (operator instructions are *just* the highest-trust stimulus, not a special path).
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -16,7 +17,15 @@ use crate::bus::Bus;
 use crate::config::DackConfig;
 use crate::error::{DackError, Result};
 use crate::harness::ingest::{spawn_stimuli_watcher, Ingestor};
+use crate::harness::Harness;
+use crate::identity::gitlawb::GitlawbIdentity;
+use crate::identity::IdentityProvider;
 use crate::queue::{Queue, SqliteQueue};
+use crate::repo::git::PlainGitRepo;
+use crate::repo::RepoHost;
+use crate::runlog::{FileRunLog, RunLogWriter};
+use crate::runtime::openclaude::OpenClaudeClient;
+use crate::runtime::RuntimeClient;
 use crate::sensor::{SensorRunner, SubprocessSensor};
 use crate::sources::{CronScheduler, CronWheel};
 use crate::stimuli::Registry;
@@ -116,6 +125,38 @@ async fn run(config_path: &str) -> Result<()> {
     let _watcher =
         spawn_stimuli_watcher(repo_root.clone(), registry.clone(), cron.clone(), webhook.clone())?;
 
+    // ── Consciousness loop (Phase 4): pop the queue → invoke states → the wall ──
+    // Shares the queue with ingestion (senses write, cognition reads). The runtime spawns
+    // the bun bridge per invocation; if it's unreachable, dispatch errors are logged and the
+    // loop stays up (logging-not-rollback). repo/identity are wired but inert until Phase 5/6.
+    let runtime: Arc<dyn RuntimeClient> = Arc::new(OpenClaudeClient::bun_bridge(
+        &config.bridge_dir,
+        bridge_env(&config),
+        config.model.clone(),
+    ));
+    let runlog: Arc<dyn RunLogWriter> = Arc::new(FileRunLog::new(repo_root.join("runlogs")));
+    let repo: Arc<dyn RepoHost> = Arc::new(PlainGitRepo::new(&config.soul_repo, &config.operator_did));
+    let identity: Arc<dyn IdentityProvider> =
+        Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await?);
+    let harness = Arc::new(Harness {
+        config: config.clone(),
+        queue: queue.clone(),
+        bus: bus.clone(),
+        runtime,
+        repo,
+        identity,
+        runlog,
+    });
+    tokio::spawn({
+        let h = harness.clone();
+        async move {
+            if let Err(e) = h.run().await {
+                eprintln!("dack: consciousness loop stopped: {e}");
+            }
+        }
+    });
+    eprintln!("dack: consciousness loop up (queue → Perceive → wall → Express).");
+
     let ingestor = Arc::new(Ingestor {
         repo_root,
         config,
@@ -124,9 +165,27 @@ async fn run(config_path: &str) -> Result<()> {
         sensor,
         registry,
     });
-    eprintln!("dack: ingestion up (cron+webhook → bus → queue). Consciousness loop = Phase 4.");
+    eprintln!("dack: ingestion up (cron+webhook → bus → queue).");
     ingestor.run(rx).await;
     Ok(())
+}
+
+/// Env forwarded into the runtime bridge: `PATH`/`HOME` + the provider/capability names the
+/// operator listed (`runtime_env` + `forwarded_env`). Values come from the harness env; the
+/// soul key is never among them (PRD §7.2).
+fn bridge_env(config: &DackConfig) -> HashMap<String, String> {
+    let mut env = HashMap::new();
+    for key in ["PATH", "HOME"] {
+        if let Ok(v) = std::env::var(key) {
+            env.insert(key.to_string(), v);
+        }
+    }
+    for name in config.runtime_env.iter().chain(config.forwarded_env.iter()) {
+        if let Ok(v) = std::env::var(name) {
+            env.insert(name.clone(), v);
+        }
+    }
+    env
 }
 
 /// `dack status` (PRD §8.3) — Phase 3 slice: queue depth + duty registration health. The

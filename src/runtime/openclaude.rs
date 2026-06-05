@@ -1,54 +1,348 @@
-//! OpenClaude runtime adapter (PRD §5, §6) — v1 implementation of [`RuntimeClient`],
-//! grounded against OpenClaude 0.15.0 (see `docs/VERIFICATION.md`).
+//! OpenClaude runtime adapter (PRD §5, §6) — v1 [`RuntimeClient`], grounded against
+//! OpenClaude 0.15.0 (`docs/VERIFICATION.md`).
 //!
-//! **Decision: build on the public SDK (`@gitlawb/openclaude/sdk`), no internal fork.**
-//! The SDK's `query()` exposes everything we need as a CI-guarded public surface:
-//! - `canUseTool(name, input, {toolUseID}) → {behavior}` — **the wall**. Secure-by-default:
-//!   omit it and ALL tools deny. We provide it; it forwards each request to our Rust
-//!   [`ActionResponder`](super::ActionResponder) and returns its decision.
-//! - `systemPrompt: {type:'custom', content}` — the SOUL + state prompt becomes the real
-//!   system prompt (not OpenClaude's default coding-assistant prompt).
-//! - `disallowedTools` — defense-in-depth tool restriction layered on the responder.
-//! - `model` per call; session continuity via `Query.sessionId` / the v2 session API.
-//! - `respondToPermission(toolUseId, decision)` — carries the `toolUseId` the lean gRPC
-//!   proto omitted, so correlation is exact.
+//! **Decision: public SDK, no fork; transport = NDJSON over stdio to a thin TS bridge.**
+//! OpenClaude is Node-side, so a small `bridge.ts` runs the SDK `query()` and this Rust
+//! client drives it as a child process: one line in (`invoke`), a stream of `permission`
+//! events out (each answered by the Rust [`ActionResponder`] — **the wall**), and a final
+//! `result` carrying the structured [`AgentOutput`] (the SDK has no public JSON-schema output,
+//! so the bridge instructs the model to make its FINAL message a JSON object and parses it —
+//! provider-agnostic, unlike an MCP `submit` tool which perturbed provider routing;
+//! live-verified Phase 4, `docs/VERIFICATION.md`).
 //!
-//! **Topology.** OpenClaude is the engine; this Rust harness is the client/approver. The
-//! SDK is Node-side, so a thin TS **bridge** runs `query()` and relays permission events
-//! to us. Transport between Rust and the bridge is a seam decision (localhost gRPC to
-//! match the PRD topology, or newline-JSON over stdio for simplicity) — finalized in
-//! Phase 4; either way the wall stays in this Rust responder.
+//! Why stdio, not gRPC: no `protoc`/`tonic`/ports, and a pipe to a child is *more* confined
+//! than a localhost socket (nothing binds, nothing impersonable). The approval channel
+//! (PRD §6.3) is the child's stdin/stdout — local by construction.
 //!
-//! SCAFFOLD: the bridge + transport land in Phase 4. The live SDK round-trip needs
-//! `npm install` in `openclaude-0.15.0/` + a provider key; the runbook is in the plan.
+//! The client is parameterized by its spawn `command`, so it drives the real `bun run
+//! bridge.ts` in production and a mock script in tests (same protocol, no network).
 
-use async_trait::async_trait;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Arc;
 
-use super::{ActionResponder, InvocationRequest, RuntimeClient};
-use crate::error::Result;
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command;
+
+use super::{ActionDecision, ActionRequest, ActionResponder, InvocationRequest, RuntimeClient};
+use crate::error::{DackError, Result};
 use crate::model::proposal::AgentOutput;
 
+/// Tools we deny at the engine boundary too (defense-in-depth over the wall, which already
+/// denies the `Shell` class in every state — `docs/VERIFICATION.md` "Memory access model").
+/// Raw shell bypasses path-gating, so it never belongs in a duck state.
+const ALWAYS_DISALLOWED: &[&str] = &["Bash", "PowerShell", "REPL", "KillShell"];
+
+/// Rust → bridge.
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ToBridge<'a> {
+    Invoke {
+        system_prompt: &'a str,
+        user_prompt: String,
+        disallowed_tools: Vec<String>,
+        allowed_tools: Option<Vec<String>>,
+        model: Option<&'a str>,
+    },
+    Decision {
+        tool_use_id: String,
+        allow: bool,
+        message: Option<String>,
+    },
+}
+
+/// bridge → Rust.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum FromBridge {
+    /// A `canUseTool` event: answer via the wall, then reply with a `Decision`.
+    Permission {
+        tool: String,
+        tool_use_id: String,
+        #[serde(default)]
+        input: serde_json::Value,
+    },
+    /// The run finished; `output` is the agent's `submit`ted structured proposal.
+    Result { output: AgentOutput },
+    /// The run failed inside the engine/bridge.
+    Error { message: String },
+    /// Diagnostic passthrough (surfaced to the harness log).
+    Log { message: String },
+}
+
 pub struct OpenClaudeClient {
-    /// Address of the TS bridge (e.g. `http://127.0.0.1:50051` for gRPC, or a spawned
-    /// child for stdio). MUST be localhost — the channel carries approvals (PRD §6.3).
-    pub endpoint: String,
+    /// How to spawn the bridge, e.g. `["bun", "run", "bridge.ts"]`. In tests, a mock script.
+    pub command: Vec<String>,
+    /// Working dir for the spawn (the `openclaude-bridge/` project in production).
+    pub cwd: Option<PathBuf>,
+    /// Env **overlaid** on the inherited process env for the bridge (provider key/base-URL +
+    /// `forwarded_env`). We inherit rather than clear because the engine's auth context can
+    /// live in ambient env the SDK requires; the soul key is never in env regardless
+    /// (PRD §7.2 — it is a `file://` secret ref).
+    pub env: HashMap<String, String>,
+    /// Model id passed to the SDK (e.g. `mimo-v2.5-pro`); `None` = bridge/provider default.
+    pub model: Option<String>,
+}
+
+impl OpenClaudeClient {
+    /// The production bridge: `bun run bridge.ts` inside the `openclaude-bridge/` project.
+    pub fn bun_bridge(bridge_dir: impl Into<PathBuf>, env: HashMap<String, String>, model: Option<String>) -> Self {
+        Self {
+            command: vec!["bun".into(), "run".into(), "bridge.ts".into()],
+            cwd: Some(bridge_dir.into()),
+            env,
+            model,
+        }
+    }
+
+    /// Render context blocks into one user turn with **visible trust framing** (PRD §5.3):
+    /// the trusted directive and the untrusted world data are fenced and labelled so the
+    /// model (and any reviewer) can see which is which. Framing lives here, in the harness.
+    fn render_blocks(blocks: &[super::ContextBlock]) -> String {
+        blocks
+            .iter()
+            .map(|b| {
+                let tag = if b.trusted {
+                    "TRUSTED-DIRECTIVE"
+                } else {
+                    "UNTRUSTED-WORLD-DATA"
+                };
+                format!("<{tag} label=\"{}\">\n{}\n</{tag}>", b.label, b.body)
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
 }
 
 #[async_trait]
 impl RuntimeClient for OpenClaudeClient {
     async fn invoke(
         &self,
-        _req: InvocationRequest,
-        _responder: Arc<dyn ActionResponder>,
+        req: InvocationRequest,
+        responder: Arc<dyn ActionResponder>,
     ) -> Result<AgentOutput> {
-        todo!(
-            "Phase 4: drive the SDK bridge — send {{prompt, systemPrompt(custom), model, \
-             disallowedTools, session}}; on each permission event build an ActionRequest \
-             {{tool, tool_use_id, input}} and answer via `responder` → respondToPermission; \
-             collect the structured AgentOutput (emitted via a `submit` tool the agent \
-             calls — the SDK has no public jsonSchema, so structured output rides a tool \
-             call we intercept)."
-        )
+        let (bin, args) = self
+            .command
+            .split_first()
+            .ok_or_else(|| DackError::Runtime("empty bridge command".into()))?;
+
+        let mut cmd = Command::new(bin);
+        cmd.args(args)
+            .envs(&self.env)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true);
+        if let Some(cwd) = &self.cwd {
+            cmd.current_dir(cwd);
+        }
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| DackError::Runtime(format!("spawn bridge {bin}: {e}")))?;
+
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| DackError::Runtime("bridge stdin unavailable".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| DackError::Runtime("bridge stdout unavailable".into()))?;
+        let mut lines = BufReader::new(stdout).lines();
+
+        // Send the one invocation. stdin stays open for decision replies.
+        let invoke = ToBridge::Invoke {
+            system_prompt: &req.system_prompt,
+            user_prompt: Self::render_blocks(&req.blocks),
+            disallowed_tools: ALWAYS_DISALLOWED.iter().map(|s| s.to_string()).collect(),
+            allowed_tools: None,
+            model: self.model.as_deref(),
+        };
+        write_line(&mut stdin, &invoke).await?;
+
+        // Drive the permission round-trips until the result arrives.
+        loop {
+            let line = lines
+                .next_line()
+                .await
+                .map_err(|e| DackError::Runtime(format!("bridge read: {e}")))?;
+            let Some(line) = line else {
+                return Err(DackError::Runtime("bridge closed before result".into()));
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<FromBridge>(&line)
+                .map_err(|e| DackError::Runtime(format!("bridge event parse: {e} (line: {line})")))?
+            {
+                FromBridge::Permission {
+                    tool,
+                    tool_use_id,
+                    input,
+                } => {
+                    let decision = responder
+                        .decide(&ActionRequest {
+                            tool,
+                            tool_use_id: tool_use_id.clone(),
+                            input,
+                        })
+                        .await;
+                    let (allow, message) = match decision {
+                        ActionDecision::Allow => (true, None),
+                        ActionDecision::Deny(why) => (false, Some(why)),
+                    };
+                    write_line(
+                        &mut stdin,
+                        &ToBridge::Decision {
+                            tool_use_id,
+                            allow,
+                            message,
+                        },
+                    )
+                    .await?;
+                }
+                FromBridge::Result { output } => return Ok(output),
+                FromBridge::Error { message } => return Err(DackError::Runtime(message)),
+                FromBridge::Log { message } => eprintln!("[bridge] {message}"),
+            }
+        }
+    }
+}
+
+async fn write_line<W: AsyncWriteExt + Unpin>(w: &mut W, msg: &ToBridge<'_>) -> Result<()> {
+    let mut buf = serde_json::to_vec(msg)?;
+    buf.push(b'\n');
+    w.write_all(&buf)
+        .await
+        .map_err(|e| DackError::Runtime(format!("bridge write: {e}")))?;
+    w.flush()
+        .await
+        .map_err(|e| DackError::Runtime(format!("bridge flush: {e}")))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::ContextBlock;
+    use crate::state::{default_spec, ConsciousnessState};
+    use std::sync::Mutex;
+
+    /// A recording responder: captures every tool it was asked about, returns a fixed verdict.
+    struct Recorder {
+        asked: Mutex<Vec<String>>,
+        allow: bool,
+    }
+    #[async_trait]
+    impl ActionResponder for Recorder {
+        async fn decide(&self, req: &ActionRequest) -> ActionDecision {
+            self.asked.lock().unwrap().push(req.tool.clone());
+            if self.allow {
+                ActionDecision::Allow
+            } else {
+                ActionDecision::Deny("test deny".into())
+            }
+        }
+    }
+
+    /// Write a `/bin/sh` mock bridge and return a client that spawns it.
+    fn mock_client(script: &str, tag: &str) -> OpenClaudeClient {
+        let dir = std::env::temp_dir().join(format!("dack-bridge-{}-{}", tag, std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mock.sh");
+        std::fs::write(&path, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut env = HashMap::new();
+        if let Ok(p) = std::env::var("PATH") {
+            env.insert("PATH".into(), p);
+        }
+        OpenClaudeClient {
+            command: vec!["/bin/sh".into(), path.to_string_lossy().into()],
+            cwd: None,
+            env,
+            model: None,
+        }
+    }
+
+    fn perceive_req() -> InvocationRequest {
+        InvocationRequest {
+            spec: default_spec(ConsciousnessState::Perceive),
+            system_prompt: "SOUL + perceive".into(),
+            blocks: vec![ContextBlock {
+                label: "world".into(),
+                body: "a tweet".into(),
+                trusted: false,
+            }],
+            session: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn relays_permission_to_the_wall_then_parses_result() {
+        // The mock induces one permission event, blocks until the decision arrives
+        // (proving the round-trip), then returns a structured result.
+        let mock = "#!/bin/sh\n\
+            read invoke\n\
+            printf '{\"kind\":\"permission\",\"tool\":\"Write\",\"tool_use_id\":\"tu_1\",\"input\":{\"file_path\":\"/x/p.txt\"}}\\n'\n\
+            read decision\n\
+            printf '{\"kind\":\"result\",\"output\":{\"thought\":\"done\",\"transition\":{\"to_state\":null}}}\\n'\n";
+        let client = mock_client(mock, "perm");
+        let rec = Arc::new(Recorder {
+            asked: Mutex::new(vec![]),
+            allow: false,
+        });
+        let out = client.invoke(perceive_req(), rec.clone()).await.unwrap();
+
+        assert_eq!(out.thought, "done");
+        assert!(out.transition.to_state.is_none());
+        // The wall WAS consulted with the real tool; the mock only reached `result`
+        // because the decision line was delivered (it blocks on `read decision`).
+        assert_eq!(*rec.asked.lock().unwrap(), vec!["Write".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn result_only_run_needs_no_decisions() {
+        let mock = "#!/bin/sh\n\
+            read invoke\n\
+            printf '{\"kind\":\"result\",\"output\":{\"thought\":\"hi\",\"proposal\":{\"intent\":\"noop\",\"gist\":\"g\"},\"transition\":{\"to_state\":null}}}\\n'\n";
+        let client = mock_client(mock, "resultonly");
+        let rec = Arc::new(Recorder {
+            asked: Mutex::new(vec![]),
+            allow: true,
+        });
+        let out = client.invoke(perceive_req(), rec).await.unwrap();
+        assert_eq!(out.thought, "hi");
+        assert_eq!(out.proposal.unwrap().gist, "g");
+    }
+
+    #[tokio::test]
+    async fn bridge_error_becomes_runtime_error() {
+        let mock = "#!/bin/sh\n\
+            read invoke\n\
+            printf '{\"kind\":\"error\",\"message\":\"provider 401\"}\\n'\n";
+        let client = mock_client(mock, "err");
+        let rec = Arc::new(Recorder {
+            asked: Mutex::new(vec![]),
+            allow: true,
+        });
+        let err = client.invoke(perceive_req(), rec).await.unwrap_err();
+        assert!(matches!(err, DackError::Runtime(m) if m.contains("provider 401")));
+    }
+
+    #[test]
+    fn render_frames_trusted_and_untrusted_blocks() {
+        let s = OpenClaudeClient::render_blocks(&[
+            ContextBlock { label: "dir".into(), body: "do x".into(), trusted: true },
+            ContextBlock { label: "world".into(), body: "evil".into(), trusted: false },
+        ]);
+        assert!(s.contains("<TRUSTED-DIRECTIVE label=\"dir\">"));
+        assert!(s.contains("<UNTRUSTED-WORLD-DATA label=\"world\">"));
     }
 }

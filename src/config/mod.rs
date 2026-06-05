@@ -110,6 +110,22 @@ pub struct DackConfig {
     /// Localhost bind for the webhook listener (PRD §2 — nothing public without a proxy).
     #[serde(default = "default_webhook_addr")]
     pub webhook_addr: String,
+    /// Path to the `openclaude-bridge/` project the runtime runs (`bun run bridge.ts`) —
+    /// the TS side of the runtime seam (depends on `@gitlawb/openclaude` from npm).
+    #[serde(default = "default_bridge_dir")]
+    pub bridge_dir: String,
+    /// Model id passed to the engine as `options.model` — only for models in the SDK's own
+    /// catalog (Anthropic tiers). **For an OpenAI-compatible gateway (opengateway/mimo,
+    /// Ollama, …) leave this `None` and set `OPENAI_MODEL` via `runtime_env`** — the SDK
+    /// resolves `options.model` against its catalog and rejects unknown gateway names
+    /// (live-verified, Phase 4).
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Env var *names* forwarded into the runtime bridge — the provider key, base URL, and
+    /// model name live here (values come from the harness env, never the YAML). **Soul key
+    /// never listed.**
+    #[serde(default = "default_runtime_env")]
+    pub runtime_env: Vec<String>,
 }
 
 fn default_soul_repo() -> String {
@@ -120,6 +136,16 @@ fn default_db_path() -> String {
 }
 fn default_webhook_addr() -> String {
     "127.0.0.1:8787".to_string()
+}
+fn default_bridge_dir() -> String {
+    "openclaude-bridge".to_string()
+}
+fn default_runtime_env() -> Vec<String> {
+    vec![
+        "OPENAI_API_KEY".to_string(),
+        "OPENAI_BASE_URL".to_string(),
+        "OPENAI_MODEL".to_string(),
+    ]
 }
 
 impl DackConfig {

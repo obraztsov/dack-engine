@@ -1,0 +1,53 @@
+# dack.config.yaml — operator control plane (PRD §8.2).
+# The non-LLM authority surface. Operator owns it; the harness reads it (hot-reloadable);
+# the agent may READ select fields but can NEVER write it.
+#
+# Copy to dack.config.yaml and fill in real DIDs. Secret *values* never live here —
+# only references (file://...) resolved by the secret store.
+
+# The trusted operator DID — provenance check for the `operator_signed` tier (PRD §5.7).
+operator_did: "did:key:z6MkOperatorReplaceMe"
+
+# Routing table: (payload_tier, type) -> entry state + priority + coalesce policy.
+# Fixed states, configurable edges (the product-iteration surface). NO row routes to
+# `settle` in v1 — the irreversible doorway is structurally unreachable.
+routing:
+  - match: { tier: public, type: mention }
+    entry: perceive
+    priority: low
+    coalesce: { mode: batch, window_sec: 300, dedup_key: thread_id }
+  - match: { tier: public, type: clarity_post }
+    entry: perceive
+    priority: low
+    coalesce: { mode: batch, window_sec: 600, dedup_key: tweet_id }
+  - match: { tier: public, type: token_launch }
+    entry: perceive
+    priority: normal
+    coalesce: { mode: none }            # one-at-a-time; each launch judged individually
+  - match: { tier: self, type: scheduled_post }
+    entry: perceive_then_express
+
+# Names injected into the agent + sensor env. RECOVERABLE values only (PRD §7.2):
+# leak == rotate. The Soul DID key is deliberately absent — it lives in `secrets:`.
+forwarded_env: [TWITTER_API_KEY, BANKR_API_KEY, BUILDER_DID_KEY, DACK_HANDLE, RATE_LIMIT]
+
+# References only — values live in a separate store the YAML never inlines, so config
+# is inspectable without exposing keys. The Soul DID key is harness-only (never forwarded).
+secrets:
+  soul_did_key: "file:///run/secrets/soul_did_key"
+
+# The Settle predicate reads this (PRD §7.6). v1: empty/zeroed — Settle unwired.
+# Amount/cap is enforced by the DAC treasury, NOT duplicated here.
+control_plane:
+  cap_remaining: 0
+  whitelist: []
+  allowed_action_types: []
+
+# Cron for the harness-entered Reflect run (PRD §4.2). The ONLY scheduled way in;
+# no consciousness state can transition into Reflect. Omit for manual `dack reflect-now`.
+reflect_schedule: "0 4 * * *"           # nightly 04:00 — "sleep-with-dreams"
+
+# Where the harness runs (Phase 3). All optional — these are the defaults.
+soul_repo: "."                          # the actor bundle on the box (holds stimuli/, SOUL.md, …)
+db_path: "dack.sqlite"                  # embedded SQLite queue (ephemeral; losing it loses only the queue)
+webhook_addr: "127.0.0.1:8787"          # localhost-only webhook listener (nothing public without a proxy)

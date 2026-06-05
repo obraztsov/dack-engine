@@ -1,0 +1,19 @@
+# openclaude directory, separate repo
+/openclaude-0.15.0
+
+# agent soul, not tracked in this repo
+/soul-template
+
+# rust
+/target
+**/*.rs.bk
+Cargo.lock        # binary crate, but harness is deployed as a built artifact; keep lock out of v1 churn
+
+# operator secrets & real config — never commit
+/dack.config.yaml
+/run/secrets/
+*.did.key
+
+# editor
+/.idea/
+.DS_Store

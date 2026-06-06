@@ -14,6 +14,11 @@ Cargo.lock        # binary crate, but harness is deployed as a built artifact; k
 /run/secrets/
 *.did.key
 
+# X / Twitter API credentials (RW keys) + rotated OAuth2 token store — never commit
+*.x.txt
+*.x.json
+*.tokens.json
+
 # editor
 /.idea/
 .DS_Store

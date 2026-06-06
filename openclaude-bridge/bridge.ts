@@ -82,7 +82,9 @@ rl.on('line', (line: string) => {
 
 async function runInvoke(inv: any) {
   const options: any = {
-    cwd: process.cwd(),
+    // The agent operates in the soul repo (so its file tools reach memory/, skills/, …);
+    // falls back to the bridge's cwd for pure-text runs.
+    cwd: inv.cwd ?? process.cwd(),
     systemPrompt: { type: 'custom', content: `${inv.system_prompt}\n\n${OUTPUT_INSTRUCTION}` },
     disallowedTools: inv.disallowed_tools ?? [],
     // The wall: relay every tool to Rust and block on its decision.

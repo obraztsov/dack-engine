@@ -17,6 +17,8 @@ use std::collections::HashMap;
 use crate::config::DackConfig;
 use crate::error::Result;
 
+pub mod providers;
+
 /// Resolves secret *references* (e.g. `file:///run/secrets/soul_did_key`) to values.
 /// Implementations must keep harness-only secrets (the Soul DID key) off any path that
 /// reaches the agent.

@@ -70,6 +70,8 @@ async fn main() -> anyhow::Result<()> {
             },
         ],
         session: None,
+        workdir: None,
+        secret_env: Default::default(),
     };
 
     let wall = Arc::new(Recording {

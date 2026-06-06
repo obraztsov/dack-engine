@@ -11,6 +11,8 @@
 //! v1 net effect: Perceive auto-denies all write/network-write; Express allows only
 //! post/reply + memory-append; everything else denied (PRD §6.3).
 
+use std::path::{Component, Path, PathBuf};
+
 use async_trait::async_trait;
 
 use super::classify::classify_tool;
@@ -32,6 +34,10 @@ pub struct StatePolicyResponder {
     /// Present only for a Settle run: the operator control plane + the triggering
     /// stimulus the Settle predicate reads. `None` in v1 (Settle is unreachable).
     pub settle_ctx: Option<SettleContext>,
+    /// The soul-repo root, for relativizing the **absolute** `file_path`s the SDK emits
+    /// before the `writable_dirs` prefix check (PRD §4.1). `None` in unit tests, which use
+    /// repo-relative paths directly.
+    pub repo_root: Option<PathBuf>,
 }
 
 pub struct SettleContext {
@@ -51,6 +57,7 @@ impl StatePolicyResponder {
             post_tools: Vec::new(),
             settle_tools: Vec::new(),
             settle_ctx: None,
+            repo_root: None,
         }
     }
 
@@ -65,22 +72,56 @@ impl StatePolicyResponder {
             post_tools,
             settle_tools,
             settle_ctx: None,
+            repo_root: None,
         }
     }
 
-    /// Write-gating: a file-write target must sit under a `writable_dirs` prefix and
-    /// must never be `runlogs/` (PRD §4.1).
-    ///
-    /// GROUNDING (verified against OpenClaude 0.15.0, see `docs/VERIFICATION.md`): file
-    /// tools emit **absolute** paths in `input.file_path` (e.g. `/home/user/dack-soul/
-    /// memory/log.md`), so Phase 5 must relativize `target` against the soul-repo root
-    /// before this prefix check (and reject any path that escapes the root via `..`).
-    /// The scaffold matches relative prefixes; the test suite uses repo-relative paths.
+    /// Bind the soul-repo root so live (absolute) write targets are relativized against it
+    /// before the `writable_dirs` check. The harness sets this to the canonical soul-repo path.
+    pub fn with_repo_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.repo_root = Some(root.into());
+        self
+    }
+
+    /// Write-gating: a file-write target must sit under a `writable_dirs` prefix and must
+    /// never be `runlogs/` (PRD §4.1). The target is first **relativized** against the soul
+    /// repo (file tools emit absolute paths, grounded vs OpenClaude 0.15.0) — anything that
+    /// escapes the repo, or `..`-escapes one writable dir into another (e.g. `memory/../
+    /// skills/`), is denied.
     fn write_target_allowed(&self, target: &str) -> bool {
-        if target.starts_with("runlogs/") {
+        let Some(rel) = self.relativize(target) else {
+            return false; // escaped the soul repo entirely
+        };
+        if rel.starts_with("runlogs/") {
             return false; // never — the record is harness-authored.
         }
-        self.spec.writable_dirs.iter().any(|d| target.starts_with(d))
+        self.spec.writable_dirs.iter().any(|d| rel.starts_with(d))
+    }
+
+    /// Resolve a write `target` to a **repo-relative, `..`-collapsed** path, or `None` if it
+    /// escapes the soul repo. With a `repo_root`, an absolute target is relativized against
+    /// it (and a `..`-escape above the root fails `strip_prefix`); without one (unit tests),
+    /// the target is treated as repo-relative and any `..` component is rejected outright.
+    fn relativize(&self, target: &str) -> Option<String> {
+        let t = Path::new(target);
+        match &self.repo_root {
+            Some(root) => {
+                let root = normalize_lexical(root);
+                let abs = if t.is_absolute() {
+                    normalize_lexical(t)
+                } else {
+                    normalize_lexical(&root.join(t))
+                };
+                let rel = abs.strip_prefix(&root).ok()?;
+                Some(rel.to_string_lossy().replace('\\', "/"))
+            }
+            None => {
+                if t.components().any(|c| c == Component::ParentDir) {
+                    return None;
+                }
+                Some(normalize_lexical(t).to_string_lossy().replace('\\', "/"))
+            }
+        }
     }
 }
 
@@ -135,6 +176,23 @@ impl ActionResponder for StatePolicyResponder {
 
         ActionDecision::Allow
     }
+}
+
+/// Lexically resolve `.`/`..` segments **without touching the filesystem** (a write target
+/// may not exist yet, and we must not follow symlinks during a security check). `..` pops the
+/// last kept component; `.` is dropped; roots/prefixes are kept.
+fn normalize_lexical(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -231,6 +289,59 @@ mod tests {
         let r = responder(ConsciousnessState::Settle);
         assert!(matches!(
             r.decide(&req("mcp__bankr__send", json!({"to": "0xGOOD", "amount": "1"})))
+                .await,
+            ActionDecision::Deny(_)
+        ));
+    }
+
+    // ── Phase 5: live absolute-path relativization (the SDK emits absolute file_paths) ──
+
+    #[tokio::test]
+    async fn relativizes_absolute_paths_and_blocks_escapes() {
+        let r = responder(ConsciousnessState::Express).with_repo_root("/repo");
+        // The live case: an absolute memory path under the repo → allowed.
+        assert!(matches!(
+            r.decide(&req("Write", json!({"file_path": "/repo/memory/log.md", "content": "x"})))
+                .await,
+            ActionDecision::Allow
+        ));
+        // Absolute soul-dir path → denied (Express may write only memory/).
+        assert!(matches!(
+            r.decide(&req("Write", json!({"file_path": "/repo/skills/x/SKILL.md", "content": "x"})))
+                .await,
+            ActionDecision::Deny(_)
+        ));
+        // `..`-escape out of memory/ into skills/ → denied (the path the prefix check missed).
+        assert!(matches!(
+            r.decide(&req("Write", json!({"file_path": "/repo/memory/../skills/x", "content": "x"})))
+                .await,
+            ActionDecision::Deny(_)
+        ));
+        // Outside the soul repo entirely → denied.
+        assert!(matches!(
+            r.decide(&req("Write", json!({"file_path": "/etc/passwd", "content": "x"})))
+                .await,
+            ActionDecision::Deny(_)
+        ));
+        // runlogs/ never — even via an absolute path.
+        assert!(matches!(
+            r.decide(&req("Write", json!({"file_path": "/repo/runlogs/2026-06.md", "content": "x"})))
+                .await,
+            ActionDecision::Deny(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn reflect_writes_soul_dirs_via_absolute_paths() {
+        let r = responder(ConsciousnessState::Reflect).with_repo_root("/repo");
+        assert!(matches!(
+            r.decide(&req("Write", json!({"file_path": "/repo/skills/new/SKILL.md", "content": "x"})))
+                .await,
+            ActionDecision::Allow
+        ));
+        // ...but a double `..` above the repo root is still denied.
+        assert!(matches!(
+            r.decide(&req("Write", json!({"file_path": "/repo/../../etc/x", "content": "x"})))
                 .await,
             ActionDecision::Deny(_)
         ));

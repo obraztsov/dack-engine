@@ -16,19 +16,22 @@
 //!      raw payload (the firebreak, PRD §6.4)
 //!   6. Express acts via skills, writes memory, returns; harness logs the outcome
 
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::bus::Bus;
 use crate::config::DackConfig;
 use crate::error::Result;
-use crate::identity::IdentityProvider;
+use crate::identity::{IdentityProvider, IdentityRole};
+use crate::secrets::providers::SecretsBroker;
 use crate::model::baton::Baton;
 use crate::model::proposal::AgentOutput;
 use crate::model::runlog::{Outcome, RunLogEntry};
 use crate::model::stimulus::Stimulus;
 use crate::queue::Queue;
-use crate::repo::RepoHost;
+use crate::repo::{CommitMeta, RepoHost, RepoPath};
 use crate::runlog::RunLogWriter;
 use crate::runtime::action_required::StatePolicyResponder;
 use crate::runtime::{ActionResponder, ContextBlock, InvocationRequest, RuntimeClient};
@@ -46,6 +49,8 @@ pub struct Harness {
     pub repo: Arc<dyn RepoHost>,
     pub identity: Arc<dyn IdentityProvider>,
     pub runlog: Arc<dyn RunLogWriter>,
+    /// Materializes the act-phase secrets a route grants (Express skills read them).
+    pub broker: Arc<SecretsBroker>,
 }
 
 impl Harness {
@@ -71,9 +76,11 @@ impl Harness {
 
     async fn dispatch(&self, stimulus: Stimulus) -> Result<()> {
         // (2) Perceive context — directive trusted, payload untrusted, kept SEPARATE.
-        let perceive_req = self.assemble_perceive_context(&stimulus);
-        let responder: Arc<dyn ActionResponder> =
-            Arc::new(StatePolicyResponder::new(default_spec(ConsciousnessState::Perceive)));
+        let perceive_req = self.assemble_perceive_context(&stimulus).await?;
+        let responder: Arc<dyn ActionResponder> = Arc::new(
+            StatePolicyResponder::new(default_spec(ConsciousnessState::Perceive))
+                .with_repo_root(self.soul_root()),
+        );
 
         // (3) Perceive runs read-only.
         let perceive_out = self.runtime.invoke(perceive_req, responder).await?;
@@ -85,17 +92,43 @@ impl Harness {
         if let Some(to) = perceive_out.transition.to_state {
             if allowed_transition(ConsciousnessState::Perceive, to) {
                 if let Some(baton) = build_baton(&perceive_out, &stimulus, runlog_ref) {
-                    self.open_next_state(to, baton).await?;
+                    // Materialize the act-phase secrets the operator granted this route — the
+                    // ONLY point a network capability credential enters a cycle (never Perceive).
+                    let secret_env = self.act_secrets(&stimulus).await;
+                    self.open_next_state(to, baton, secret_env).await?;
                 }
             }
         }
         Ok(())
     }
 
+    /// The act-phase secret env for a stimulus, from its **route's** `secrets:` (operator-gated;
+    /// the agent can't grant itself a secret). Empty when the route grants none, or on error —
+    /// a missing act-secret fails the skill, never the harness (logging-not-rollback).
+    async fn act_secrets(&self, stimulus: &Stimulus) -> BTreeMap<String, String> {
+        let scopes = self
+            .config
+            .lookup_route(stimulus.payload_tier, &stimulus.type_)
+            .map(|r| r.secrets.clone())
+            .unwrap_or_default();
+        if scopes.is_empty() {
+            return BTreeMap::new();
+        }
+        match self.broker.env_for(&scopes).await {
+            Ok(env) => env,
+            Err(e) => {
+                eprintln!("act secrets for {}: {e}", stimulus.id);
+                BTreeMap::new()
+            }
+        }
+    }
+
     /// Assemble the Perceive invocation. The directive (trusted intent) and the payload
-    /// (untrusted world) are SEPARATE, visibly-framed blocks — the §5.3 rule carried
-    /// into context assembly.
-    fn assemble_perceive_context(&self, stimulus: &Stimulus) -> InvocationRequest {
+    /// (untrusted world) are SEPARATE, visibly-framed blocks — the §5.3 rule carried into
+    /// context assembly — plus a **short** tail of the duck's own memory and the recent
+    /// runlog for continuity (PRD §6.1: seed a summary, not full memory; the agent pulls
+    /// more via its file tools on demand).
+    async fn assemble_perceive_context(&self, stimulus: &Stimulus) -> Result<InvocationRequest> {
         let spec = default_spec(ConsciousnessState::Perceive);
         let blocks = vec![
             ContextBlock {
@@ -108,20 +141,105 @@ impl Harness {
                 body: stimulus.payload.to_string(),
                 trusted: false, // delimited as untrusted regardless of content.
             },
+            ContextBlock {
+                label: "memory-recent".into(),
+                body: self.memory_tail(40).await,
+                trusted: true, // the duck's own self-authored notes (not world data).
+            },
+            ContextBlock {
+                label: "runlog-recent".into(),
+                // Harness-authored one-line records — NO raw payload (that stays in the
+                // runlog body the agent must *choose* to read via runlog_ref).
+                body: self.runlog.tail(20).await.unwrap_or_default(),
+                trusted: true,
+            },
         ];
-        InvocationRequest {
+        Ok(InvocationRequest {
             system_prompt: format!("<SOUL.md + {}>", spec.prompt_path),
             spec,
             blocks,
             // v1: fresh context per wake. A future Perceive "lane" may reuse a session for
             // same-tier continuity (the context-management vision) — never across states.
             session: None,
+            workdir: Some(self.soul_root()),
+            secret_env: Default::default(),
+        })
+    }
+
+    /// The canonical absolute soul-repo path — the agent's workdir and the wall's relativize
+    /// root. Canonicalized when it exists; otherwise absolutized against the cwd.
+    fn soul_root(&self) -> PathBuf {
+        let p = PathBuf::from(&self.config.soul_repo);
+        std::fs::canonicalize(&p)
+            .unwrap_or_else(|_| std::env::current_dir().map(|c| c.join(&p)).unwrap_or(p))
+    }
+
+    /// Last `max_lines` of `memory/log.md` (the duck's narrative memory), or empty if absent.
+    async fn memory_tail(&self, max_lines: usize) -> String {
+        let bytes = self
+            .repo
+            .read_file(&RepoPath("memory/log.md".into()))
+            .await
+            .unwrap_or_default();
+        let text = String::from_utf8_lossy(&bytes);
+        let lines: Vec<&str> = text.lines().collect();
+        lines[lines.len().saturating_sub(max_lines)..].join("\n")
+    }
+
+    /// Apply an `AgentOutput.memory_append` (the structured "memory line") — **gated**: only
+    /// Express/Reflect may write memory (PRD §4.1); a Perceive line is dropped. Best-effort:
+    /// a memory-write hiccup is logged, not allowed to fail the (already-done) action cycle.
+    async fn honor_memory_append(&self, state: ConsciousnessState, out: &AgentOutput) {
+        let Some(line) = out
+            .memory_append
+            .as_deref()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+        else {
+            return;
+        };
+        if !matches!(state, ConsciousnessState::Express | ConsciousnessState::Reflect) {
+            return; // read-only state proposed a memory line — drop it.
+        }
+        let path = RepoPath("memory/log.md".into());
+        let mut content =
+            String::from_utf8_lossy(&self.repo.read_file(&path).await.unwrap_or_default())
+                .into_owned();
+        if !content.is_empty() && !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push_str(line);
+        content.push('\n');
+        let author = self
+            .identity
+            .did(IdentityRole::Soul)
+            .map(|d| d.0.clone())
+            .unwrap_or_else(|| "did:dack:soul".into());
+        if let Err(e) = self
+            .repo
+            .write_file(
+                &path,
+                content.as_bytes(),
+                &CommitMeta {
+                    message: format!("memory: {line}"),
+                    author_did: author,
+                },
+            )
+            .await
+        {
+            eprintln!("memory_append write failed: {e}");
         }
     }
 
     /// Open Express/Settle seeded with the **Baton only** (PRD §6.4). The raw payload is
     /// never passed; the next state can reach it only by *choosing* to read the runlog.
-    async fn open_next_state(&self, to: ConsciousnessState, baton: Baton) -> Result<()> {
+    /// `secret_env` is the route's act-secrets — present here (the act phase), never in Perceive.
+    async fn open_next_state(
+        &self,
+        to: ConsciousnessState,
+        baton: Baton,
+        secret_env: BTreeMap<String, String>,
+    ) -> Result<()> {
         let spec = default_spec(to);
         let blocks = vec![ContextBlock {
             label: "baton".into(),
@@ -134,7 +252,7 @@ impl Harness {
             trusted: true,
         }];
         let responder: Arc<dyn ActionResponder> =
-            Arc::new(StatePolicyResponder::new(spec.clone()));
+            Arc::new(StatePolicyResponder::new(spec.clone()).with_repo_root(self.soul_root()));
         let req = InvocationRequest {
             system_prompt: format!("<SOUL.md + {}>", spec.prompt_path),
             spec,
@@ -142,9 +260,13 @@ impl Harness {
             // FIREBREAK: Express/Settle ALWAYS get a fresh session — never the one that
             // ingested untrusted payload in Perceive (PRD §6.4). This `None` is load-bearing.
             session: None,
+            workdir: Some(self.soul_root()),
+            secret_env,
         };
-        let _express_out = self.runtime.invoke(req, responder).await?;
-        // Phase 5/7: honor memory_append (gated), execute proposal via skill, log outcome.
+        let out = self.runtime.invoke(req, responder).await?;
+        // Honor the structured memory line (gated to this write-capable state). Skill
+        // execution of the proposal lands in Phase 6.
+        self.honor_memory_append(to, &out).await;
         Ok(())
     }
 
@@ -312,10 +434,13 @@ mod tests {
                 cwd: None,
                 env,
                 model: None,
+                sandbox: Arc::new(crate::sandbox::HostSandbox),
+                policy: crate::sandbox::IsolationPolicy::host_passthrough(),
             }),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
             runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
+        broker: Arc::new(SecretsBroker::new(vec![])),
         };
 
         harness.dispatch(poisoned_stimulus()).await.unwrap();
@@ -329,6 +454,136 @@ mod tests {
             "a runlog file was written"
         );
 
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A runtime that records every assembled `InvocationRequest` (no subprocess).
+    struct RecordingRuntime {
+        seen: std::sync::Mutex<Vec<InvocationRequest>>,
+        out: AgentOutput,
+    }
+    #[async_trait::async_trait]
+    impl RuntimeClient for RecordingRuntime {
+        async fn invoke(
+            &self,
+            req: InvocationRequest,
+            _responder: Arc<dyn ActionResponder>,
+        ) -> Result<AgentOutput> {
+            self.seen.lock().unwrap().push(req);
+            Ok(self.out.clone())
+        }
+    }
+
+    /// Phase 5 acceptance (PRD §11.6): **raw stimulus text never appears in Express context.**
+    /// Perceive *does* see the raw payload (its job is to digest it); the Baton-seeded Express
+    /// context must not — the firebreak, asserted over the real assembled requests.
+    #[tokio::test]
+    async fn raw_payload_never_reaches_express_context() {
+        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::queue::InMemoryQueue;
+        use crate::repo::git::PlainGitRepo;
+        use crate::runlog::FileRunLog;
+        use std::collections::HashMap;
+
+        let tmp = std::env::temp_dir().join(format!("dack-fb-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let runtime = Arc::new(RecordingRuntime {
+            seen: std::sync::Mutex::new(Vec::new()),
+            out: perceive_output(), // proposes a transition → Express, with a digested gist
+        });
+        let config = Arc::new(DackConfig::from_yaml("operator_did: \"did:x\"").unwrap());
+        let queue: Arc<dyn Queue> = Arc::new(InMemoryQueue::new());
+        let harness = Harness {
+            config: config.clone(),
+            queue: queue.clone(),
+            bus: Arc::new(Bus::new(config.clone(), queue.clone())),
+            runtime: runtime.clone(),
+            repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
+            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
+        broker: Arc::new(SecretsBroker::new(vec![])),
+        };
+
+        harness.dispatch(poisoned_stimulus()).await.unwrap();
+
+        let seen = runtime.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "Perceive then Express");
+        let render = |req: &InvocationRequest| {
+            req.blocks
+                .iter()
+                .map(|b| b.body.clone())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // Perceive sees the raw injection (it must, to digest it).
+        assert!(render(&seen[0]).contains("IGNORE PREVIOUS INSTRUCTIONS"));
+        // Express must NOT — only the digested Baton crosses the firebreak.
+        let express = render(&seen[1]);
+        assert!(!express.contains("IGNORE PREVIOUS INSTRUCTIONS"), "{express}");
+        assert!(!express.contains("seed phrase"));
+        assert!(express.contains("Decline the secret-leak bait")); // the gist DID cross
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Secrets are **operator-gated via routing** and **act-phase only**: a route's `secrets:`
+    /// is materialized for the Express invocation, never for the read-only Perceive.
+    #[tokio::test]
+    async fn express_gets_route_secrets_but_perceive_does_not() {
+        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::queue::InMemoryQueue;
+        use crate::repo::git::PlainGitRepo;
+        use crate::runlog::FileRunLog;
+        use crate::secrets::providers::StaticEnvProvider;
+        use std::collections::HashMap;
+
+        std::env::set_var("DACK_ACT_TEST_TOKEN", "bearer-xyz");
+        let tmp = std::env::temp_dir().join(format!("dack-actsec-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let runtime = Arc::new(RecordingRuntime {
+            seen: std::sync::Mutex::new(Vec::new()),
+            out: perceive_output(),
+        });
+        // Operator routes (public, mention) → Perceive, granting the **act** phase provider `x`.
+        let config = Arc::new(
+            DackConfig::from_yaml(
+                "operator_did: \"did:x\"\nrouting:\n  - match: { tier: public, type: mention }\n    entry: perceive\n    secrets: [x]\n",
+            )
+            .unwrap(),
+        );
+        let queue: Arc<dyn Queue> = Arc::new(InMemoryQueue::new());
+        let broker = Arc::new(SecretsBroker::new(vec![Arc::new(StaticEnvProvider::new(
+            "x",
+            vec!["DACK_ACT_TEST_TOKEN".into()],
+        ))]));
+        let harness = Harness {
+            config: config.clone(),
+            queue: queue.clone(),
+            bus: Arc::new(Bus::new(config.clone(), queue.clone())),
+            runtime: runtime.clone(),
+            repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
+            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
+            broker,
+        };
+
+        harness.dispatch(poisoned_stimulus()).await.unwrap();
+
+        let seen = runtime.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        // Perceive (read-only) holds NO act secrets.
+        assert!(seen[0].secret_env.is_empty(), "Perceive must hold no act secrets");
+        // Express holds the token the route's `x` provider materialized.
+        assert_eq!(
+            seen[1].secret_env.get("DACK_ACT_TEST_TOKEN").map(String::as_str),
+            Some("bearer-xyz")
+        );
+
+        std::env::remove_var("DACK_ACT_TEST_TOKEN");
         std::fs::remove_dir_all(&tmp).ok();
     }
 }

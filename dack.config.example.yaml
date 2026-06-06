@@ -26,10 +26,36 @@ routing:
     coalesce: { mode: none }            # one-at-a-time; each launch judged individually
   - match: { tier: self, type: scheduled_post }
     entry: perceive_then_express
+  - match: { tier: public, type: feed_digest }     # twitter-feed → read the room (perceive only)
+    entry: perceive
+    priority: low
+  - match: { tier: public, type: mention }         # twitter-mentions → perceive, then reply
+    entry: perceive
+    priority: low
+    secrets: [x]                                   # ACT-phase: Express may use X (to reply).
+                                                   # Operator-gated here — the agent can't grant
+                                                   # itself a secret; read-only Perceive gets none.
 
 # Names injected into the agent + sensor env. RECOVERABLE values only (PRD §7.2):
 # leak == rotate. The Soul DID key is deliberately absent — it lives in `secrets:`.
-forwarded_env: [TWITTER_API_KEY, BANKR_API_KEY, BUILDER_DID_KEY, DACK_HANDLE, RATE_LIMIT]
+forwarded_env: [BANKR_API_KEY, BUILDER_DID_KEY, DACK_HANDLE, RATE_LIMIT]
+
+# Secrets providers — trusted, harness-owned scripts that materialize a short-lived token env
+# on demand (fetch + validity-check + rotate-only-when-needed). A duty references one by name
+# in its `secrets:` list; the harness runs the script and injects its JSON output into ONLY
+# that duty's sensor. Adding a new secret (cove.trade, …) is a new entry here + a script —
+# never a harness change. The provider holds the ROOT creds; the sensor only sees the bearer.
+secrets_providers:
+  - name: x                                    # twitter duties declare `secrets: [x]`
+    command: ["python3", "secrets-providers/x_oauth2.py"]
+    env:                                       # config (paths/refs), NOT secret values
+      X_CREDS_FILE: "agentdack.rw.x.txt"       # gitignored OAuth2 bootstrap creds (RW)
+      X_TOKEN_STORE: "agentdack.rw.x.txt.tokens.json"   # rotated tokens (gitignored, 0600)
+    keys: [X_BEARER_TOKEN]
+  # - name: cove                               # future: cove.trade trading key, same shape
+  #   command: ["python3", "secrets-providers/cove.py"]
+  #   env: { COVE_KEY_FILE: "cove.key.txt" }
+  #   keys: [COVE_API_KEY]
 
 # References only — values live in a separate store the YAML never inlines, so config
 # is inspectable without exposing keys. The Soul DID key is harness-only (never forwarded).

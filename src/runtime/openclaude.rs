@@ -25,11 +25,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Command;
 
 use super::{ActionDecision, ActionRequest, ActionResponder, InvocationRequest, RuntimeClient};
 use crate::error::{DackError, Result};
 use crate::model::proposal::AgentOutput;
+use crate::sandbox::{ExecKind, HostSandbox, IsolationPolicy, Mount, ProcessSpec, Sandbox};
 
 /// Tools we deny at the engine boundary too (defense-in-depth over the wall, which already
 /// denies the `Shell` class in every state — `docs/VERIFICATION.md` "Memory access model").
@@ -46,6 +46,8 @@ enum ToBridge<'a> {
         disallowed_tools: Vec<String>,
         allowed_tools: Option<Vec<String>>,
         model: Option<&'a str>,
+        /// The agent's working dir (the soul repo) → the bridge's `options.cwd`.
+        cwd: Option<&'a str>,
     },
     Decision {
         tool_use_id: String,
@@ -85,6 +87,11 @@ pub struct OpenClaudeClient {
     pub env: HashMap<String, String>,
     /// Model id passed to the SDK (e.g. `mimo-v2.5-pro`); `None` = bridge/provider default.
     pub model: Option<String>,
+    /// Isolation backend for the bridge process (default [`HostSandbox`]). Under a container
+    /// backend the **soul repo (`workdir`) is mounted as a writable volume** so the agent's
+    /// memory/skill writes land while the rest of the box stays out of reach.
+    pub sandbox: Arc<dyn Sandbox>,
+    pub policy: IsolationPolicy,
 }
 
 impl OpenClaudeClient {
@@ -95,6 +102,8 @@ impl OpenClaudeClient {
             cwd: Some(bridge_dir.into()),
             env,
             model,
+            sandbox: Arc::new(HostSandbox),
+            policy: IsolationPolicy::host_passthrough(),
         }
     }
 
@@ -124,24 +133,42 @@ impl RuntimeClient for OpenClaudeClient {
         req: InvocationRequest,
         responder: Arc<dyn ActionResponder>,
     ) -> Result<AgentOutput> {
-        let (bin, args) = self
-            .command
-            .split_first()
-            .ok_or_else(|| DackError::Runtime("empty bridge command".into()))?;
-
-        let mut cmd = Command::new(bin);
-        cmd.args(args)
-            .envs(&self.env)
+        // Spawn the bridge **through the sandbox seam** (HostSandbox by default). Under a
+        // container backend the soul repo (workdir) is mounted writable; the harness env is
+        // inherited (the SDK's auth context is ambient — Phase 4 learning), never cleared.
+        // Static bridge env (provider key/base-URL) + the per-invocation act secrets the
+        // harness materialized for this Express run (the skills read them). Perceive's is empty.
+        let mut env: std::collections::BTreeMap<String, String> =
+            self.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        env.extend(req.secret_env.clone());
+        let spec = ProcessSpec {
+            command: self.command.clone(),
+            cwd: self.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
+            env,
+            clear_env: false,
+            kind: ExecKind::Agent,
+            mounts: req
+                .workdir
+                .as_ref()
+                .map(|w| {
+                    vec![Mount {
+                        host: w.clone(),
+                        guest: w.clone(),
+                        writable: true,
+                    }]
+                })
+                .unwrap_or_default(),
+            policy: self.policy.clone(),
+        };
+        let mut child = self
+            .sandbox
+            .command(&spec)?
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
-            .kill_on_drop(true);
-        if let Some(cwd) = &self.cwd {
-            cmd.current_dir(cwd);
-        }
-        let mut child = cmd
+            .kill_on_drop(true)
             .spawn()
-            .map_err(|e| DackError::Runtime(format!("spawn bridge {bin}: {e}")))?;
+            .map_err(|e| DackError::Runtime(format!("spawn bridge: {e}")))?;
 
         let mut stdin = child
             .stdin
@@ -160,6 +187,7 @@ impl RuntimeClient for OpenClaudeClient {
             disallowed_tools: ALWAYS_DISALLOWED.iter().map(|s| s.to_string()).collect(),
             allowed_tools: None,
             model: self.model.as_deref(),
+            cwd: req.workdir.as_deref().and_then(|p| p.to_str()),
         };
         write_line(&mut stdin, &invoke).await?;
 
@@ -268,6 +296,8 @@ mod tests {
             cwd: None,
             env,
             model: None,
+            sandbox: Arc::new(HostSandbox),
+            policy: IsolationPolicy::host_passthrough(),
         }
     }
 
@@ -281,6 +311,8 @@ mod tests {
                 trusted: false,
             }],
             session: None,
+            workdir: None,
+            secret_env: Default::default(),
         }
     }
 

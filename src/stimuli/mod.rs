@@ -53,6 +53,11 @@ pub struct StimulusFrontmatter {
     pub route: EntryState,
     #[serde(default)]
     pub priority: Option<Priority>,
+    /// Secrets-provider scopes this duty's sensor needs (by provider `name`). The harness
+    /// runs those trusted provider scripts and injects only their short-lived token env — the
+    /// sensor never holds the root credential (PRD §7.2; `docs/SECRETS-AND-SANDBOX.md`).
+    #[serde(default)]
+    pub secrets: Vec<String>,
 }
 
 /// A registered duty: parsed frontmatter + the trusted directive body.

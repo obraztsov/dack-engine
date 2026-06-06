@@ -5,17 +5,44 @@
 
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
 
 use super::{SensorCandidate, SensorRunner};
 use crate::error::{DackError, Result};
+use crate::sandbox::{ExecKind, HostSandbox, IsolationPolicy, ProcessSpec, Sandbox};
 
-pub struct SubprocessSensor;
+/// Runs sensors as subprocesses **through the [`Sandbox`] seam** — `HostSandbox` by default
+/// (today's direct spawn), a container backend when the operator opts into isolation. A
+/// sensor is arbitrary Reflect-authored code, so it is the first thing worth isolating.
+pub struct SubprocessSensor {
+    sandbox: Arc<dyn Sandbox>,
+    policy: IsolationPolicy,
+}
+
+impl SubprocessSensor {
+    pub fn new() -> Self {
+        Self {
+            sandbox: Arc::new(HostSandbox),
+            policy: IsolationPolicy::host_passthrough(),
+        }
+    }
+
+    /// Opt into an isolation backend + policy for sensor runs (the sandbox-phase entry point).
+    pub fn with_sandbox(sandbox: Arc<dyn Sandbox>, policy: IsolationPolicy) -> Self {
+        Self { sandbox, policy }
+    }
+}
+
+impl Default for SubprocessSensor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[async_trait]
 impl SensorRunner for SubprocessSensor {
@@ -26,12 +53,23 @@ impl SensorRunner for SubprocessSensor {
         env: &HashMap<String, String>,
         timeout: Duration,
     ) -> Result<Vec<SensorCandidate>> {
-        // env_clear enforces "inject only the read-scoped env the sensor declares"
-        // (PRD §5.2). The caller is responsible for including PATH/interpreter vars in
-        // `env` when the sensor needs them.
-        let mut child = Command::new(exe)
-            .env_clear()
-            .envs(env)
+        // `clear_env: true` enforces "inject only the read-scoped env the sensor declares"
+        // (PRD §5.2). The caller includes PATH/interpreter vars in `env` when needed.
+        let spec = ProcessSpec {
+            command: vec![exe.to_string_lossy().into_owned()],
+            cwd: exe
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from(".")),
+            env: env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            clear_env: true,
+            kind: ExecKind::Sensor,
+            mounts: Vec::new(), // a container backend mounts the duty's scripts (ro); host ignores
+            policy: self.policy.clone(),
+        };
+        let mut child = self
+            .sandbox
+            .command(&spec)?
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -82,7 +120,7 @@ mod tests {
     #[tokio::test]
     async fn parses_ndjson_from_a_trivial_shell_sensor() {
         // A "sensor" that emits two candidate rows — the curl+jq shape, minus the net.
-        let runner = SubprocessSensor;
+        let runner = SubprocessSensor::new();
         let mut env = HashMap::new();
         env.insert("PATH".to_string(), "/bin:/usr/bin".to_string());
         let candidates = runner

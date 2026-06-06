@@ -16,6 +16,9 @@
 //! MCP) with no bypass, and bind gRPC to localhost only (the approval channel must not
 //! be impersonable).
 
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
 use async_trait::async_trait;
 
 use crate::error::Result;
@@ -68,6 +71,15 @@ pub struct InvocationRequest {
     /// context. **MUST be `None` across the firebreak** (see [`SessionId`]). The degraded
     /// `claude -p` adapter ignores this (always fresh).
     pub session: Option<SessionId>,
+    /// The agent's working directory — the **soul repo** — so its `Read`/`Write`/`Glob` tools
+    /// operate on `memory/`, `skills/`, … and emit absolute paths under it that the wall
+    /// relativizes (PRD §7.4). `None` = the bridge's own cwd (tests / pure-text runs).
+    pub workdir: Option<PathBuf>,
+    /// Per-invocation secret env, **materialized by the harness** for the act phase (the
+    /// skills the agent calls read it, e.g. `X_BEARER_TOKEN` to post). Operator-gated via the
+    /// route's `secrets:`; **empty for Perceive** (the read-only state holds no act creds).
+    /// Overlaid on the bridge's static env at spawn.
+    pub secret_env: BTreeMap<String, String>,
 }
 
 /// The permission event surfaced by OpenClaude, as it *actually* arrives (grounded

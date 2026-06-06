@@ -56,6 +56,13 @@ pub struct RoutingRule {
     pub priority: Option<Priority>,
     #[serde(default)]
     pub coalesce: Option<CoalescePolicy>,
+    /// Secrets-provider scopes the **act (Express/Settle) phase** of cycles matching this route
+    /// may use (by provider `name`). **Operator-controlled** — the agent can't grant itself a
+    /// secret; it can only select from the operator's `secrets_providers`. Materialized by the
+    /// harness when opening Express; the read-only **Perceive never receives these** (PRD §7.2,
+    /// §4.1; `docs/SECRETS-AND-SANDBOX.md`).
+    #[serde(default)]
+    pub secrets: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +86,23 @@ pub struct ControlPlane {
     pub allowed_action_types: Vec<String>,
 }
 
+/// One secrets provider (a trusted, harness-owned script) — see [`DackConfig::secrets_providers`].
+/// The `command` is run with `env` (its config — e.g. creds-file/token-store paths) injected;
+/// it prints a JSON object `{"ENV_KEY": "value", …}` on stdout that the harness injects into
+/// the consumer that declared this provider's `name`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretsProviderConfig {
+    pub name: String,
+    /// argv of the provider script, e.g. `["python3", "secrets-providers/x_oauth2.py"]`.
+    pub command: Vec<String>,
+    /// Config env passed to the script (paths/refs — NOT secret values).
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// Env keys this provider is expected to emit (documentation / validation; optional).
+    #[serde(default)]
+    pub keys: Vec<String>,
+}
+
 /// `dack.config.yaml` (PRD §8.2). Hot-reloadable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DackConfig {
@@ -95,6 +119,13 @@ pub struct DackConfig {
     /// `file://` ref and is **never** forwarded to the agent (PRD §7.2, §8.2).
     #[serde(default)]
     pub secrets: BTreeMap<String, String>,
+    /// **Secrets providers** — trusted, harness-owned scripts that materialize a short-lived
+    /// token env on demand (fetch + validity-check + rotate-only-when-needed). A duty/skill
+    /// references a provider by `name` in its `secrets:` list; the harness runs the provider
+    /// command and injects its JSON output. Adding a new secret (X, cove.trade, …) is a YAML
+    /// entry + a script — **never a harness change** (PRD §7.2; `docs/SECRETS-AND-SANDBOX.md`).
+    #[serde(default)]
+    pub secrets_providers: Vec<SecretsProviderConfig>,
     #[serde(default)]
     pub control_plane: ControlPlane,
     /// Cron schedule for the harness-entered Reflect run (PRD §4.2). `None` = manual

@@ -20,6 +20,7 @@ use crate::bus::Bus;
 use crate::config::DackConfig;
 use crate::error::{DackError, Result};
 use crate::model::stimulus::StimulusId;
+use crate::secrets::providers::SecretsBroker;
 use crate::sensor::{SensorCandidate, SensorRunner};
 use crate::sources::{CronScheduler, FiredTrigger};
 use crate::stimuli::Registry;
@@ -37,6 +38,8 @@ pub struct Ingestor {
     pub bus: Arc<Bus>,
     pub sensor: Arc<dyn SensorRunner>,
     pub registry: Arc<RwLock<Registry>>,
+    /// Materializes the short-lived secret env a duty declares (the trusted provider scripts).
+    pub broker: Arc<SecretsBroker>,
 }
 
 impl Ingestor {
@@ -56,8 +59,15 @@ impl Ingestor {
         let candidates = match def.resolved_sensor(&self.repo_root) {
             // A duty with a (trusted) sensor: run it on the trigger payload.
             Some(exe) => {
+                // Base read-scoped env + the short-lived token env the duty's declared
+                // providers materialize (the harness runs those trusted scripts; the sensor
+                // only ever sees the resulting bearer — PRD §7.2).
+                let mut env = self.sensor_env();
+                for (k, v) in self.broker.env_for(&def.frontmatter.secrets).await? {
+                    env.insert(k, v);
+                }
                 self.sensor
-                    .run(&exe, &fired.payload, &self.sensor_env(), SENSOR_TIMEOUT)
+                    .run(&exe, &fired.payload, &env, SENSOR_TIMEOUT)
                     .await?
             }
             // Pure-cron self-prompt (the duck's alarm clock, PRD §10.3): no sensor, so
@@ -197,7 +207,8 @@ mod tests {
             config: config.clone(),
             bus: Arc::new(Bus::new(config, queue.clone())),
             queue: queue.clone(),
-            sensor: Arc::new(SubprocessSensor),
+            sensor: Arc::new(SubprocessSensor::new()),
+            broker: Arc::new(SecretsBroker::new(vec![])),
             registry: Arc::new(RwLock::new(Registry::load(&root).unwrap())),
         };
 
@@ -227,7 +238,8 @@ mod tests {
             config: config.clone(),
             bus: Arc::new(Bus::new(config, queue.clone())),
             queue,
-            sensor: Arc::new(SubprocessSensor),
+            sensor: Arc::new(SubprocessSensor::new()),
+            broker: Arc::new(SecretsBroker::new(vec![])),
             registry: Arc::new(RwLock::new(Registry::default())),
         };
         let ids = ingestor

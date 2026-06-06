@@ -96,7 +96,7 @@ async fn run(config_path: &str) -> Result<()> {
     let queue: Arc<dyn Queue> = Arc::new(SqliteQueue::open(&config.db_path)?);
     let bus = Arc::new(Bus::new(config.clone(), queue.clone()));
     let registry = Arc::new(RwLock::new(Registry::load(&repo_root)?));
-    let sensor: Arc<dyn SensorRunner> = Arc::new(SubprocessSensor);
+    let sensor: Arc<dyn SensorRunner> = Arc::new(SubprocessSensor::new());
 
     // One unified FiredTrigger channel drained by the ingestor; cron + webhook both feed it.
     let (tx, rx) = mpsc::channel(256);
@@ -138,6 +138,9 @@ async fn run(config_path: &str) -> Result<()> {
     let repo: Arc<dyn RepoHost> = Arc::new(PlainGitRepo::new(&config.soul_repo, &config.operator_did));
     let identity: Arc<dyn IdentityProvider> =
         Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await?);
+    // Secrets broker from config — trusted provider scripts; shared by sensors (per-duty
+    // `secrets:`) and the Express act phase (per-route `secrets:`).
+    let broker = Arc::new(crate::secrets::providers::broker_from_config(&config));
     let harness = Arc::new(Harness {
         config: config.clone(),
         queue: queue.clone(),
@@ -146,6 +149,7 @@ async fn run(config_path: &str) -> Result<()> {
         repo,
         identity,
         runlog,
+        broker: broker.clone(),
     });
     tokio::spawn({
         let h = harness.clone();
@@ -164,6 +168,7 @@ async fn run(config_path: &str) -> Result<()> {
         bus,
         sensor,
         registry,
+        broker,
     });
     eprintln!("dack: ingestion up (cron+webhook → bus → queue).");
     ingestor.run(rx).await;

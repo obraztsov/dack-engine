@@ -41,6 +41,7 @@ pub mod queue;
 pub mod repo;
 pub mod runlog;
 pub mod runtime;
+pub mod sandbox;
 pub mod secrets;
 pub mod sensor;
 pub mod sources;

@@ -32,7 +32,8 @@ CREATE TABLE IF NOT EXISTS stimulus (
     priority       TEXT NOT NULL,
     priority_rank  INTEGER NOT NULL,
     status         TEXT NOT NULL,
-    directive_body TEXT NOT NULL
+    directive_body TEXT NOT NULL,
+    entry          TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_stimulus_dedup        ON stimulus(type, dedup_key);
 CREATE INDEX IF NOT EXISTS idx_stimulus_status_rank  ON stimulus(status, priority_rank, received_at);
@@ -40,7 +41,7 @@ CREATE INDEX IF NOT EXISTS idx_stimulus_status_rank  ON stimulus(status, priorit
 
 /// The column list, in a fixed order shared by every SELECT and [`read_raw`].
 const COLS: &str =
-    "id,source,type,directive_tier,payload_tier,payload,provenance,received_at,dedup_key,priority,status,directive_body";
+    "id,source,type,directive_tier,payload_tier,payload,provenance,received_at,dedup_key,priority,status,directive_body,entry";
 
 pub struct SqliteQueue {
     conn: Mutex<Connection>,
@@ -105,6 +106,7 @@ struct RawRow {
     priority: String,
     status: String,
     directive_body: String,
+    entry: String,
 }
 
 fn read_raw(row: &rusqlite::Row) -> rusqlite::Result<RawRow> {
@@ -121,6 +123,7 @@ fn read_raw(row: &rusqlite::Row) -> rusqlite::Result<RawRow> {
         priority: row.get(9)?,
         status: row.get(10)?,
         directive_body: row.get(11)?,
+        entry: row.get(12)?,
     })
 }
 
@@ -138,6 +141,7 @@ fn raw_to_stimulus(r: RawRow) -> Result<Stimulus> {
         priority: enum_from_db(&r.priority)?,
         status: enum_from_db(&r.status)?,
         directive_body: r.directive_body,
+        entry: enum_from_db(&r.entry)?,
     })
 }
 
@@ -148,8 +152,8 @@ impl Queue for SqliteQueue {
         // OR IGNORE: re-enqueuing the same id (e.g. a retried fire) is a no-op, never a dup.
         conn.execute(
             "INSERT OR IGNORE INTO stimulus
-             (id,source,type,directive_tier,payload_tier,payload,provenance,received_at,dedup_key,priority,priority_rank,status,directive_body)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+             (id,source,type,directive_tier,payload_tier,payload,provenance,received_at,dedup_key,priority,priority_rank,status,directive_body,entry)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             params![
                 s.id.0,
                 s.source,
@@ -164,6 +168,7 @@ impl Queue for SqliteQueue {
                 s.priority.numeric(),
                 enum_to_db(&s.status)?,
                 s.directive_body,
+                enum_to_db(&s.entry)?,
             ],
         )
         .map_err(db)?;
@@ -256,6 +261,7 @@ impl Queue for SqliteQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::EntryState;
     use crate::model::stimulus::{Priority, TrustTier};
     use serde_json::json;
 
@@ -273,6 +279,7 @@ mod tests {
             priority: prio,
             status: StimulusStatus::Pending,
             directive_body: "duty".into(),
+            entry: EntryState::Perceive,
         }
     }
 

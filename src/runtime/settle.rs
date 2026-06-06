@@ -123,6 +123,7 @@ mod tests {
             priority: Priority::Normal,
             status: StimulusStatus::Pending,
             directive_body: String::new(),
+            entry: crate::config::EntryState::Perceive,
         }
     }
 

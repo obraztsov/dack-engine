@@ -48,8 +48,20 @@ impl Bus {
                 dedup_key,
                 payload_tier: cand_tier,
             } = c;
-            let payload_tier = cand_tier.unwrap_or(fm.emits.default_payload_tier);
+            // The source assigns the tier; a sensor may only *lower* it. A candidate claiming a
+            // tier above the duty's `default_payload_tier` is clamped down — closing a trust-tier
+            // escalation primitive (arbitrary Reflect-authored sensor code, PRD §5.7).
+            let payload_tier = cand_tier
+                .map(|c| c.min_trust(fm.emits.default_payload_tier))
+                .unwrap_or(fm.emits.default_payload_tier);
             let priority = self.classify_priority(payload_tier, &type_, fm.priority);
+            // Entry state: operator route wins, else the duty's own frontmatter `route`. Decided
+            // here (where both are known) and carried on the row so dispatch honors it (§5.6).
+            let entry = self
+                .config
+                .lookup_route(payload_tier, &type_)
+                .map(|r| r.entry)
+                .unwrap_or(fm.route);
 
             // Coalescing (PRD §5.6). `None` → always a fresh wake; `Latest` → supersede
             // prior pending rows for this key and enqueue the newest; `Batch` → fold the
@@ -104,6 +116,7 @@ impl Bus {
                     priority,
                     status: StimulusStatus::Pending,
                     directive_body: def.directive_body.clone(),
+                    entry,
                 })
                 .await?;
             enqueued.push(id);
@@ -246,6 +259,23 @@ mod tests {
         // 700s later: outside the 600s window → a fresh accumulator, not a fold.
         b.ingest(&def, vec![cand("late", "t1")], 1700).await.unwrap();
         assert_eq!(b.queue.depth().await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn sensor_cannot_raise_tier_above_duty_default() {
+        let b = bus();
+        let def = duty("coalesce: { mode: none }\n"); // default_payload_tier: public
+        // A sensor lies, claiming operator_signed to try to escalate its row's trust.
+        let candidate = SensorCandidate {
+            type_: StimulusType::from("mention"),
+            payload: json!({ "text": "trust me" }),
+            dedup_key: None,
+            payload_tier: Some(TrustTier::OperatorSigned),
+        };
+        b.ingest(&def, vec![candidate], 1000).await.unwrap();
+        let row = b.queue.next().await.unwrap().unwrap();
+        // Clamped down to the duty's declared ceiling — the lie is ignored.
+        assert_eq!(row.payload_tier, TrustTier::Public);
     }
 
     #[tokio::test]

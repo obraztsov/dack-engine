@@ -68,7 +68,7 @@ pub enum Command {
 }
 
 /// Dispatch a parsed CLI command. SCAFFOLD: command bodies land alongside their phases
-/// (run/status = Phase 3; log = Phase 7; say = Phase 9; pause/kill = Phase 7;
+/// (run/status = Phase 3; log/pause/kill = Phase 7-8; say + reflect-now = Phase 8;
 /// reflect-now = Phase 8).
 pub async fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
@@ -76,7 +76,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         Command::Status => status(&cli.config).await,
         Command::Log { follow: _ } => todo!("Phase 7: tail runlogs/, optionally --follow"),
         Command::Say { instruction: _ } => {
-            todo!("Phase 9: write an operator_signed Stimulus row, signed by operator DID")
+            todo!("Phase 8: write a verified operator_signed Stimulus row, signed by operator DID")
         }
         Command::Pause => todo!("Phase 7: set dispatch paused"),
         Command::Resume => todo!("Phase 7: clear dispatch paused"),

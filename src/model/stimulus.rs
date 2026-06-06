@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::EntryState;
+
 /// Provenance-derived trust tier (PRD §5.7). Assigned *deterministically by the
 /// source*, never by the model. The tier does not decide what the agent thinks
 /// (cognition is sovereign); it decides — as a dumb edge rule in the bus — which
@@ -25,6 +27,29 @@ pub enum TrustTier {
     /// A tweet, a random webhook payload. Read-only (Perceive) and always delimited
     /// as untrusted.
     Public,
+}
+
+impl TrustTier {
+    /// Trust-privilege rank (higher = more privileged): `public < authed_peer < self <
+    /// operator_signed`. The source assigns the tier; a payload-producer (sensor) may only
+    /// **lower** it (PRD §5.7 — "the source assigns the tier, never the payload-producer").
+    pub fn rank(self) -> u8 {
+        match self {
+            TrustTier::Public => 0,
+            TrustTier::AuthedPeer => 1,
+            TrustTier::SelfTier => 2,
+            TrustTier::OperatorSigned => 3,
+        }
+    }
+
+    /// The lower-trust of two tiers — the clamp a sensor-declared tier may not exceed.
+    pub fn min_trust(self, ceiling: TrustTier) -> TrustTier {
+        if self.rank() <= ceiling.rank() {
+            self
+        } else {
+            ceiling
+        }
+    }
 }
 
 /// Open vocabulary of stimulus types ("mention", "clarity_post", "scheduled_post",
@@ -118,4 +143,8 @@ pub struct Stimulus {
     /// The trusted directive text (the `.md` body) carried alongside the untrusted
     /// payload. Delimited as trusted-briefing when assembled into Perceive context.
     pub directive_body: String,
+    /// The consciousness entry state this cycle opens at — decided by the **bus** at ingest
+    /// (operator route `entry`, else the duty's frontmatter `route`). `PerceiveThenExpress`
+    /// makes dispatch open Express unconditionally after Perceive (the firebreak still holds).
+    pub entry: EntryState,
 }

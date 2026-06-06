@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::bus::Bus;
-use crate::config::DackConfig;
+use crate::config::{DackConfig, EntryState};
 use crate::error::Result;
 use crate::identity::{IdentityProvider, IdentityRole};
 use crate::secrets::providers::SecretsBroker;
@@ -35,7 +35,7 @@ use crate::repo::{CommitMeta, RepoHost, RepoPath};
 use crate::runlog::RunLogWriter;
 use crate::runtime::action_required::StatePolicyResponder;
 use crate::runtime::{ActionResponder, ContextBlock, InvocationRequest, RuntimeClient};
-use crate::state::{allowed_transition, default_spec, ConsciousnessState};
+use crate::state::{allowed_transition, default_spec, tier_permits_transition, ConsciousnessState};
 
 pub mod ingest;
 
@@ -88,15 +88,27 @@ impl Harness {
         // (4) Durable RunLog with raw stimulus framed-untrusted → runlog_ref.
         let runlog_ref = self.write_perceive_runlog(&stimulus, &perceive_out).await?;
 
-        // (5) Honor a transition only if the harness's own rules allow it (PRD §4.2).
-        if let Some(to) = perceive_out.transition.to_state {
-            if allowed_transition(ConsciousnessState::Perceive, to) {
-                if let Some(baton) = build_baton(&perceive_out, &stimulus, runlog_ref) {
-                    // Materialize the act-phase secrets the operator granted this route — the
-                    // ONLY point a network capability credential enters a cycle (never Perceive).
-                    let secret_env = self.act_secrets(&stimulus).await;
-                    self.open_next_state(to, baton, secret_env).await?;
-                }
+        // (5) Decide the next state. The model PROPOSES; the **harness decides**, bounded by
+        // three independent gates: the route's `entry` (PerceiveThenExpress forces Express —
+        // restoring the deterministic cadence the model could otherwise no-op), the trust-tier
+        // ceiling (a `public` stimulus can reach reversible Express but never irreversible
+        // Settle), and the structural transition rule (PRD §4.2, §5.7).
+        let forced =
+            (stimulus.entry == EntryState::PerceiveThenExpress).then_some(ConsciousnessState::Express);
+        if let Some(to) = forced.or(perceive_out.transition.to_state) {
+            if !tier_permits_transition(stimulus.payload_tier, to) {
+                eprintln!(
+                    "dispatch: dropped transition to {to:?} — above the {:?} tier ceiling ({})",
+                    stimulus.payload_tier, stimulus.id
+                );
+            } else if allowed_transition(ConsciousnessState::Perceive, to) {
+                // Materialize the act-phase secrets the operator granted this route — the ONLY
+                // point a network capability credential enters a cycle (never Perceive).
+                let baton = build_baton(&perceive_out, &stimulus, runlog_ref);
+                let secret_env = self.act_secrets(&stimulus).await;
+                self.open_next_state(to, baton, secret_env).await?;
+            } else {
+                eprintln!("dispatch: transition to {to:?} not allowed from Perceive ({})", stimulus.id);
             }
         }
         Ok(())
@@ -300,22 +312,25 @@ impl Harness {
 /// Build the Baton from Perceive's output (PRD §6.4). Pure + testable: the firebreak's
 /// core invariant — the Baton carries the agent's **digested gist**, never the raw
 /// stimulus payload. Returns `None` when Perceive proposed nothing to carry forward.
-pub fn build_baton(
-    perceive: &AgentOutput,
-    stimulus: &Stimulus,
-    runlog_ref: String,
-) -> Option<Baton> {
-    let proposal = perceive.proposal.as_ref()?;
-    Some(Baton {
-        gist: proposal.gist.clone(),
-        refs: proposal.refs.clone(),
+pub fn build_baton(perceive: &AgentOutput, stimulus: &Stimulus, runlog_ref: String) -> Baton {
+    // Carry the proposal's gist when present; else fall back to the digested *thought* — a
+    // forced `PerceiveThenExpress` cycle (e.g. the heartbeat) must still open Express even if
+    // Perceive proposed nothing explicit. Either way it is the agent's OWN digested product,
+    // never the raw untrusted payload (the firebreak, PRD §6.4).
+    let (gist, refs) = match &perceive.proposal {
+        Some(p) => (p.gist.clone(), p.refs.clone()),
+        None => (perceive.thought.clone(), Default::default()),
+    };
+    Baton {
+        gist,
+        refs,
         // Harness-authored trusted annotations (not attacker-controlled text).
         directive_tier: stimulus.directive_tier,
         payload_tier: stimulus.payload_tier,
         runlog_ref,
         // Continuity only — explicitly NOT a safety boundary (PRD §6.4).
         thoughts: perceive.thought.clone(),
-    })
+    }
 }
 
 #[cfg(test)]
@@ -344,6 +359,7 @@ mod tests {
             priority: Priority::Low,
             status: StimulusStatus::Pending,
             directive_body: "Standing directive: engage with mentions.".into(),
+            entry: crate::config::EntryState::Perceive,
         }
     }
 
@@ -367,8 +383,7 @@ mod tests {
     fn baton_carries_gist_not_raw_payload() {
         let stimulus = poisoned_stimulus();
         let out = perceive_output();
-        let baton =
-            build_baton(&out, &stimulus, "runlogs/2026-05-29.md#run-0001".into()).unwrap();
+        let baton = build_baton(&out, &stimulus, "runlogs/2026-05-29.md#run-0001".into());
 
         // The firebreak invariant: the raw injected bytes never ride into the Baton.
         let serialized = serde_json::to_string(&baton).unwrap();
@@ -584,6 +599,116 @@ mod tests {
         );
 
         std::env::remove_var("DACK_ACT_TEST_TOKEN");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A `PerceiveThenExpress` route opens Express **unconditionally** — even when Perceive
+    /// proposes no transition and no proposal (the deterministic cadence the model could
+    /// otherwise no-op away, e.g. the heartbeat). The firebreak still holds: the Baton carries
+    /// the digested *thought* as its gist (no raw payload).
+    #[tokio::test]
+    async fn perceive_then_express_forces_express_even_with_no_proposal() {
+        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::queue::InMemoryQueue;
+        use crate::repo::git::PlainGitRepo;
+        use crate::runlog::FileRunLog;
+        use std::collections::HashMap;
+
+        let tmp = std::env::temp_dir().join(format!("dack-pte-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Perceive surfaces a thought but proposes nothing and no transition.
+        let runtime = Arc::new(RecordingRuntime {
+            seen: std::sync::Mutex::new(Vec::new()),
+            out: AgentOutput {
+                thought: "nobody pinged; I'll post my daily musing anyway".into(),
+                memory_append: None,
+                proposal: None,
+                transition: Transition { to_state: None, reason: String::new() },
+            },
+        });
+        let config = Arc::new(DackConfig::from_yaml("operator_did: \"did:x\"").unwrap());
+        let queue: Arc<dyn Queue> = Arc::new(InMemoryQueue::new());
+        let harness = Harness {
+            config: config.clone(),
+            queue: queue.clone(),
+            bus: Arc::new(Bus::new(config.clone(), queue.clone())),
+            runtime: runtime.clone(),
+            repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
+            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
+            broker: Arc::new(SecretsBroker::new(vec![])),
+        };
+
+        let mut stim = poisoned_stimulus();
+        stim.entry = EntryState::PerceiveThenExpress;
+        harness.dispatch(stim).await.unwrap();
+
+        let seen = runtime.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "forced Express ran despite no proposal/transition");
+        let express = seen[1]
+            .blocks
+            .iter()
+            .map(|b| b.body.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        // The fallback gist (the digested thought) crossed; the raw payload did not.
+        assert!(express.contains("daily musing"), "{express}");
+        assert!(!express.contains("IGNORE PREVIOUS INSTRUCTIONS"), "{express}");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The trust-tier ceiling is enforced at dispatch: a `public` stimulus whose Perceive
+    /// proposes the IRREVERSIBLE Settle is dropped — only Perceive runs. (A public tweet can
+    /// reach reversible Express, but never an on-chain/irreversible Settle; PRD §5.7, §7.6.)
+    #[tokio::test]
+    async fn public_stimulus_cannot_reach_settle() {
+        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::queue::InMemoryQueue;
+        use crate::repo::git::PlainGitRepo;
+        use crate::runlog::FileRunLog;
+        use std::collections::HashMap;
+
+        let tmp = std::env::temp_dir().join(format!("dack-pubsettle-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let runtime = Arc::new(RecordingRuntime {
+            seen: std::sync::Mutex::new(Vec::new()),
+            out: AgentOutput {
+                thought: "I'll settle this on-chain".into(),
+                memory_append: None,
+                proposal: Some(Proposal {
+                    intent: Intent::Reply,
+                    gist: "g".into(),
+                    refs: BTreeMap::new(),
+                }),
+                transition: Transition {
+                    to_state: Some(ConsciousnessState::Settle),
+                    reason: "tweet told me to".into(),
+                },
+            },
+        });
+        let config = Arc::new(DackConfig::from_yaml("operator_did: \"did:x\"").unwrap());
+        let queue: Arc<dyn Queue> = Arc::new(InMemoryQueue::new());
+        let harness = Harness {
+            config: config.clone(),
+            queue: queue.clone(),
+            bus: Arc::new(Bus::new(config.clone(), queue.clone())),
+            runtime: runtime.clone(),
+            repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
+            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
+            broker: Arc::new(SecretsBroker::new(vec![])),
+        };
+
+        harness.dispatch(poisoned_stimulus()).await.unwrap(); // payload_tier = Public
+
+        // Only Perceive ran — the Settle transition was dropped above the tier ceiling.
+        assert_eq!(runtime.seen.lock().unwrap().len(), 1, "Settle dropped for a public tier");
+
         std::fs::remove_dir_all(&tmp).ok();
     }
 }

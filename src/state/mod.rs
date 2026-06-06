@@ -172,20 +172,39 @@ pub fn allowed_transition(from: ConsciousnessState, to: ConsciousnessState) -> b
     matches!((from, to), (Perceive, Express) | (Perceive, Settle))
 }
 
-/// Max consciousness state a stimulus of a given tier may route toward (PRD §5.7).
-/// This is the deterministic edge rule that generalizes the settlement predicate:
-/// "a stimulus of sufficient provenance exists" is the precondition the dumb bus
-/// checks before unlocking a dangerous state transition.
+/// The highest consciousness state a stimulus of a given tier may **transition** toward — the
+/// deterministic tier-edge backstop (PRD §5.7), independent of the model's proposal and the
+/// operator's routing. **Only the irreversible `Settle` doorway is tier-gated** (operator_signed
+/// only); reversible **`Express` is open to *any* tier**, because the firebreak makes the Express
+/// action the duck's *own* digested choice (a bad reply is reversible — sovereign territory — and
+/// the dumb Settle predicate still backstops irreversible action). This is the *transition*
+/// ceiling, distinct from the *entry* state (which routing/`route.entry` decides — a public tweet
+/// still *enters* at Perceive). `Reflect` is harness-entered only and never transition-reachable.
 pub fn max_reachable_state(tier: TrustTier) -> ConsciousnessState {
     match tier {
-        // (settle, when wired) — v1 has no routing edge to Settle regardless.
         TrustTier::OperatorSigned => ConsciousnessState::Settle,
-        // self can author duties and reach Reflect via the harness clock (not directly).
-        TrustTier::SelfTier => ConsciousnessState::Reflect,
-        TrustTier::AuthedPeer => ConsciousnessState::Express,
-        // A tweet / random webhook: Perceive only, always delimited untrusted.
-        TrustTier::Public => ConsciousnessState::Perceive,
+        // public / authed_peer / self: up to reversible Express (Settle needs operator_signed).
+        _ => ConsciousnessState::Express,
     }
+}
+
+/// Reachability rank for the tier-ceiling clamp: `Perceive < Express < Settle`. `Reflect` ranks
+/// above only so the comparison is total; it is harness-only and never compared in practice.
+fn reach_rank(s: ConsciousnessState) -> u8 {
+    use ConsciousnessState::*;
+    match s {
+        Perceive => 0,
+        Express => 1,
+        Settle => 2,
+        Reflect => 3,
+    }
+}
+
+/// Whether a `tier` stimulus may transition to `to` — the dumb tier-edge gate the harness
+/// applies before honoring a model-proposed transition (PRD §5.7). Compose with
+/// [`allowed_transition`] (the structural rule): a transition needs **both**.
+pub fn tier_permits_transition(tier: TrustTier, to: ConsciousnessState) -> bool {
+    reach_rank(to) <= reach_rank(max_reachable_state(tier))
 }
 
 #[cfg(test)]
@@ -262,8 +281,23 @@ mod tests {
     }
 
     #[test]
-    fn public_tier_reaches_only_perceive() {
-        assert_eq!(max_reachable_state(TrustTier::Public), Perceive);
+    fn tier_ceiling_gates_settle_not_express() {
+        // Reversible Express is open to EVERY tier — the firebreak makes it the duck's own
+        // digested choice (a public mention → Perceive → Express reply is the core flow).
+        for t in [
+            TrustTier::Public,
+            TrustTier::AuthedPeer,
+            TrustTier::SelfTier,
+            TrustTier::OperatorSigned,
+        ] {
+            assert!(tier_permits_transition(t, Express), "{t:?} → Express must be permitted");
+        }
+        // The irreversible Settle doorway is operator_signed ONLY.
+        assert!(tier_permits_transition(TrustTier::OperatorSigned, Settle));
+        for t in [TrustTier::Public, TrustTier::AuthedPeer, TrustTier::SelfTier] {
+            assert!(!tier_permits_transition(t, Settle), "{t:?} → Settle must be denied");
+        }
+        assert_eq!(max_reachable_state(TrustTier::Public), Express);
         assert_eq!(max_reachable_state(TrustTier::OperatorSigned), Settle);
     }
 }

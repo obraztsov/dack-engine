@@ -1,20 +1,20 @@
-//! Runtime seam (PRD §5, §6) — the OpenClaude headless-gRPC substrate, rented not
-//! rebuilt (architecture §5). **Engine = consciousness substrate; this harness = gRPC
-//! client = the actor-scheduler.** The operator/actor split becomes a *process
-//! boundary*, not a convention.
+//! Runtime seam (PRD §5, §6) — the OpenClaude substrate, rented not rebuilt (architecture
+//! §5). **Engine = consciousness substrate; this harness = the client/approver = the
+//! actor-scheduler.** Transport is **NDJSON over stdio** to a child Node bridge
+//! ([`openclaude::OpenClaudeClient`] drives `openclaude-bridge/bridge.ts`); the operator/actor
+//! split becomes a *process boundary*, not a convention. (OpenClaude also ships a gRPC server —
+//! the original topology — but it under-exposes the engine; we chose its richer SDK + stdio.)
 //!
 //! The two load-bearing pieces:
 //!   - [`RuntimeClient`] — invoke a consciousness state with an assembled context and
 //!     a per-state allowed-tool set; returns the agent's structured [`AgentOutput`].
-//!   - [`ActionResponder`] — answers the `action_required` event y/n after
-//!     deterministic checks. **This is the wall** (PRD §6.3): every sensitive tool call
-//!     pauses for this out-of-process responder before completing. The agent cannot
-//!     touch it.
+//!   - [`ActionResponder`] — **the wall** (PRD §6.3). Every tool call routes through the SDK's
+//!     `canUseTool(name, input, {toolUseID})` callback, which the bridge relays to this
+//!     out-of-process responder for a y/n decision before the tool runs. The agent can't touch it.
 //!
-//! MUST-VERIFY (Phase 0, gates the whole runtime choice, PRD §6.3/§12.2): confirm
-//! `action_required` fires for *all* sensitive tool classes (bash, file-write, network,
-//! MCP) with no bypass, and bind gRPC to localhost only (the approval channel must not
-//! be impersonable).
+//! Phase 0 verified (`docs/VERIFICATION.md` G1): `canUseTool` fires for *all* tool classes
+//! (bash, file-write, network, MCP, subagent) with no bypass. The approval channel is the
+//! child's stdin/stdout — a pipe binds nothing, so there is no socket to impersonate.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

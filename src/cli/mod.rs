@@ -19,11 +19,12 @@ use crate::error::{DackError, Result};
 use crate::harness::ingest::{spawn_stimuli_watcher, Ingestor};
 use crate::harness::Harness;
 use crate::identity::gitlawb::GitlawbIdentity;
-use crate::identity::IdentityProvider;
+use crate::identity::{IdentityProvider, IdentityRole};
 use crate::queue::{Queue, SqliteQueue};
 use crate::repo::git::PlainGitRepo;
+use crate::repo::gitlawb::GitlawbRepo;
 use crate::repo::RepoHost;
-use crate::runlog::{FileRunLog, RunLogWriter};
+use crate::runlog::{DailyFileRunLog, RunLogWriter};
 use crate::runtime::openclaude::OpenClaudeClient;
 use crate::runtime::RuntimeClient;
 use crate::sensor::{SensorRunner, SubprocessSensor};
@@ -74,16 +75,45 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Run => run(&cli.config).await,
         Command::Status => status(&cli.config).await,
-        Command::Log { follow: _ } => todo!("Phase 7: tail runlogs/, optionally --follow"),
-        Command::Say { instruction: _ } => {
-            todo!("Phase 8: write a verified operator_signed Stimulus row, signed by operator DID")
-        }
-        Command::Pause => todo!("Phase 7: set dispatch paused"),
-        Command::Resume => todo!("Phase 7: clear dispatch paused"),
-        Command::Kill => todo!("Phase 7: stop processes"),
-        Command::Fund => todo!("placeholder: extend runway"),
-        Command::ReflectNow => todo!("Phase 8: enqueue a harness-entered Reflect run"),
+        Command::Log { follow } => log_cmd(&cli.config, follow).await,
+        // Clean `NotImplemented` (not a panic): a stray invocation logs, never crashes (PRD §7.5).
+        Command::Say { instruction: _ } => Err(DackError::NotImplemented(
+            "dack say — Phase 8 (verified operator_signed stimulus, signed by operator DID)",
+        )),
+        Command::Pause => Err(DackError::NotImplemented("dack pause — kill-switch, Phase 8")),
+        Command::Resume => Err(DackError::NotImplemented("dack resume — Phase 8")),
+        // The hard stop is SIGTERM (graceful drain) — `systemctl stop dack` / Ctrl-C.
+        Command::Kill => Err(DackError::NotImplemented(
+            "dack kill — use SIGTERM (systemctl stop / Ctrl-C) for a graceful drain",
+        )),
+        Command::Fund => Err(DackError::NotImplemented("dack fund — runway placeholder")),
+        Command::ReflectNow => Err(DackError::NotImplemented(
+            "dack reflect-now — Phase 8 (enqueue a harness-entered Reflect run)",
+        )),
     }
+}
+
+/// `dack log` (PRD §8.3) — the "agent syslog": print today's runlog, and with `--follow` stream
+/// new entries as the duck writes them (naive size-poll; the runlog is append-only).
+async fn log_cmd(config_path: &str, follow: bool) -> Result<()> {
+    use std::io::Write;
+    let config = DackConfig::load(config_path)?;
+    let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let path = PathBuf::from(&config.soul_repo).join(format!("runlogs/{date}.md"));
+    let mut shown = 0usize;
+    loop {
+        let text = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+        if text.len() > shown {
+            print!("{}", &text[shown..]);
+            std::io::stdout().flush().ok();
+            shown = text.len();
+        }
+        if !follow {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    }
+    Ok(())
 }
 
 /// Boot the ingestion pipeline (Phase 3): cron + webhook → sensor → bus → SQLite queue,
@@ -133,11 +163,35 @@ async fn run(config_path: &str) -> Result<()> {
         &config.bridge_dir,
         bridge_env(&config),
         config.model.clone(),
+        std::time::Duration::from_secs(config.invoke_timeout_secs),
     ));
-    let runlog: Arc<dyn RunLogWriter> = Arc::new(FileRunLog::new(repo_root.join("runlogs")));
-    let repo: Arc<dyn RepoHost> = Arc::new(PlainGitRepo::new(&config.soul_repo, &config.operator_did));
+    // Identity: resolve the configured `gl` role dirs. The Soul dir signs soul commits + the
+    // `gitlawb://` push; its key never enters agent env (PRD §3.3, §7.2).
     let identity: Arc<dyn IdentityProvider> =
-        Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await?);
+        Arc::new(GitlawbIdentity::resolve("gl", config.identity_dirs()).await?);
+    let soul_did = identity
+        .did(IdentityRole::Soul)
+        .map(|d| d.0.clone())
+        .unwrap_or_else(|| config.operator_did.clone());
+
+    // Repo-host: a signed `gitlawb://` soul repo when a remote + Soul identity dir are
+    // configured, else plain git (degraded mode, PRD §3.5). The Soul DID attributes the
+    // commit history to the duck; the signed push is the cryptographic provenance.
+    let repo: Arc<dyn RepoHost> = match (&config.soul_remote, &config.identities.soul) {
+        (Some(remote), Some(soul_dir)) => Arc::new(GitlawbRepo::new(
+            &config.soul_repo,
+            soul_did.clone(),
+            remote.clone(),
+            soul_dir.clone(),
+            config.gitlawb_node.clone(),
+        )),
+        _ => {
+            eprintln!("dack: no soul_remote/identities.soul — plain-git, local-only (no signed push)");
+            Arc::new(PlainGitRepo::new(&config.soul_repo, soul_did.clone()))
+        }
+    };
+    let runlog: Arc<dyn RunLogWriter> =
+        Arc::new(DailyFileRunLog::new(repo.clone(), soul_did.clone()));
     // Secrets broker from config — trusted provider scripts; shared by sensors (per-duty
     // `secrets:`) and the Express act phase (per-route `secrets:`).
     let broker = Arc::new(crate::secrets::providers::broker_from_config(&config));
@@ -151,10 +205,23 @@ async fn run(config_path: &str) -> Result<()> {
         runlog,
         broker: broker.clone(),
     });
+    // Graceful shutdown: SIGTERM/SIGINT flips the watch; the consciousness loop finishes its
+    // in-flight dispatch, then exits (no zombie `dispatched` row). systemd restarts on crash;
+    // the next boot reclaims orphans + posts "back online" (PRD §11.8).
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = term.recv() => eprintln!("dack: SIGTERM — draining"),
+            _ = tokio::signal::ctrl_c() => eprintln!("dack: SIGINT — draining"),
+        }
+        let _ = shutdown_tx.send(true);
+    });
     tokio::spawn({
         let h = harness.clone();
         async move {
-            if let Err(e) = h.run().await {
+            if let Err(e) = h.run(shutdown_rx).await {
                 eprintln!("dack: consciousness loop stopped: {e}");
             }
         }

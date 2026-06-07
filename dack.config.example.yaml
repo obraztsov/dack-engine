@@ -89,3 +89,23 @@ bridge_dir: "openclaude-bridge"
 # Env var NAMES forwarded into the bridge (values come from the harness env, never the YAML).
 # For opengateway: export OPENAI_API_KEY=ogw_live_…  OPENAI_BASE_URL=https://opengateway.gitlawb.com/v1  OPENAI_MODEL=mimo-v2.5-pro
 runtime_env: [OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL]
+
+# ── Soul repo + identity (Phase 7: durable, signed, off-VPS) ──────────────────────────────
+# `gl` identity DIRECTORIES per role (each holds identity.pem + ucan.json). The Soul dir signs
+# every soul commit + the `gitlawb://` push, and its key NEVER enters agent env (PRD §3.3, §7.2).
+# Create with `gl identity new --dir identities/<role>`; gitignore `/identities/`.
+identities:
+  soul: "identities/soul"
+  operator: "identities/operator"
+  builder: "identities/builder"
+
+# The soul's signed push remote. When set (with identities.soul), the harness uses the Gitlawb
+# repo-host: each per-run commit-sweep + runlog is committed as the Soul DID and pushed as a
+# signed `gitlawb://` ref-update. Omit for plain-git, local-only (degraded mode, PRD §3.5).
+# soul_repo above should point at the soul working tree (its own git repo), e.g. "soul-template".
+soul_remote: "gitlawb://did:key:z6MkYourSoulDidReplaceMe/dack-soul"
+gitlawb_node: "https://node.gitlawb.com"
+
+# Wall-clock budget (seconds) for one consciousness invocation incl. the wall round-trips. A hung
+# LLM/bridge elapses here → a logged Runtime error → dispatch continues (never a frozen loop).
+invoke_timeout_secs: 300

@@ -23,18 +23,22 @@ use std::time::Duration;
 
 use crate::bus::Bus;
 use crate::config::{DackConfig, EntryState};
-use crate::error::Result;
+use crate::error::{DackError, Result};
 use crate::identity::{IdentityProvider, IdentityRole};
 use crate::secrets::providers::SecretsBroker;
 use crate::model::baton::Baton;
 use crate::model::proposal::AgentOutput;
-use crate::model::runlog::{Outcome, RunLogEntry};
-use crate::model::stimulus::Stimulus;
+use crate::model::runlog::{Outcome, RunLogEntry, ToolCallRecord};
+use crate::model::stimulus::{
+    Priority, Stimulus, StimulusId, StimulusStatus, StimulusType, TrustTier,
+};
 use crate::queue::Queue;
 use crate::repo::{CommitMeta, RepoHost, RepoPath};
 use crate::runlog::RunLogWriter;
 use crate::runtime::action_required::StatePolicyResponder;
-use crate::runtime::{ActionResponder, ContextBlock, InvocationRequest, RuntimeClient};
+use crate::runtime::{
+    ActionDecision, ActionRequest, ActionResponder, ContextBlock, InvocationRequest, RuntimeClient,
+};
 use crate::state::{allowed_transition, default_spec, tier_permits_transition, ConsciousnessState};
 
 pub mod ingest;
@@ -57,38 +61,131 @@ impl Harness {
     /// The single-flight dispatch loop. Concurrency = 1 — the duck is one mind
     /// (architecture §3). SCAFFOLD: the body wires the real calls; the runtime stub
     /// (`todo!`) lands in Phase 4.
-    pub async fn run(&self) -> Result<()> {
+    pub async fn run(&self, mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
+        // Boot reconciliation: requeue any row a crash left stuck in `dispatched` (PRD §9.3).
+        match self.queue.reclaim_orphans().await {
+            Ok(0) => {}
+            Ok(n) => eprintln!("dack: reclaimed {n} orphaned dispatched row(s) at boot"),
+            Err(e) => eprintln!("dack: boot reclaim failed: {e}"),
+        }
+        // Downtime → character (PRD §11.8): a restart enqueues a self-tier "back online" wake
+        // that Perceives then Expresses (the duck may comment on having been away).
+        self.enqueue_back_online().await;
+
         loop {
+            // Graceful shutdown: a SIGTERM (set via the watch) is honored at a cycle boundary —
+            // an in-flight dispatch always finishes (no zombie `dispatched` row), then we exit.
+            if *shutdown.borrow() {
+                eprintln!("dack: shutdown signal — consciousness loop exiting cleanly");
+                return Ok(());
+            }
             match self.queue.next().await? {
                 Some(stimulus) => {
-                    if let Err(e) = self.dispatch(stimulus).await {
-                        // logging-not-rollback (PRD §7.5): a failed run is a logged line,
-                        // never a crash of the loop. Phase 7 records a tagged error entry.
-                        eprintln!("dispatch error: {e}");
+                    let snap = stimulus.clone();
+                    match self.dispatch(stimulus).await {
+                        // Terminal states (PRD §5.6): a processed row never sticks in `dispatched`.
+                        Ok(()) => {
+                            let _ = self.queue.update_status(&snap.id, StimulusStatus::Done).await;
+                        }
+                        Err(e) => {
+                            // logging-not-rollback (PRD §7.5): a failed run is a tagged entry + a
+                            // terminal `failed` row, never a crash of the single-flight loop.
+                            eprintln!("dack: dispatch error ({}): {e}", snap.id);
+                            self.log_dispatch_failure(&snap, &e).await;
+                            let _ = self.queue.update_status(&snap.id, StimulusStatus::Failed).await;
+                        }
                     }
                 }
-                // Daemon: the duck sleeps between stimuli, it doesn't exit. Poll the queue
-                // (single-flight, so a tight wake-on-enqueue isn't needed at this scale).
-                None => tokio::time::sleep(Duration::from_millis(500)).await,
+                // Daemon: the duck sleeps between stimuli, it doesn't exit. Wake on a new
+                // stimulus (poll) OR on the shutdown signal, whichever comes first.
+                None => {
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                        _ = shutdown.changed() => {}
+                    }
+                }
             }
         }
+    }
+
+    /// Enqueue the self-tier "back online" wake (PRD §11.8). `PerceiveThenExpress` so the duck
+    /// reflects on the downtime and may say something — entirely its call in Express.
+    async fn enqueue_back_online(&self) {
+        let now = chrono::Utc::now().timestamp();
+        let stim = Stimulus {
+            id: StimulusId(format!("back-online-{now}")),
+            source: "harness".into(),
+            type_: StimulusType::from("back_online"),
+            // Self-tier: the harness's own scheduled wake, not untrusted world data.
+            directive_tier: TrustTier::SelfTier,
+            payload_tier: TrustTier::SelfTier,
+            payload: serde_json::json!({ "event": "harness back online", "at": now }),
+            provenance: Some("harness restart".into()),
+            received_at: now,
+            dedup_key: None,
+            priority: Priority::Low,
+            status: StimulusStatus::Pending,
+            directive_body: "You just came back online after being down. Take stock; if it suits \
+                your character, you may note it. No obligation to post."
+                .into(),
+            entry: EntryState::PerceiveThenExpress,
+        };
+        if let Err(e) = self.queue.enqueue(stim).await {
+            eprintln!("dack: back-online enqueue failed: {e}");
+        }
+    }
+
+    /// Author a tagged-error runlog entry for a dispatch that failed before writing its own
+    /// runlog (e.g. the runtime/bridge was unreachable). PRD §7.5 — errors are runlog entries.
+    async fn log_dispatch_failure(&self, stimulus: &Stimulus, err: &DackError) {
+        let entry = RunLogEntry {
+            run_id: format!("run-{}-error", stimulus.id.0),
+            stimulus_id: stimulus.id.clone(),
+            state: ConsciousnessState::Perceive,
+            context_summary: format!("dispatch failed before completion: {err}"),
+            baton: None,
+            raw_stimulus: stimulus.payload.to_string(),
+            tool_calls: Vec::new(),
+            output: None,
+            outcome: Outcome::Error(err.to_string()),
+            timestamp: stimulus.received_at,
+        };
+        let _ = self.runlog.append(&entry).await;
     }
 
     async fn dispatch(&self, stimulus: Stimulus) -> Result<()> {
         // (2) Perceive context — directive trusted, payload untrusted, kept SEPARATE.
         let perceive_req = self.assemble_perceive_context(&stimulus).await?;
-        let responder: Arc<dyn ActionResponder> = Arc::new(
+        // The wall, wrapped to record every (tool, decision) for the runlog (PRD §7.5 — an
+        // injection path must be visible post-hoc).
+        let recorder = RecordingResponder::wrap(
             StatePolicyResponder::new(default_spec(ConsciousnessState::Perceive))
                 .with_repo_root(self.soul_root()),
         );
 
         // (3) Perceive runs read-only.
-        let perceive_out = self.runtime.invoke(perceive_req, responder).await?;
+        let perceive_out = self.runtime.invoke(perceive_req, recorder.clone()).await?;
 
-        // (4) Durable RunLog with raw stimulus framed-untrusted → runlog_ref.
-        let runlog_ref = self.write_perceive_runlog(&stimulus, &perceive_out).await?;
+        // (4) Post-run soul reconciliation (PRD §7.5, invariant I13): revert any write outside
+        //     Perceive's (empty) allowlist + alarm, commit nothing. Read-only Perceive normally
+        //     finds an empty delta — this is defense-in-depth *behind* the live wall.
+        let reverted = self
+            .reconcile_soul(ConsciousnessState::Perceive, &stimulus.id.0)
+            .await;
 
-        // (5) Decide the next state. The model PROPOSES; the **harness decides**, bounded by
+        // (5) Durable RunLog: raw stimulus framed-untrusted, the captured tool decisions, and
+        //     the tripwire alarm as a tagged-error outcome → runlog_ref for the Baton.
+        let runlog_ref = self
+            .write_runlog(
+                ConsciousnessState::Perceive,
+                &stimulus,
+                &perceive_out,
+                recorder.take(),
+                &reverted,
+            )
+            .await?;
+
+        // (6) Decide the next state. The model PROPOSES; the **harness decides**, bounded by
         // three independent gates: the route's `entry` (PerceiveThenExpress forces Express —
         // restoring the deterministic cadence the model could otherwise no-op), the trust-tier
         // ceiling (a `public` stimulus can reach reversible Express but never irreversible
@@ -106,12 +203,86 @@ impl Harness {
                 // point a network capability credential enters a cycle (never Perceive).
                 let baton = build_baton(&perceive_out, &stimulus, runlog_ref);
                 let secret_env = self.act_secrets(&stimulus).await;
-                self.open_next_state(to, baton, secret_env).await?;
+                self.open_next_state(to, baton, secret_env, &stimulus).await?;
             } else {
                 eprintln!("dispatch: transition to {to:?} not allowed from Perceive ({})", stimulus.id);
             }
         }
+
+        // One push per cycle ships every local commit made above (Perceive/Express runlogs,
+        // memory append, the sweep) as one signed `gitlawb://` ref-update. No-op offline.
+        self.push_soul().await;
         Ok(())
+    }
+
+    /// Post-run soul reconciliation (PRD §7.5, invariant I13) — the durability+integrity
+    /// interlock that makes tool-driven `Write`/`Edit` well-defined:
+    ///   1. enumerate the soul working-tree delta (`git status`);
+    ///   2. **revert** anything outside the running state's `writable_dirs` (the SAME allowlist
+    ///      the wall enforces) — out-of-allowlist writes, or *any* write in read-only Perceive;
+    ///   3. **commit** the remaining (allowlisted) delta as the **Soul DID**, then **push**.
+    /// Returns the reverted paths so [`write_runlog`](Self::write_runlog) can raise the alarm as a
+    /// tagged-error entry. Best-effort: a git hiccup is logged, never fatal to the cycle.
+    async fn reconcile_soul(&self, state: ConsciousnessState, run_id: &str) -> Vec<String> {
+        let spec = default_spec(state);
+        let changes = match self.repo.status().await {
+            Ok(c) => c,
+            Err(e) => {
+                // A non-git soul dir (tests) or a transient git error — log and move on.
+                eprintln!("reconcile {run_id} {state:?}: status failed: {e}");
+                return Vec::new();
+            }
+        };
+        if changes.is_empty() {
+            return Vec::new();
+        }
+
+        let mut allowed: Vec<RepoPath> = Vec::new();
+        let mut reverted: Vec<String> = Vec::new();
+        for ch in &changes {
+            let permitted = spec.writable_dirs.iter().any(|d| ch.path.0.starts_with(d));
+            if permitted {
+                allowed.push(ch.path.clone());
+            } else {
+                // The tripwire: a write the running state may not make. Restore HEAD + alarm.
+                if let Err(e) = self.repo.restore_to_head(ch).await {
+                    eprintln!("reconcile {run_id}: revert {} failed: {e}", ch.path.0);
+                }
+                reverted.push(ch.path.0.clone());
+            }
+        }
+
+        if !allowed.is_empty() {
+            let commit = CommitMeta {
+                message: format!("run {run_id} {state:?}: sweep {} path(s)", allowed.len()),
+                author_did: self.soul_did(),
+            };
+            // Commit locally; the cycle's single `push_soul` (end of dispatch) ships it along
+            // with the runlog + memory commits. Staying local on push failure is fine — durable
+            // on the box, re-pushed next cycle (PRD §3.5).
+            if let Err(e) = self.repo.commit_paths(&allowed, &commit).await {
+                eprintln!("reconcile {run_id}: sweep commit failed: {e}");
+            }
+        }
+        reverted
+    }
+
+    /// Push the cycle's local soul commits (runlog + memory + sweep) to the configured remote,
+    /// signed for `gitlawb://`. Best-effort: a node-down/offline push is logged, never fatal
+    /// — the commits are durable locally and re-push next cycle (PRD §3.5, invariant I13).
+    async fn push_soul(&self) {
+        if let Err(e) = self.repo.push().await {
+            eprintln!("soul push failed (kept local): {e}");
+        }
+    }
+
+    /// The Soul DID that authors soul commits, or a stable placeholder if the identity isn't
+    /// wired (tests). Attribution only — the cryptographic signature is the `gitlawb://` push.
+    fn soul_did(&self) -> String {
+        self.identity
+            .did(IdentityRole::Soul)
+            .map(|d| d.0.clone())
+            .unwrap_or_else(|| "did:dack:soul".into())
     }
 
     /// The act-phase secret env for a stimulus, from its **route's** `secrets:` (operator-gated;
@@ -222,11 +393,6 @@ impl Harness {
         }
         content.push_str(line);
         content.push('\n');
-        let author = self
-            .identity
-            .did(IdentityRole::Soul)
-            .map(|d| d.0.clone())
-            .unwrap_or_else(|| "did:dack:soul".into());
         if let Err(e) = self
             .repo
             .write_file(
@@ -234,7 +400,7 @@ impl Harness {
                 content.as_bytes(),
                 &CommitMeta {
                     message: format!("memory: {line}"),
-                    author_did: author,
+                    author_did: self.soul_did(),
                 },
             )
             .await
@@ -251,6 +417,7 @@ impl Harness {
         to: ConsciousnessState,
         baton: Baton,
         secret_env: BTreeMap<String, String>,
+        stimulus: &Stimulus,
     ) -> Result<()> {
         let spec = default_spec(to);
         let blocks = vec![ContextBlock {
@@ -263,8 +430,8 @@ impl Harness {
             ),
             trusted: true,
         }];
-        let responder: Arc<dyn ActionResponder> =
-            Arc::new(StatePolicyResponder::new(spec.clone()).with_repo_root(self.soul_root()));
+        let recorder =
+            RecordingResponder::wrap(StatePolicyResponder::new(spec.clone()).with_repo_root(self.soul_root()));
         let req = InvocationRequest {
             system_prompt: format!("<SOUL.md + {}>", spec.prompt_path),
             spec,
@@ -275,37 +442,104 @@ impl Harness {
             workdir: Some(self.soul_root()),
             secret_env,
         };
-        let out = self.runtime.invoke(req, responder).await?;
-        // Honor the structured memory line (gated to this write-capable state). Skill
-        // execution of the proposal lands in Phase 6.
+        let out = self.runtime.invoke(req, recorder.clone()).await?;
+        // Honor the structured memory line (gated to this write-capable state) — its own
+        // Soul-DID commit. Free-form tool-driven writes to `memory/` are caught by the sweep.
         self.honor_memory_append(to, &out).await;
+        // Reconcile this state's working-tree delta (commit allowlisted memory/ writes as the
+        // Soul, revert anything else + alarm, push) then author the Express runlog.
+        let reverted = self.reconcile_soul(to, &stimulus.id.0).await;
+        self.write_runlog(to, stimulus, &out, recorder.take(), &reverted)
+            .await?;
         Ok(())
     }
 
-    async fn write_perceive_runlog(
+    /// Author the durable RunLog entry for one state invocation (PRD §7.5) — the harness
+    /// writes it, never the agent. Carries the raw stimulus (the runlog writer frames it
+    /// untrusted), the captured `(tool, decision)` records, and the soul-integrity verdict:
+    /// any `reverted` paths make this a tagged-error entry (the tripwire alarm). Returns the
+    /// `runlog_ref` the Baton points at. `run_id` is unique per `(stimulus, state)`.
+    async fn write_runlog(
         &self,
+        state: ConsciousnessState,
         stimulus: &Stimulus,
         out: &AgentOutput,
+        tool_calls: Vec<ToolCallRecord>,
+        reverted: &[String],
     ) -> Result<String> {
-        // The harness authors the record (PRD §7.5) — the agent never writes its own runlog.
-        // Phase 7 enriches this (raw stimulus in a delimited-untrusted block, captured
-        // tool-call decisions, error tagging); Phase 4 records the essential mapping.
+        let outcome = if reverted.is_empty() {
+            Outcome::Ok
+        } else {
+            Outcome::Error(format!(
+                "soul-integrity tripwire reverted out-of-allowlist write(s): {}",
+                reverted.join(", ")
+            ))
+        };
         let entry = RunLogEntry {
-            run_id: format!("run-{}", stimulus.id.0),
+            run_id: format!("run-{}-{}", stimulus.id.0, state_tag(state)),
             stimulus_id: stimulus.id.clone(),
-            state: ConsciousnessState::Perceive,
+            state,
             context_summary: format!(
                 "source={} type={} directive_tier={:?} payload_tier={:?}",
                 stimulus.source, stimulus.type_, stimulus.directive_tier, stimulus.payload_tier
             ),
             baton: None,
             raw_stimulus: stimulus.payload.to_string(),
-            tool_calls: Vec::new(),
+            tool_calls,
             output: Some(out.clone()),
-            outcome: Outcome::Ok,
+            outcome,
             timestamp: stimulus.received_at,
         };
         self.runlog.append(&entry).await
+    }
+}
+
+/// Short lowercase state tag for the `run_id` anchor (`run-<stim>-perceive`).
+fn state_tag(state: ConsciousnessState) -> &'static str {
+    match state {
+        ConsciousnessState::Perceive => "perceive",
+        ConsciousnessState::Express => "express",
+        ConsciousnessState::Settle => "settle",
+        ConsciousnessState::Reflect => "reflect",
+    }
+}
+
+/// Wraps the wall ([`ActionResponder`]) to capture every `(tool, decision)` for the runlog
+/// (PRD §7.5): an injection path — a tool the agent tried that the wall denied — must be
+/// visible post-hoc and become a lesson in Reflect. Transparent: it records, then delegates
+/// the decision verbatim. The agent cannot see or touch it (it is out-of-process state).
+struct RecordingResponder {
+    inner: StatePolicyResponder,
+    calls: std::sync::Mutex<Vec<ToolCallRecord>>,
+}
+
+impl RecordingResponder {
+    fn wrap(inner: StatePolicyResponder) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            calls: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Drain the captured records (after the invocation completes) for the runlog entry.
+    fn take(&self) -> Vec<ToolCallRecord> {
+        std::mem::take(&mut self.calls.lock().unwrap())
+    }
+}
+
+#[async_trait::async_trait]
+impl ActionResponder for RecordingResponder {
+    async fn decide(&self, req: &ActionRequest) -> ActionDecision {
+        let decision = self.inner.decide(req).await;
+        let rendered = match &decision {
+            ActionDecision::Allow => "allow".to_string(),
+            ActionDecision::Deny(why) => format!("deny: {why}"),
+        };
+        self.calls.lock().unwrap().push(ToolCallRecord {
+            tool: req.tool.clone(),
+            decision: rendered,
+        });
+        decision
     }
 }
 
@@ -451,6 +685,7 @@ mod tests {
                 model: None,
                 sandbox: Arc::new(crate::sandbox::HostSandbox),
                 policy: crate::sandbox::IsolationPolicy::host_passthrough(),
+                timeout: std::time::Duration::from_secs(30),
             }),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
@@ -708,6 +943,140 @@ mod tests {
 
         // Only Perceive ran — the Settle transition was dropped above the tier ceiling.
         assert_eq!(runtime.seen.lock().unwrap().len(), 1, "Settle dropped for a public tier");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Phase 7 / invariant I13: post-run soul reconciliation. Against a REAL git soul repo,
+    /// an Express run's tool-driven writes are reconciled — the allowlisted `memory/` write is
+    /// committed as the Soul DID, an out-of-allowlist `skills/` write is reverted + alarmed.
+    #[tokio::test]
+    async fn reconcile_commits_allowlisted_writes_and_reverts_the_rest() {
+        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::queue::InMemoryQueue;
+        use crate::repo::git::PlainGitRepo;
+        use crate::runlog::FileRunLog;
+        use std::collections::HashMap;
+        use tokio::process::Command;
+
+        let soul = std::env::temp_dir().join(format!("dack-reconcile-{}", std::process::id()));
+        std::fs::remove_dir_all(&soul).ok();
+        std::fs::create_dir_all(soul.join("memory")).unwrap();
+        // A real git soul repo with a committed memory seed.
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.name", "seed"],
+            vec!["config", "user.email", "s@d"],
+        ] {
+            Command::new("git").arg("-C").arg(&soul).args(&args).output().await.unwrap();
+        }
+        std::fs::write(soul.join("memory/log.md"), b"seed\n").unwrap();
+        Command::new("git").arg("-C").arg(&soul).args(["add", "-A"]).output().await.unwrap();
+        Command::new("git").arg("-C").arg(&soul).args(["commit", "-q", "-m", "seed"]).output().await.unwrap();
+
+        let config = Arc::new(DackConfig::from_yaml("operator_did: \"did:x\"").unwrap());
+        let queue: Arc<dyn Queue> = Arc::new(InMemoryQueue::new());
+        let harness = Harness {
+            config: config.clone(),
+            queue: queue.clone(),
+            bus: Arc::new(Bus::new(config.clone(), queue.clone())),
+            runtime: Arc::new(RecordingRuntime {
+                seen: std::sync::Mutex::new(Vec::new()),
+                out: perceive_output(),
+            }),
+            repo: Arc::new(PlainGitRepo::new(&soul, "did:dack:soul")),
+            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            runlog: Arc::new(FileRunLog::new(soul.join("runlogs"))),
+            broker: Arc::new(SecretsBroker::new(vec![])),
+        };
+
+        // Simulate this Express run's tool-driven writes straight to the working tree: an
+        // ALLOWED memory append + a FORBIDDEN new skill (Express may write only memory/).
+        std::fs::write(soul.join("memory/log.md"), b"seed\nthe duck noted something\n").unwrap();
+        std::fs::create_dir_all(soul.join("skills/evil")).unwrap();
+        std::fs::write(soul.join("skills/evil/SKILL.md"), b"injected by a tweet\n").unwrap();
+
+        let reverted = harness.reconcile_soul(ConsciousnessState::Express, "run-1").await;
+
+        // The forbidden write was reverted + reported (the tripwire alarm → tagged-error runlog).
+        assert_eq!(reverted, vec!["skills/evil/SKILL.md".to_string()]);
+        assert!(!soul.join("skills/evil/SKILL.md").exists(), "forbidden write reverted");
+        // The allowed memory write was committed; the tree is now clean (empty unexpected-delta).
+        let status = Command::new("git").arg("-C").arg(&soul).args(["status", "--porcelain"]).output().await.unwrap();
+        assert!(String::from_utf8_lossy(&status.stdout).trim().is_empty(), "tree clean after reconcile");
+        // ...authored as the Soul DID, with a run/state-tagged sweep message.
+        let author = Command::new("git").arg("-C").arg(&soul).args(["log", "-1", "--format=%an"]).output().await.unwrap();
+        assert_eq!(String::from_utf8_lossy(&author.stdout).trim(), "did:dack:soul");
+        let subject = Command::new("git").arg("-C").arg(&soul).args(["log", "-1", "--format=%s"]).output().await.unwrap();
+        assert!(String::from_utf8_lossy(&subject.stdout).contains("Express: sweep"));
+        // The memory content actually persisted.
+        let head_mem = Command::new("git").arg("-C").arg(&soul).args(["show", "HEAD:memory/log.md"]).output().await.unwrap();
+        assert!(String::from_utf8_lossy(&head_mem.stdout).contains("the duck noted something"));
+
+        std::fs::remove_dir_all(&soul).ok();
+    }
+
+    /// Phase 7 resilience: the run loop reclaims a crash-orphaned row, mints the "back online"
+    /// wake, drives both to a TERMINAL state (no row stuck `dispatched`), and shuts down cleanly
+    /// on the signal — the in-flight cycle finishes, then the loop exits.
+    #[tokio::test]
+    async fn run_loop_reclaims_marks_terminal_and_shuts_down_gracefully() {
+        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::queue::InMemoryQueue;
+        use crate::repo::git::PlainGitRepo;
+        use crate::runlog::FileRunLog;
+        use std::collections::HashMap;
+
+        let tmp = std::env::temp_dir().join(format!("dack-runloop-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let config = Arc::new(DackConfig::from_yaml("operator_did: \"did:x\"").unwrap());
+        let queue: Arc<dyn Queue> = Arc::new(InMemoryQueue::new());
+        // An orphaned `dispatched` row left by a "previous crash".
+        let mut orphan = poisoned_stimulus();
+        orphan.id = StimulusId("orphan".into());
+        orphan.status = StimulusStatus::Dispatched;
+        queue.enqueue(orphan).await.unwrap();
+
+        let runtime = Arc::new(RecordingRuntime {
+            seen: std::sync::Mutex::new(Vec::new()),
+            out: perceive_output(), // proposes Express → each cycle = Perceive + Express
+        });
+        let harness = Arc::new(Harness {
+            config: config.clone(),
+            queue: queue.clone(),
+            bus: Arc::new(Bus::new(config.clone(), queue.clone())),
+            runtime: runtime.clone(),
+            repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
+            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
+            broker: Arc::new(SecretsBroker::new(vec![])),
+        });
+
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let h = harness.clone();
+        let handle = tokio::spawn(async move { h.run(rx).await });
+
+        // Wait until the reclaimed orphan has been driven through Perceive+Express.
+        for _ in 0..100 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            if runtime.seen.lock().unwrap().len() >= 2 {
+                break;
+            }
+        }
+        tx.send(true).unwrap();
+        // Graceful: the loop returns (bounded) rather than running forever.
+        tokio::time::timeout(std::time::Duration::from_secs(3), handle)
+            .await
+            .expect("run loop did not exit within budget")
+            .unwrap()
+            .unwrap();
+
+        // The orphan was reclaimed and processed (≥ one full cycle ran).
+        assert!(runtime.seen.lock().unwrap().len() >= 2, "orphan reclaimed + processed");
+        // Nothing left stuck `dispatched` — every processed row reached a terminal state.
+        assert_eq!(queue.reclaim_orphans().await.unwrap(), 0, "no orphaned dispatched rows remain");
 
         std::fs::remove_dir_all(&tmp).ok();
     }

@@ -53,6 +53,16 @@ impl Queue for InMemoryQueue {
         Ok(())
     }
 
+    async fn reclaim_orphans(&self) -> Result<usize> {
+        let mut rows = self.rows.lock().unwrap();
+        let mut n = 0;
+        for s in rows.iter_mut().filter(|s| s.status == StimulusStatus::Dispatched) {
+            s.status = StimulusStatus::Pending;
+            n += 1;
+        }
+        Ok(n)
+    }
+
     async fn set_payload(&self, id: &StimulusId, payload: serde_json::Value) -> Result<()> {
         let mut rows = self.rows.lock().unwrap();
         if let Some(s) = rows.iter_mut().find(|s| &s.id == id) {

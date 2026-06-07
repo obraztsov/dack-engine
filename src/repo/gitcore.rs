@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use tokio::process::Command;
 
-use super::{CommitId, CommitMeta, RepoPath};
+use super::{CommitId, CommitMeta, RepoChange, RepoPath};
 use crate::error::{DackError, Result};
 
 pub struct GitCore {
@@ -34,10 +34,18 @@ impl GitCore {
 
     /// Run `git -C <workdir> <args>` and return stdout, or an error carrying stderr.
     async fn git(&self, args: &[&str]) -> Result<String> {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(&self.workdir)
-            .args(args)
+        self.git_env(args, &[]).await
+    }
+
+    /// As [`git`](Self::git), but with extra environment overlaid — used by the signed
+    /// `gitlawb://` push (`GITLAWB_KEY`/`GITLAWB_NODE`, read by the `git-remote-gitlawb` helper).
+    async fn git_env(&self, args: &[&str], env: &[(&str, String)]) -> Result<String> {
+        let mut cmd = Command::new("git");
+        cmd.arg("-C").arg(&self.workdir).args(args);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd
             .output()
             .await
             .map_err(|e| DackError::Repo(format!("git spawn ({}): {e}", args.join(" "))))?;
@@ -162,15 +170,101 @@ impl GitCore {
         .await?;
         self.head().await
     }
+
+    /// The working-tree delta vs HEAD (untracked files included), as porcelain entries.
+    /// `--porcelain=v1 -z`-free parse: each line is `XY <path>`; renames (`R`) report the
+    /// destination. Empty result = clean tree (PRD §7.5, invariant I13).
+    pub async fn status_porcelain(&self) -> Result<Vec<RepoChange>> {
+        let out = self
+            .git(&["status", "--porcelain", "--untracked-files=all"])
+            .await?;
+        let mut changes = Vec::new();
+        for line in out.lines() {
+            if line.len() < 4 {
+                continue;
+            }
+            let code = line[..2].to_string();
+            // Path starts at column 3. A rename prints `orig -> dest`; the dest is what changed.
+            let rest = &line[3..];
+            let raw = rest.rsplit(" -> ").next().unwrap_or(rest).trim();
+            // git quotes paths containing special chars; strip the surrounding quotes.
+            let path = raw.trim_matches('"').to_string();
+            changes.push(RepoChange {
+                code,
+                path: RepoPath(path),
+            });
+        }
+        Ok(changes)
+    }
+
+    /// Stage exactly `paths` (new/modified/deleted) and commit them attributed to `author_did`.
+    /// `Ok(None)` when nothing was staged (the tree was already clean for these paths) — never
+    /// an empty commit. The per-run sweep's committer for tool-driven `Write`/`Edit`.
+    pub async fn commit_paths(
+        &self,
+        paths: &[RepoPath],
+        message: &str,
+        author_did: &str,
+    ) -> Result<Option<CommitId>> {
+        if paths.is_empty() {
+            return Ok(None);
+        }
+        let mut add: Vec<&str> = vec!["add", "-A", "--"];
+        add.extend(paths.iter().map(|p| p.0.as_str()));
+        self.git(&add).await?;
+
+        // Anything actually staged among these paths? (Avoid an empty commit.)
+        let mut diff: Vec<&str> = vec!["diff", "--cached", "--name-only", "--"];
+        diff.extend(paths.iter().map(|p| p.0.as_str()));
+        if self.git(&diff).await?.trim().is_empty() {
+            return Ok(None);
+        }
+
+        let name = format!("user.name={author_did}");
+        let email = format!("user.email={author_did}@dack");
+        let mut commit: Vec<&str> =
+            vec!["-c", &name, "-c", &email, "commit", "-m", message, "--"];
+        commit.extend(paths.iter().map(|p| p.0.as_str()));
+        self.git(&commit).await?;
+        Ok(Some(self.head().await?))
+    }
+
+    /// Discard a working-tree change, restoring it to HEAD: `checkout HEAD -- <path>` for a
+    /// tracked file, or delete the file for an untracked one. The tripwire's revert — no commit.
+    pub async fn restore_to_head(&self, change: &RepoChange) -> Result<()> {
+        if change.is_untracked() {
+            let full = self.workdir.join(&change.path.0);
+            tokio::fs::remove_file(&full)
+                .await
+                .map_err(|e| DackError::Repo(format!("rm untracked {}: {e}", change.path.0)))?;
+        } else {
+            self.git(&["checkout", "HEAD", "--", &change.path.0]).await?;
+        }
+        Ok(())
+    }
+
+    /// `git push <remote> HEAD:<branch>` with `env` overlaid (the signed `gitlawb://` helper
+    /// reads `GITLAWB_KEY`/`GITLAWB_NODE`). The branch is HEAD's current branch.
+    pub async fn push(&self, remote: &str, env: &[(&str, String)]) -> Result<()> {
+        let branch = self
+            .git(&["rev-parse", "--abbrev-ref", "HEAD"])
+            .await?
+            .trim()
+            .to_string();
+        let refspec = format!("HEAD:refs/heads/{branch}");
+        self.git_env(&["push", remote, &refspec], env).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    async fn init_repo() -> PathBuf {
+    async fn init_repo(tag: &str) -> PathBuf {
         // A throwaway repo under the system temp dir (no tempfile crate dependency).
-        let dir = std::env::temp_dir().join(format!("dack-gitcore-{}", std::process::id()));
+        // `tag` keeps concurrent tests in the same binary (shared pid) from clobbering each other.
+        let dir = std::env::temp_dir().join(format!("dack-gitcore-{}-{tag}", std::process::id()));
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
         for args in [
@@ -191,7 +285,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_read_list_and_revert_round_trip() {
-        let dir = init_repo().await;
+        let dir = init_repo("rtrip").await;
         let core = GitCore::new(&dir, "did:key:zSoul");
         let path = RepoPath("memory/log.md".into());
         let meta = |m: &str| CommitMeta {
@@ -221,5 +315,73 @@ mod tests {
         assert_eq!(core.read_file(&path).await.unwrap(), b"first\n");
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn status_sweep_and_tripwire_revert() {
+        let dir = init_repo("sweep").await;
+        let core = GitCore::new(&dir, "did:key:zSoul");
+        // Seed a committed memory file so it has HEAD history.
+        let mem = RepoPath("memory/log.md".into());
+        core.write_file(&mem, b"seed\n", &CommitMeta { message: "seed".into(), author_did: "did:key:zSoul".into() })
+            .await
+            .unwrap();
+
+        // Simulate a run's tool-driven writes straight to the working tree (no commit):
+        // an ALLOWED memory append + a FORBIDDEN new skill file.
+        tokio::fs::write(dir.join("memory/log.md"), b"seed\nagent note\n").await.unwrap();
+        tokio::fs::create_dir_all(dir.join("skills/evil")).await.unwrap();
+        tokio::fs::write(dir.join("skills/evil/SKILL.md"), b"injected\n").await.unwrap();
+
+        // status sees both (one modified, one untracked).
+        let changes = core.status_porcelain().await.unwrap();
+        assert!(changes.iter().any(|c| c.path.0 == "memory/log.md" && !c.is_untracked()));
+        let evil = changes.iter().find(|c| c.path.0 == "skills/evil/SKILL.md").unwrap().clone();
+        assert!(evil.is_untracked(), "new skill file is untracked");
+
+        // Tripwire: revert the forbidden untracked write → file gone, tree clean of it.
+        core.restore_to_head(&evil).await.unwrap();
+        assert!(!dir.join("skills/evil/SKILL.md").exists(), "forbidden write reverted");
+
+        // Sweep: commit ONLY the allowlisted memory path → a real commit, attributed to Soul.
+        let committed = core
+            .commit_paths(&[mem.clone()], "run-x express: sweep", "did:key:zSoul")
+            .await
+            .unwrap();
+        assert!(committed.is_some(), "the memory change was committed");
+        assert_eq!(core.read_file(&mem).await.unwrap(), b"seed\nagent note\n");
+
+        // Idempotent: a second sweep with nothing changed → no empty commit.
+        assert!(core.commit_paths(&[mem], "noop", "did:key:zSoul").await.unwrap().is_none());
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn push_to_local_bare_remote_offline() {
+        let base = std::env::temp_dir().join(format!("dack-push-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&base).await;
+        let work = base.join("work");
+        let bare = base.join("remote.git");
+        tokio::fs::create_dir_all(&work).await.unwrap();
+        // A local bare remote stands in for the gitlawb node (the push path, offline-tested).
+        Command::new("git").args(["init", "-q", "--bare"]).arg(&bare).output().await.unwrap();
+        for args in [vec!["init", "-q", "-b", "main"], vec!["config", "user.name", "s"], vec!["config", "user.email", "s@d"]] {
+            Command::new("git").arg("-C").arg(&work).args(&args).output().await.unwrap();
+        }
+        Command::new("git").arg("-C").arg(&work).args(["remote", "add", "origin"]).arg(&bare).output().await.unwrap();
+
+        let core = GitCore::new(&work, "did:key:zSoul");
+        core.write_file(&RepoPath("SOUL.md".into()), b"I am.\n", &CommitMeta { message: "genesis".into(), author_did: "did:key:zSoul".into() })
+            .await
+            .unwrap();
+        core.push("origin", &[]).await.unwrap();
+
+        // The bare remote now has the branch at our HEAD.
+        let head = core.head().await.unwrap();
+        let remote_ref = Command::new("git").arg("-C").arg(&bare).args(["rev-parse", "refs/heads/main"]).output().await.unwrap();
+        assert_eq!(String::from_utf8_lossy(&remote_ref.stdout).trim(), head.0);
+
+        let _ = tokio::fs::remove_dir_all(&base).await;
     }
 }

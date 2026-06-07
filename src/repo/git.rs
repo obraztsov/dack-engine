@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use std::path::PathBuf;
 
 use super::gitcore::GitCore;
-use super::{CommitId, CommitMeta, RepoHost, RepoPath};
+use super::{CommitId, CommitMeta, RepoChange, RepoHost, RepoPath};
 use crate::error::Result;
 
 pub struct PlainGitRepo {
@@ -47,5 +47,28 @@ impl RepoHost for PlainGitRepo {
     }
     async fn revert_file(&self, path: &RepoPath) -> Result<CommitId> {
         self.core.revert_file(path).await
+    }
+    async fn status(&self) -> Result<Vec<RepoChange>> {
+        self.core.status_porcelain().await
+    }
+    async fn commit_paths(
+        &self,
+        paths: &[RepoPath],
+        commit: &CommitMeta,
+    ) -> Result<Option<CommitId>> {
+        self.core
+            .commit_paths(paths, &commit.message, &commit.author_did)
+            .await
+    }
+    async fn restore_to_head(&self, change: &RepoChange) -> Result<()> {
+        self.core.restore_to_head(change).await
+    }
+    /// Plain `git push` to the configured remote, or a no-op when none is set (offline /
+    /// degraded mode, PRD §3.5). No Gitlawb signing here.
+    async fn push(&self) -> Result<()> {
+        match &self.remote {
+            Some(remote) => self.core.push(remote, &[]).await,
+            None => Ok(()),
+        }
     }
 }

@@ -157,6 +157,35 @@ pub struct DackConfig {
     /// never listed.**
     #[serde(default = "default_runtime_env")]
     pub runtime_env: Vec<String>,
+    /// `gl` identity **directories** per role (each holds `identity.pem` + `ucan.json`). The
+    /// Soul dir signs soul commits/pushes and **never enters agent env** (PRD §3.3, §7.2).
+    #[serde(default)]
+    pub identities: IdentityDirs,
+    /// The soul repo's signed push remote, e.g. `gitlawb://<soul-did>/dack-soul`. When set
+    /// (with `identities.soul`), the harness uses the Gitlawb repo-host (signed `gitlawb://`
+    /// push); otherwise plain-git degraded mode (PRD §3.5). `None` = local-only / offline.
+    #[serde(default)]
+    pub soul_remote: Option<String>,
+    /// The gitlawb node the signed push targets (`GITLAWB_NODE`).
+    #[serde(default = "default_gitlawb_node")]
+    pub gitlawb_node: String,
+    /// Wall-clock budget (seconds) for one consciousness invocation, incl. the wall round-trips.
+    /// A hung LLM/bridge elapses here rather than freezing the single-flight loop (PRD §11.8).
+    #[serde(default = "default_invoke_timeout_secs")]
+    pub invoke_timeout_secs: u64,
+}
+
+/// `gl` identity directories per liability-boundary role (PRD §3.3). Each is a path to a dir
+/// holding `identity.pem` (+ `ucan.json`). All optional: unset roles are simply absent (the
+/// harness falls back where it can). The Soul key is harness-only — never forwarded.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct IdentityDirs {
+    #[serde(default)]
+    pub soul: Option<String>,
+    #[serde(default)]
+    pub operator: Option<String>,
+    #[serde(default)]
+    pub builder: Option<String>,
 }
 
 fn default_soul_repo() -> String {
@@ -170,6 +199,12 @@ fn default_webhook_addr() -> String {
 }
 fn default_bridge_dir() -> String {
     "openclaude-bridge".to_string()
+}
+fn default_gitlawb_node() -> String {
+    "https://node.gitlawb.com".to_string()
+}
+fn default_invoke_timeout_secs() -> u64 {
+    300
 }
 fn default_runtime_env() -> Vec<String> {
     vec![
@@ -187,6 +222,26 @@ impl DackConfig {
 
     pub fn from_yaml(text: &str) -> Result<Self> {
         serde_yaml::from_str(text).map_err(DackError::from)
+    }
+
+    /// The configured `gl` identity dirs keyed by role — fed to
+    /// [`GitlawbIdentity::resolve`](crate::identity::gitlawb::GitlawbIdentity::resolve) so the
+    /// harness can sign as the Soul (and, later, verify operator_signed via the Operator DID).
+    pub fn identity_dirs(
+        &self,
+    ) -> std::collections::HashMap<crate::identity::IdentityRole, std::path::PathBuf> {
+        use crate::identity::IdentityRole::*;
+        let mut m = std::collections::HashMap::new();
+        if let Some(d) = &self.identities.soul {
+            m.insert(Soul, d.into());
+        }
+        if let Some(d) = &self.identities.operator {
+            m.insert(Operator, d.into());
+        }
+        if let Some(d) = &self.identities.builder {
+            m.insert(Builder, d.into());
+        }
+        m
     }
 
     /// Look up the routing rule for a `(payload_tier, type)` pair. Returns the first

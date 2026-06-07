@@ -33,7 +33,11 @@ CREATE TABLE IF NOT EXISTS stimulus (
     priority_rank  INTEGER NOT NULL,
     status         TEXT NOT NULL,
     directive_body TEXT NOT NULL,
-    entry          TEXT NOT NULL
+    entry          TEXT NOT NULL,
+    -- When `next()` leased this row (epoch secs). Queue-internal metadata (NOT on `Stimulus`):
+    -- a boot sweep requeues `dispatched` rows; `started_at` dates the lease for future
+    -- stale-lease detection. NULL until first dispatched.
+    started_at     INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_stimulus_dedup        ON stimulus(type, dedup_key);
 CREATE INDEX IF NOT EXISTS idx_stimulus_status_rank  ON stimulus(status, priority_rank, received_at);
@@ -194,8 +198,8 @@ impl Queue for SqliteQueue {
             return Ok(None);
         };
         tx.execute(
-            "UPDATE stimulus SET status='dispatched' WHERE id=?1",
-            params![raw.id],
+            "UPDATE stimulus SET status='dispatched', started_at=?2 WHERE id=?1",
+            params![raw.id, chrono::Utc::now().timestamp()],
         )
         .map_err(db)?;
         tx.commit().map_err(db)?;
@@ -212,6 +216,18 @@ impl Queue for SqliteQueue {
         )
         .map_err(db)?;
         Ok(())
+    }
+
+    async fn reclaim_orphans(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        // Single-flight: any `dispatched` row at boot is from a crashed run → back to `pending`.
+        let n = conn
+            .execute(
+                "UPDATE stimulus SET status='pending', started_at=NULL WHERE status='dispatched'",
+                [],
+            )
+            .map_err(db)?;
+        Ok(n)
     }
 
     async fn set_payload(&self, id: &StimulusId, payload: serde_json::Value) -> Result<()> {
@@ -332,6 +348,26 @@ mod tests {
         // Pop it and confirm the payload round-tripped.
         let s = q.next().await.unwrap().unwrap();
         assert_eq!(s.payload, json!({"items": [1, 2, 3]}));
+    }
+
+    #[tokio::test]
+    async fn reclaim_requeues_orphaned_dispatched_rows() {
+        let q = SqliteQueue::open_in_memory().unwrap();
+        q.enqueue(mk("a", Priority::Normal, 1, "mention", None)).await.unwrap();
+        q.enqueue(mk("b", Priority::Normal, 2, "mention", None)).await.unwrap();
+        // Two rows leased (→ dispatched), then a "crash" leaves them stuck.
+        let a = q.next().await.unwrap().unwrap();
+        let _b = q.next().await.unwrap().unwrap();
+        assert_eq!(a.status, StimulusStatus::Dispatched);
+        assert_eq!(q.depth().await.unwrap(), 0, "nothing pending mid-flight");
+
+        // One reached a terminal state; the other is an orphan.
+        q.update_status(&StimulusId("a".into()), StimulusStatus::Done).await.unwrap();
+        let reclaimed = q.reclaim_orphans().await.unwrap();
+        assert_eq!(reclaimed, 1, "only the still-dispatched orphan is requeued");
+        assert_eq!(q.depth().await.unwrap(), 1, "the orphan is pending again");
+        // The reclaimed row is `b` (Done `a` is terminal, never reconsidered).
+        assert_eq!(q.next().await.unwrap().unwrap().id.0, "b");
     }
 
     #[tokio::test]

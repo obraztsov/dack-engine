@@ -7,12 +7,21 @@
 # rust
 /target
 **/*.rs.bk
+
+# embedded SQLite queue (ephemeral; PRD §9.3) + WAL sidecars — never commit
+/dack.sqlite
+/dack.sqlite-wal
+/dack.sqlite-shm
 Cargo.lock        # binary crate, but harness is deployed as a built artifact; keep lock out of v1 churn
 
 # operator secrets & real config — never commit
 /dack.config.yaml
 /run/secrets/
 *.did.key
+
+# gitlawb identity keypairs (operator/soul/builder identity.pem) — never commit.
+# The Soul key is narrative-ending if leaked; all three live here only for local dev.
+/identities/
 
 # X / Twitter API credentials (RW keys) + rotated OAuth2 token store — never commit
 *.x.txt

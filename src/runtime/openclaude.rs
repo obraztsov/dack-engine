@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -92,11 +93,20 @@ pub struct OpenClaudeClient {
     /// memory/skill writes land while the rest of the box stays out of reach.
     pub sandbox: Arc<dyn Sandbox>,
     pub policy: IsolationPolicy,
+    /// Wall-clock budget for one whole invocation (incl. the wall round-trips). A hung LLM/bridge
+    /// would otherwise freeze the single-flight loop forever; on elapse `invoke` returns a
+    /// `Runtime` error (dispatch logs + continues) and `kill_on_drop` reaps the child (PRD §11.8).
+    pub timeout: Duration,
 }
 
 impl OpenClaudeClient {
     /// The production bridge: `bun run bridge.ts` inside the `openclaude-bridge/` project.
-    pub fn bun_bridge(bridge_dir: impl Into<PathBuf>, env: HashMap<String, String>, model: Option<String>) -> Self {
+    pub fn bun_bridge(
+        bridge_dir: impl Into<PathBuf>,
+        env: HashMap<String, String>,
+        model: Option<String>,
+        timeout: Duration,
+    ) -> Self {
         Self {
             command: vec!["bun".into(), "run".into(), "bridge.ts".into()],
             cwd: Some(bridge_dir.into()),
@@ -104,6 +114,7 @@ impl OpenClaudeClient {
             model,
             sandbox: Arc::new(HostSandbox),
             policy: IsolationPolicy::host_passthrough(),
+            timeout,
         }
     }
 
@@ -189,53 +200,65 @@ impl RuntimeClient for OpenClaudeClient {
             model: self.model.as_deref(),
             cwd: req.workdir.as_deref().and_then(|p| p.to_str()),
         };
-        write_line(&mut stdin, &invoke).await?;
 
-        // Drive the permission round-trips until the result arrives.
-        loop {
-            let line = lines
-                .next_line()
-                .await
-                .map_err(|e| DackError::Runtime(format!("bridge read: {e}")))?;
-            let Some(line) = line else {
-                return Err(DackError::Runtime("bridge closed before result".into()));
-            };
-            if line.trim().is_empty() {
-                continue;
-            }
-            match serde_json::from_str::<FromBridge>(&line)
-                .map_err(|e| DackError::Runtime(format!("bridge event parse: {e} (line: {line})")))?
-            {
-                FromBridge::Permission {
-                    tool,
-                    tool_use_id,
-                    input,
-                } => {
-                    let decision = responder
-                        .decide(&ActionRequest {
-                            tool,
-                            tool_use_id: tool_use_id.clone(),
-                            input,
-                        })
-                        .await;
-                    let (allow, message) = match decision {
-                        ActionDecision::Allow => (true, None),
-                        ActionDecision::Deny(why) => (false, Some(why)),
-                    };
-                    write_line(
-                        &mut stdin,
-                        &ToBridge::Decision {
-                            tool_use_id,
-                            allow,
-                            message,
-                        },
-                    )
-                    .await?;
+        // The whole exchange (send → permission round-trips → result) runs under ONE wall-clock
+        // budget. A hung LLM/bridge turn elapses here instead of freezing the single-flight loop
+        // forever; on return the child is reaped by `kill_on_drop` (PRD §11.8).
+        let drive = async {
+            write_line(&mut stdin, &invoke).await?;
+            loop {
+                let line = lines
+                    .next_line()
+                    .await
+                    .map_err(|e| DackError::Runtime(format!("bridge read: {e}")))?;
+                let Some(line) = line else {
+                    return Err(DackError::Runtime("bridge closed before result".into()));
+                };
+                if line.trim().is_empty() {
+                    continue;
                 }
-                FromBridge::Result { output } => return Ok(output),
-                FromBridge::Error { message } => return Err(DackError::Runtime(message)),
-                FromBridge::Log { message } => eprintln!("[bridge] {message}"),
+                match serde_json::from_str::<FromBridge>(&line).map_err(|e| {
+                    DackError::Runtime(format!("bridge event parse: {e} (line: {line})"))
+                })? {
+                    FromBridge::Permission {
+                        tool,
+                        tool_use_id,
+                        input,
+                    } => {
+                        let decision = responder
+                            .decide(&ActionRequest {
+                                tool,
+                                tool_use_id: tool_use_id.clone(),
+                                input,
+                            })
+                            .await;
+                        let (allow, message) = match decision {
+                            ActionDecision::Allow => (true, None),
+                            ActionDecision::Deny(why) => (false, Some(why)),
+                        };
+                        write_line(
+                            &mut stdin,
+                            &ToBridge::Decision {
+                                tool_use_id,
+                                allow,
+                                message,
+                            },
+                        )
+                        .await?;
+                    }
+                    FromBridge::Result { output } => return Ok(output),
+                    FromBridge::Error { message } => return Err(DackError::Runtime(message)),
+                    FromBridge::Log { message } => eprintln!("[bridge] {message}"),
+                }
             }
+        };
+
+        match tokio::time::timeout(self.timeout, drive).await {
+            Ok(result) => result,
+            Err(_elapsed) => Err(DackError::Runtime(format!(
+                "invoke exceeded its {:?} budget (LLM/bridge hung)",
+                self.timeout
+            ))),
         }
     }
 }
@@ -298,6 +321,7 @@ mod tests {
             model: None,
             sandbox: Arc::new(HostSandbox),
             policy: IsolationPolicy::host_passthrough(),
+            timeout: Duration::from_secs(30),
         }
     }
 
@@ -352,6 +376,22 @@ mod tests {
         let out = client.invoke(perceive_req(), rec).await.unwrap();
         assert_eq!(out.thought, "hi");
         assert_eq!(out.proposal.unwrap().gist, "g");
+    }
+
+    #[tokio::test]
+    async fn invoke_times_out_on_a_hung_bridge() {
+        // The mock reads the invoke, then hangs (never emits a result) — the budget must fire.
+        let mock = "#!/bin/sh\n\
+            read invoke\n\
+            sleep 30\n";
+        let mut client = mock_client(mock, "hang");
+        client.timeout = Duration::from_millis(250); // tight budget for the test
+        let rec = Arc::new(Recorder { asked: Mutex::new(vec![]), allow: true });
+        let err = client.invoke(perceive_req(), rec).await.unwrap_err();
+        assert!(
+            matches!(err, DackError::Runtime(m) if m.contains("budget")),
+            "a hung bridge must time out, not freeze the loop"
+        );
     }
 
     #[tokio::test]

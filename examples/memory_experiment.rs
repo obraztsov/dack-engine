@@ -94,7 +94,12 @@ async fn main() -> anyhow::Result<()> {
             env.insert(k.to_string(), v);
         }
     }
-    let client = OpenClaudeClient::bun_bridge("openclaude-bridge", env, std::env::var("DACK_MODEL").ok());
+    let client = OpenClaudeClient::bun_bridge(
+        "openclaude-bridge",
+        env,
+        std::env::var("DACK_MODEL").ok(),
+        std::time::Duration::from_secs(300),
+    );
 
     let perceive = run_state(
         &client,

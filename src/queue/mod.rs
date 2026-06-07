@@ -22,6 +22,13 @@ pub trait Queue: Send + Sync {
 
     async fn update_status(&self, id: &StimulusId, status: StimulusStatus) -> Result<()>;
 
+    /// Boot reconciliation (PRD §9.3): requeue rows stuck in `dispatched` — a crash mid-run
+    /// orphans the in-flight row (`next` flipped it `dispatched`, nothing advanced it). v1
+    /// effects are reversible (post/memory, never Settle), so **requeue is safe**: the duck
+    /// reconsiders the stimulus rather than silently dropping it. Single-flight means there is
+    /// at most one such row. Returns how many were reclaimed (logged at boot).
+    async fn reclaim_orphans(&self) -> Result<usize>;
+
     /// Replace a row's payload — used by the bus to fold a `batch`-coalesced candidate
     /// into the pending accumulator row (PRD §5.6). Policy stays in the bus; the queue is
     /// a dumb store.

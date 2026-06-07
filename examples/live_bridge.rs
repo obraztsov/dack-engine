@@ -45,7 +45,12 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     let model = std::env::var("DACK_MODEL").ok();
-    let client = OpenClaudeClient::bun_bridge("openclaude-bridge", env, model);
+    let client = OpenClaudeClient::bun_bridge(
+        "openclaude-bridge",
+        env,
+        model,
+        std::time::Duration::from_secs(300),
+    );
 
     let req = InvocationRequest {
         spec: default_spec(ConsciousnessState::Perceive),

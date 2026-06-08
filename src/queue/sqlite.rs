@@ -41,6 +41,12 @@ CREATE TABLE IF NOT EXISTS stimulus (
 );
 CREATE INDEX IF NOT EXISTS idx_stimulus_dedup        ON stimulus(type, dedup_key);
 CREATE INDEX IF NOT EXISTS idx_stimulus_status_rank  ON stimulus(status, priority_rank, received_at);
+
+-- Cross-poll dedup watermarks (PRD §10.2): one row per duty cursor key.
+CREATE TABLE IF NOT EXISTS cursor (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 ";
 
 /// The column list, in a fixed order shared by every SELECT and [`read_raw`].
@@ -271,6 +277,24 @@ impl Queue for SqliteQueue {
             )
             .map_err(db)?;
         Ok(n as usize)
+    }
+
+    async fn get_cursor(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row("SELECT value FROM cursor WHERE key=?1", params![key], |r| r.get(0))
+            .optional()
+            .map_err(db)
+    }
+
+    async fn set_cursor(&self, key: &str, value: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO cursor(key,value) VALUES(?1,?2)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![key, value],
+        )
+        .map_err(db)?;
+        Ok(())
     }
 }
 

@@ -66,6 +66,16 @@ impl Ingestor {
                 for (k, v) in self.broker.env_for(&def.frontmatter.secrets).await? {
                     env.insert(k, v);
                 }
+                // Cross-poll dedup (PRD §10.2): inject the stored watermark so the sensor fetches
+                // ONLY items newer than what we've already seen (e.g. X `since_id`). Absent on the
+                // first poll. Single-flight makes this read-then-advance race-free.
+                if let Some(cur) = &def.frontmatter.cursor {
+                    if let Some(since) =
+                        self.queue.get_cursor(&cur.key_for(&def.frontmatter.id)).await?
+                    {
+                        env.insert(cur.env.clone(), since);
+                    }
+                }
                 self.sensor
                     .run(&exe, &fired.payload, &env, SENSOR_TIMEOUT)
                     .await?
@@ -80,6 +90,17 @@ impl Ingestor {
                 payload_tier: None,
             }],
         };
+
+        // Advance the watermark to the newest discovered item, at DISCOVERY time (so a later
+        // processing failure never re-discovers it — a mention is "seen" once; we don't risk a
+        // double-reply by retrying). Empty poll → no candidate carries the field → no change.
+        if let Some(cur) = &def.frontmatter.cursor {
+            if let Some(mark) = watermark(&candidates, &cur.field) {
+                self.queue
+                    .set_cursor(&cur.key_for(&def.frontmatter.id), &mark)
+                    .await?;
+            }
+        }
 
         self.bus.ingest(&def, candidates, now).await
     }
@@ -109,6 +130,32 @@ impl Ingestor {
             }
         }
         env
+    }
+}
+
+/// The max value of `field` across `candidates` — the new cross-poll dedup watermark (PRD §10.2),
+/// or `None` if no candidate carries it. Numeric when both compare as integers (Twitter snowflake
+/// ids), else lexical — so a monotonic id advances correctly without assuming a value type.
+fn watermark(candidates: &[SensorCandidate], field: &str) -> Option<String> {
+    let mut best: Option<String> = None;
+    for c in candidates {
+        let v = match c.payload.get(field) {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(serde_json::Value::Number(n)) => n.to_string(),
+            _ => continue,
+        };
+        if best.as_deref().map_or(true, |b| cursor_gt(&v, b)) {
+            best = Some(v);
+        }
+    }
+    best
+}
+
+/// Is watermark `a` newer than `b`? Numeric when both parse as integers, else lexical.
+fn cursor_gt(a: &str, b: &str) -> bool {
+    match (a.parse::<u128>(), b.parse::<u128>()) {
+        (Ok(x), Ok(y)) => x > y,
+        _ => a > b,
     }
 }
 
@@ -223,6 +270,68 @@ mod tests {
         let row = queue.next().await.unwrap().unwrap();
         let items = row.payload.get("items").and_then(|v| v.as_array()).unwrap();
         assert_eq!(items.len(), 2, "both polled items folded into the row");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn watermark_is_numeric_then_lexical() {
+        let c = |id: &str| SensorCandidate {
+            type_: crate::model::stimulus::StimulusType::from("m"),
+            payload: serde_json::json!({ "id": id }),
+            dedup_key: None,
+            payload_tier: None,
+        };
+        // Numeric max (a snowflake id), NOT lexical: "100" > "99" numerically though "99" wins lexically.
+        assert_eq!(watermark(&[c("99"), c("100"), c("250")], "id").as_deref(), Some("250"));
+        // Lexical fallback for non-integer values.
+        assert_eq!(watermark(&[c("abc"), c("abd")], "id").as_deref(), Some("abd"));
+        // Missing field → no watermark.
+        assert_eq!(watermark(&[c("1")], "nope"), None);
+    }
+
+    /// PRD §10.2: the harness fetches the stored watermark, injects it into the sensor env, and
+    /// advances it from the discovered candidates — so a poll never re-surfaces a handled item.
+    #[tokio::test]
+    async fn cursor_dedup_injects_and_advances_watermark() {
+        let root = std::env::temp_dir().join(format!("dack-cursor-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        // Sensor: emit ONE mention candidate echoing the injected watermark + a fixed id.
+        write_exec(
+            &root.join("stimuli/mtest/scripts/emit.sh"),
+            "#!/bin/sh\nprintf '{\"type\":\"mention\",\"payload\":{\"id\":\"500\",\"saw_since\":\"%s\"}}\\n' \"${DACK_SINCE_ID:-none}\"\n",
+        );
+        std::fs::write(
+            root.join("stimuli/mtest/STIMULUS.md"),
+            "---\nid: mtest\ntrigger: { type: cron, schedule: \"* * * * *\" }\n\
+             sensor: ./scripts/emit.sh\ndirective_tier: self\n\
+             emits:\n  type: mention\n  default_payload_tier: public\n\
+             cursor: { field: id, env: DACK_SINCE_ID }\nroute: perceive\n---\nPoll.\n",
+        )
+        .unwrap();
+
+        let config = Arc::new(DackConfig::from_yaml("operator_did: \"did:key:zOp\"").unwrap());
+        let queue: Arc<dyn crate::queue::Queue> = Arc::new(SqliteQueue::open_in_memory().unwrap());
+        let ingestor = Ingestor {
+            repo_root: root.clone(),
+            config: config.clone(),
+            bus: Arc::new(Bus::new(config, queue.clone())),
+            queue: queue.clone(),
+            sensor: Arc::new(SubprocessSensor::new()),
+            broker: Arc::new(SecretsBroker::new(vec![])),
+            registry: Arc::new(RwLock::new(Registry::load(&root).unwrap())),
+        };
+
+        // First poll: no watermark yet → sensor sees none; cursor advances to 500.
+        ingestor.process(FiredTrigger { def_id: "mtest".into(), payload: vec![] }, 1000).await.unwrap();
+        assert_eq!(queue.get_cursor("mtest").await.unwrap().as_deref(), Some("500"));
+        let row1 = queue.next().await.unwrap().unwrap();
+        assert_eq!(row1.payload.get("saw_since").unwrap(), "none", "first poll injects no watermark");
+
+        // Second poll: the harness fetches the stored 500 and injects it into the sensor env.
+        ingestor.process(FiredTrigger { def_id: "mtest".into(), payload: vec![] }, 1001).await.unwrap();
+        let row2 = queue.next().await.unwrap().unwrap();
+        assert_eq!(row2.payload.get("saw_since").unwrap(), "500", "stored watermark was injected");
 
         std::fs::remove_dir_all(&root).ok();
     }

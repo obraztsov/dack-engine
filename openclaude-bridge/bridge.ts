@@ -29,6 +29,22 @@ console.log = (...a: unknown[]) => console.error('[bridge:log]', ...a)
 
 const emit = (obj: unknown) => process.stdout.write(JSON.stringify(obj) + '\n')
 
+// ── Twitter capability (Express act phase) ────────────────────────────────────────────────
+// Reversible external effect, exposed via a standalone **stdio MCP server** (`twitter-mcp.ts`)
+// the SDK spawns — `mcp__twitter__post`/`__reply` → the Rust wall gates them by clean name
+// (ToolClass::Post → Express only). The server inherits this bridge's env, so the harness-injected
+// `X_BEARER_TOKEN` (route `secrets: [x]`, act-phase only) and `DACK_TWITTER_DRY_RUN` reach it.
+const TWITTER_MCP = `${import.meta.dir}/twitter-mcp.ts`
+const twitterMcpServer = {
+  type: 'stdio' as const,
+  command: 'bun',
+  args: ['run', TWITTER_MCP],
+  // Pass the full env so `bun` (PATH), the bearer, and the dry-run flag reach the server.
+  env: Object.fromEntries(
+    Object.entries(process.env).filter(([, v]) => v !== undefined),
+  ) as Record<string, string>,
+}
+
 const OUTPUT_INSTRUCTION =
   'When you have finished perceiving and taking any permitted actions, your FINAL message ' +
   'MUST be ONLY a single JSON object (no prose, no markdown fence) with exactly this shape: ' +
@@ -101,13 +117,26 @@ async function runInvoke(inv: any) {
   }
   if (inv.model) options.model = inv.model
   if (inv.allowed_tools) options.allowedTools = inv.allowed_tools
+  // The duck's act-phase capabilities. The wall still gates every call (canUseTool → Rust).
+  options.mcpServers = { twitter: twitterMcpServer }
 
   let finalText = ''
   for await (const m of query({ prompt: inv.user_prompt, options }) as AsyncIterable<any>) {
     if (m?.type === 'assistant' && Array.isArray(m.message?.content)) {
       for (const b of m.message.content) if (b.type === 'text') finalText += b.text
-    } else if (m?.type === 'result' && m?.result) {
-      finalText ||= m.result
+    } else if (m?.type === 'result') {
+      if (m?.result) finalText ||= m.result
+      // Cost telemetry → stderr (inherited by the harness log). Per-invocation = per-state.
+      console.error(
+        '[bridge:usage]',
+        JSON.stringify({
+          model: inv.model ?? null,
+          usage: m.usage ?? m.modelUsage ?? null,
+          cost_usd: m.total_cost_usd ?? null,
+          duration_ms: m.duration_ms ?? null,
+          num_turns: m.num_turns ?? null,
+        }),
+      )
     }
   }
 

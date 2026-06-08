@@ -39,7 +39,9 @@ use crate::runtime::action_required::StatePolicyResponder;
 use crate::runtime::{
     ActionDecision, ActionRequest, ActionResponder, ContextBlock, InvocationRequest, RuntimeClient,
 };
-use crate::state::{allowed_transition, default_spec, tier_permits_transition, ConsciousnessState};
+use crate::state::{
+    allowed_transition, default_spec, tier_permits_transition, ConsciousnessState, StateSpec,
+};
 
 pub mod ingest;
 
@@ -158,10 +160,7 @@ impl Harness {
         let perceive_req = self.assemble_perceive_context(&stimulus).await?;
         // The wall, wrapped to record every (tool, decision) for the runlog (PRD §7.5 — an
         // injection path must be visible post-hoc).
-        let recorder = RecordingResponder::wrap(
-            StatePolicyResponder::new(default_spec(ConsciousnessState::Perceive))
-                .with_repo_root(self.soul_root()),
-        );
+        let recorder = self.wall_for(default_spec(ConsciousnessState::Perceive));
 
         // (3) Perceive runs read-only.
         let perceive_out = self.runtime.invoke(perceive_req, recorder.clone()).await?;
@@ -285,6 +284,20 @@ impl Harness {
             .unwrap_or_else(|| "did:dack:soul".into())
     }
 
+    /// The wall for `spec` — a [`RecordingResponder`] wrapping a [`StatePolicyResponder`] wired
+    /// with the operator's capability prefixes (so `mcp__twitter__*` classifies as Post in
+    /// Express) and the soul root (to relativize the absolute paths the SDK emits, PRD §4.1, §6.3).
+    fn wall_for(&self, spec: StateSpec) -> Arc<RecordingResponder> {
+        RecordingResponder::wrap(
+            StatePolicyResponder::with_capabilities(
+                spec,
+                self.config.post_tools.clone(),
+                self.config.settle_tools.clone(),
+            )
+            .with_repo_root(self.soul_root()),
+        )
+    }
+
     /// The act-phase secret env for a stimulus, from its **route's** `secrets:` (operator-gated;
     /// the agent can't grant itself a secret). Empty when the route grants none, or on error —
     /// a missing act-secret fails the skill, never the harness (logging-not-rollback).
@@ -337,8 +350,9 @@ impl Harness {
                 trusted: true,
             },
         ];
+        let system_prompt = self.system_prompt_for(&spec).await;
         Ok(InvocationRequest {
-            system_prompt: format!("<SOUL.md + {}>", spec.prompt_path),
+            system_prompt,
             spec,
             blocks,
             // v1: fresh context per wake. A future Perceive "lane" may reuse a session for
@@ -347,6 +361,26 @@ impl Harness {
             workdir: Some(self.soul_root()),
             secret_env: Default::default(),
         })
+    }
+
+    /// The state's system prompt = **SOUL.md** (the constant self) + **prompts/<state>.md** (the
+    /// state's task framing), read live from the soul repo so a Reflect edit takes effect next
+    /// wake. The bridge appends the structured-output instruction. Missing files degrade to a
+    /// minimal header rather than failing the run (PRD §4, §6.2).
+    async fn system_prompt_for(&self, spec: &StateSpec) -> String {
+        let soul = self.repo.read_file(&RepoPath("SOUL.md".into())).await.unwrap_or_default();
+        let prompt = self
+            .repo
+            .read_file(&RepoPath(spec.prompt_path.to_string()))
+            .await
+            .unwrap_or_default();
+        let soul = String::from_utf8_lossy(&soul);
+        let prompt = String::from_utf8_lossy(&prompt);
+        if soul.trim().is_empty() && prompt.trim().is_empty() {
+            format!("You are a DACK actor in the {:?} state.", spec.state)
+        } else {
+            format!("{}\n\n---\n\n{}", soul.trim_end(), prompt.trim_end())
+        }
     }
 
     /// The canonical absolute soul-repo path — the agent's workdir and the wall's relativize
@@ -420,20 +454,28 @@ impl Harness {
         stimulus: &Stimulus,
     ) -> Result<()> {
         let spec = default_spec(to);
+        // Harness-provided structured refs (e.g. `source_tweet_id` for a reply target). Trusted
+        // because the harness derived them deterministically from the payload, not the model.
+        let refs_rendered = if baton.refs.is_empty() {
+            String::new()
+        } else {
+            let kv: Vec<String> = baton.refs.iter().map(|(k, v)| format!("  {k}: {v}")).collect();
+            format!("\nrefs (harness-provided):\n{}", kv.join("\n"))
+        };
         let blocks = vec![ContextBlock {
             label: "baton".into(),
             // The agent's own digested product + harness-trusted annotations — NOT raw
             // untrusted bytes. payload_tier rides along so Express can stay skeptical.
             body: format!(
-                "gist: {}\n(directive_tier={:?} payload_tier={:?} runlog_ref={})",
-                baton.gist, baton.directive_tier, baton.payload_tier, baton.runlog_ref
+                "gist: {}{}\n(directive_tier={:?} payload_tier={:?} runlog_ref={})",
+                baton.gist, refs_rendered, baton.directive_tier, baton.payload_tier, baton.runlog_ref
             ),
             trusted: true,
         }];
-        let recorder =
-            RecordingResponder::wrap(StatePolicyResponder::new(spec.clone()).with_repo_root(self.soul_root()));
+        let recorder = self.wall_for(spec.clone());
+        let system_prompt = self.system_prompt_for(&spec).await;
         let req = InvocationRequest {
-            system_prompt: format!("<SOUL.md + {}>", spec.prompt_path),
+            system_prompt,
             spec,
             blocks,
             // FIREBREAK: Express/Settle ALWAYS get a fresh session — never the one that
@@ -535,9 +577,17 @@ impl ActionResponder for RecordingResponder {
             ActionDecision::Allow => "allow".to_string(),
             ActionDecision::Deny(why) => format!("deny: {why}"),
         };
+        // Capture a compact input so the runlog shows the ACTION (e.g. the reply text), not just
+        // the tool name — the audit trail of what the duck actually did (PRD §7.5). Truncated.
+        let mut input = req.input.to_string();
+        if input.len() > 240 {
+            input.truncate(240);
+            input.push('…');
+        }
         self.calls.lock().unwrap().push(ToolCallRecord {
             tool: req.tool.clone(),
             decision: rendered,
+            input: Some(input),
         });
         decision
     }
@@ -551,10 +601,20 @@ pub fn build_baton(perceive: &AgentOutput, stimulus: &Stimulus, runlog_ref: Stri
     // forced `PerceiveThenExpress` cycle (e.g. the heartbeat) must still open Express even if
     // Perceive proposed nothing explicit. Either way it is the agent's OWN digested product,
     // never the raw untrusted payload (the firebreak, PRD §6.4).
-    let (gist, refs) = match &perceive.proposal {
+    let (gist, mut refs) = match &perceive.proposal {
         Some(p) => (p.gist.clone(), p.refs.clone()),
         None => (perceive.thought.clone(), Default::default()),
     };
+    // Harness-derived structured reply target, taken DETERMINISTICALLY from the payload the
+    // harness holds (never model-laundered text). This is the only tweet id Express sees, so it
+    // can reply to the triggering tweet but not target arbitrary ones (PRD §6.4 — the firebreak
+    // carries the agent's digested gist + these trusted structured refs, not the raw payload).
+    if let Some(id) = stimulus.payload.get("id").and_then(|v| v.as_str()) {
+        refs.insert("source_tweet_id".into(), id.to_string());
+    }
+    if let Some(author) = stimulus.payload.get("author_username").and_then(|v| v.as_str()) {
+        refs.insert("source_author".into(), author.to_string());
+    }
     Baton {
         gist,
         refs,
@@ -632,6 +692,30 @@ mod tests {
         assert_eq!(baton.payload_tier, TrustTier::Public);
         assert_eq!(baton.directive_tier, TrustTier::SelfTier);
         assert_eq!(baton.refs.get("in_reply_to").unwrap(), "tweet_123");
+    }
+
+    #[test]
+    fn baton_carries_harness_derived_reply_target() {
+        // A real mention payload: the harness lifts the structured reply target deterministically.
+        let mut stim = poisoned_stimulus();
+        stim.payload = serde_json::json!({
+            "id": "1799000000000000001",
+            "text": "@agentdack gm duck",
+            "author_username": "alice",
+            "conversation_id": "1799000000000000001"
+        });
+        let out = perceive_output(); // intent=reply
+        let baton = build_baton(&out, &stim, "runlogs/2026-06-08.md#run".into());
+
+        assert_eq!(
+            baton.refs.get("source_tweet_id").map(String::as_str),
+            Some("1799000000000000001"),
+            "the reply target id crosses as a trusted, harness-derived ref"
+        );
+        assert_eq!(baton.refs.get("source_author").map(String::as_str), Some("alice"));
+        // The firebreak still holds: the raw mention text is NOT laundered into the baton.
+        let serialized = serde_json::to_string(&baton).unwrap();
+        assert!(!serialized.contains("gm duck"), "raw payload text must not ride the baton");
     }
 
     /// The dispatch wiring (Phase 4), offline against a mock bridge: a stimulus runs

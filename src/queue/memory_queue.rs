@@ -3,6 +3,7 @@
 //! is enforced by the harness loop, not here; this just orders by priority.
 
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use super::Queue;
@@ -12,6 +13,7 @@ use crate::model::stimulus::{Stimulus, StimulusId, StimulusStatus, StimulusType}
 #[derive(Default)]
 pub struct InMemoryQueue {
     rows: Mutex<Vec<Stimulus>>,
+    cursors: Mutex<HashMap<String, String>>,
 }
 
 impl InMemoryQueue {
@@ -96,5 +98,14 @@ impl Queue for InMemoryQueue {
             .iter()
             .filter(|s| s.status == StimulusStatus::Pending)
             .count())
+    }
+
+    async fn get_cursor(&self, key: &str) -> Result<Option<String>> {
+        Ok(self.cursors.lock().unwrap().get(key).cloned())
+    }
+
+    async fn set_cursor(&self, key: &str, value: &str) -> Result<()> {
+        self.cursors.lock().unwrap().insert(key.to_string(), value.to_string());
+        Ok(())
     }
 }

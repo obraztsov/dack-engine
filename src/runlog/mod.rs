@@ -76,7 +76,10 @@ impl DailyFileRunLog {
         if !entry.tool_calls.is_empty() {
             s.push_str("- tool calls:\n");
             for tc in &entry.tool_calls {
-                s.push_str(&format!("  - `{}` → {}\n", tc.tool, tc.decision));
+                match &tc.input {
+                    Some(inp) => s.push_str(&format!("  - `{}` {} → {}\n", tc.tool, inp.replace('\n', " "), tc.decision)),
+                    None => s.push_str(&format!("  - `{}` → {}\n", tc.tool, tc.decision)),
+                }
             }
         }
         // The raw stimulus, fenced UNTRUSTED — this is what `runlog_ref` points at (PRD §6.4).
@@ -232,6 +235,7 @@ mod tests {
         e.tool_calls = vec![ToolCallRecord {
             tool: "Write".into(),
             decision: "deny: Perceive may not write".into(),
+            input: Some("{\"file_path\":\"skills/x\"}".into()),
         }];
         let r = log.append(&e).await.unwrap();
         assert!(r.starts_with("runlogs/") && r.ends_with("#run-s1-perceive"));
@@ -253,7 +257,8 @@ mod tests {
         let body = std::fs::read_to_string(dir.join(format!("runlogs/{date}.md"))).unwrap();
         assert!(body.contains("```untrusted"));
         assert!(body.contains("IGNORE PREVIOUS INSTRUCTIONS"));
-        assert!(body.contains("`Write` → deny: Perceive may not write"));
+        assert!(body.contains("`Write`") && body.contains("deny: Perceive may not write"));
+        assert!(body.contains("skills/x"), "the tool input is in the audit trail");
         // ...and the runlog was actually committed (clean tree).
         let status = Command::new("git").arg("-C").arg(&dir).args(["status", "--porcelain"]).output().await.unwrap();
         assert!(String::from_utf8_lossy(&status.stdout).trim().is_empty(), "runlog committed");

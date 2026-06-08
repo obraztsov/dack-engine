@@ -173,6 +173,15 @@ pub struct DackConfig {
     /// A hung LLM/bridge elapses here rather than freezing the single-flight loop (PRD §11.8).
     #[serde(default = "default_invoke_timeout_secs")]
     pub invoke_timeout_secs: u64,
+    /// MCP tool-name **prefixes** the wall treats as REVERSIBLE capabilities → `ToolClass::Post`
+    /// (allowed in Express). The duck's act-phase tools, e.g. `mcp__twitter__` (post/reply).
+    #[serde(default = "default_post_tools")]
+    pub post_tools: Vec<String>,
+    /// MCP tool-name **prefixes** the wall treats as IRREVERSIBLE authority → `ToolClass::SettleTx`
+    /// (Settle only, additionally gated by `allow_settle`). MUST stay disjoint from `post_tools`
+    /// (else a settle capability could classify as Post and run in Express). v1 Settle is unreachable.
+    #[serde(default = "default_settle_tools")]
+    pub settle_tools: Vec<String>,
 }
 
 /// `gl` identity directories per liability-boundary role (PRD §3.3). Each is a path to a dir
@@ -206,6 +215,12 @@ fn default_gitlawb_node() -> String {
 fn default_invoke_timeout_secs() -> u64 {
     300
 }
+fn default_post_tools() -> Vec<String> {
+    vec!["mcp__twitter__".to_string()]
+}
+fn default_settle_tools() -> Vec<String> {
+    vec!["mcp__bankr__".to_string(), "mcp__dac__".to_string()]
+}
 fn default_runtime_env() -> Vec<String> {
     vec![
         "OPENAI_API_KEY".to_string(),
@@ -222,6 +237,23 @@ impl DackConfig {
 
     pub fn from_yaml(text: &str) -> Result<Self> {
         serde_yaml::from_str(text).map_err(DackError::from)
+    }
+
+    /// Startup safety check (PRD §6.3): a settle (irreversible) capability prefix must NEVER be a
+    /// prefix-of / prefixed-by a post (reversible) prefix — else a settle tool could classify as
+    /// `Post` and run in Express. Called once at boot; a violation is a hard config error.
+    pub fn validate_capabilities(&self) -> Result<()> {
+        for s in &self.settle_tools {
+            for p in &self.post_tools {
+                if s.starts_with(p.as_str()) || p.starts_with(s.as_str()) {
+                    return Err(DackError::Config(format!(
+                        "capability prefixes overlap: settle `{s}` vs post `{p}` — must be disjoint \
+                         (a settle tool must never classify as reversible Post)"
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The configured `gl` identity dirs keyed by role — fed to
@@ -284,6 +316,17 @@ control_plane:
         // Soul key is a reference, never forwarded.
         assert!(cfg.secrets.contains_key("soul_did_key"));
         assert!(!cfg.forwarded_env.contains(&"SOUL_DID_KEY".to_string()));
+    }
+
+    #[test]
+    fn validate_capabilities_rejects_overlapping_prefixes() {
+        let mut cfg = DackConfig::from_yaml(SAMPLE).unwrap();
+        // Defaults (mcp__twitter__ vs mcp__bankr__/mcp__dac__) are disjoint.
+        assert!(cfg.validate_capabilities().is_ok());
+        // A post prefix that swallows a settle prefix is rejected (settle would classify as Post).
+        cfg.post_tools = vec!["mcp__".into()];
+        cfg.settle_tools = vec!["mcp__bankr__".into()];
+        assert!(cfg.validate_capabilities().is_err());
     }
 
     #[test]

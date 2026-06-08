@@ -36,6 +36,30 @@ pub struct Emits {
     pub default_payload_tier: TrustTier,
 }
 
+/// Cross-poll dedup cursor (PRD §10.2) — a monotonic **watermark** the harness persists in the
+/// queue DB so a polling sensor never re-discovers what it already saw (e.g. X `since_id`). The
+/// harness fetches the stored value, injects it into the sensor's env before the run, and after
+/// the run advances it to the max `field` over the discovered candidates. Single-flight → no race.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CursorSpec {
+    /// Candidate-payload field whose MAX is the new watermark (e.g. `id` — a Twitter snowflake,
+    /// monotonic). Compared numerically when both values parse as integers, else lexically.
+    pub field: String,
+    /// Env var the stored watermark is injected into the sensor as (e.g. `DACK_SINCE_ID`). Absent
+    /// on the first poll (no stored value yet) — the sensor then fetches from the beginning.
+    pub env: String,
+    /// DB key the watermark is stored under. Defaults to the duty id (one cursor per duty).
+    #[serde(default)]
+    pub key: Option<String>,
+}
+
+impl CursorSpec {
+    /// The DB key for this duty's watermark (explicit `key`, else the duty id).
+    pub fn key_for(&self, duty_id: &str) -> String {
+        self.key.clone().unwrap_or_else(|| duty_id.to_string())
+    }
+}
+
 /// The YAML frontmatter of a `STIMULUS.md` (PRD §5.4).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StimulusFrontmatter {
@@ -58,6 +82,10 @@ pub struct StimulusFrontmatter {
     /// sensor never holds the root credential (PRD §7.2; `docs/SECRETS-AND-SANDBOX.md`).
     #[serde(default)]
     pub secrets: Vec<String>,
+    /// Optional cross-poll dedup watermark (PRD §10.2) — see [`CursorSpec`]. Present on polling
+    /// sensors (mentions) so the duck never re-processes (or re-replies to) an already-seen item.
+    #[serde(default)]
+    pub cursor: Option<CursorSpec>,
 }
 
 /// A registered duty: parsed frontmatter + the trusted directive body.

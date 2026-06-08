@@ -87,8 +87,10 @@ bridge_dir: "openclaude-bridge"
 # models; a gateway name passed as options.model is rejected by the SDK's model catalog.
 # model: "claude-haiku-4-5"
 # Env var NAMES forwarded into the bridge (values come from the harness env, never the YAML).
-# For opengateway: export OPENAI_API_KEY=ogw_live_…  OPENAI_BASE_URL=https://opengateway.gitlawb.com/v1  OPENAI_MODEL=mimo-v2.5-pro
-runtime_env: [OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL]
+# For opengateway: export CLAUDE_CODE_USE_OPENAI=1  OPENAI_API_KEY=ogw_live_…  OPENAI_BASE_URL=https://opengateway.gitlawb.com/v1  OPENAI_MODEL=mimo-v2.5-pro
+# CLAUDE_CODE_USE_OPENAI=1 is REQUIRED to use the gateway — without it the SDK falls back to
+# ambient Anthropic/Claude auth (verified Phase 6). A reasoning model (mimo) is slow (~30–60s/state).
+runtime_env: [OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL, CLAUDE_CODE_USE_OPENAI]
 
 # ── Soul repo + identity (Phase 7: durable, signed, off-VPS) ──────────────────────────────
 # `gl` identity DIRECTORIES per role (each holds identity.pem + ucan.json). The Soul dir signs

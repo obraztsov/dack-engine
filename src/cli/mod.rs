@@ -121,7 +121,13 @@ async fn log_cmd(config_path: &str, follow: bool) -> Result<()> {
 /// Phase 4; until then `run` keeps the duck's senses live and the queue filling.
 async fn run(config_path: &str) -> Result<()> {
     let config = Arc::new(DackConfig::load(config_path)?);
-    let repo_root = PathBuf::from(&config.soul_repo);
+    // Fail fast if the capability prefixes overlap (a settle tool must never classify as Post).
+    config.validate_capabilities()?;
+    // Absolutize the soul repo so sensor exes (spawned with a changed cwd) and the signed-push
+    // `GITLAWB_KEY` resolve regardless of where `dack` is launched from (relative config paths
+    // otherwise break under subprocess cwd changes). Falls back to as-written if it doesn't exist.
+    let repo_root = std::fs::canonicalize(&config.soul_repo)
+        .unwrap_or_else(|_| PathBuf::from(&config.soul_repo));
 
     let queue: Arc<dyn Queue> = Arc::new(SqliteQueue::open(&config.db_path)?);
     let bus = Arc::new(Bus::new(config.clone(), queue.clone()));
@@ -178,16 +184,22 @@ async fn run(config_path: &str) -> Result<()> {
     // configured, else plain git (degraded mode, PRD §3.5). The Soul DID attributes the
     // commit history to the duck; the signed push is the cryptographic provenance.
     let repo: Arc<dyn RepoHost> = match (&config.soul_remote, &config.identities.soul) {
-        (Some(remote), Some(soul_dir)) => Arc::new(GitlawbRepo::new(
-            &config.soul_repo,
-            soul_did.clone(),
-            remote.clone(),
-            soul_dir.clone(),
-            config.gitlawb_node.clone(),
-        )),
+        (Some(remote), Some(soul_dir)) => {
+            // Absolutize the identity dir: `GITLAWB_KEY` is read by the push helper running with
+            // cwd = the soul repo, so a relative dir would not resolve (→ unsigned / 401).
+            let soul_dir = std::fs::canonicalize(soul_dir)
+                .unwrap_or_else(|_| PathBuf::from(soul_dir));
+            Arc::new(GitlawbRepo::new(
+                &repo_root,
+                soul_did.clone(),
+                remote.clone(),
+                soul_dir,
+                config.gitlawb_node.clone(),
+            ))
+        }
         _ => {
             eprintln!("dack: no soul_remote/identities.soul — plain-git, local-only (no signed push)");
-            Arc::new(PlainGitRepo::new(&config.soul_repo, soul_did.clone()))
+            Arc::new(PlainGitRepo::new(&repo_root, soul_did.clone()))
         }
     };
     let runlog: Arc<dyn RunLogWriter> =
@@ -220,8 +232,9 @@ async fn run(config_path: &str) -> Result<()> {
     });
     tokio::spawn({
         let h = harness.clone();
+        let sd = shutdown_rx.clone();
         async move {
-            if let Err(e) = h.run(shutdown_rx).await {
+            if let Err(e) = h.run(sd).await {
                 eprintln!("dack: consciousness loop stopped: {e}");
             }
         }
@@ -238,7 +251,14 @@ async fn run(config_path: &str) -> Result<()> {
         broker,
     });
     eprintln!("dack: ingestion up (cron+webhook → bus → queue).");
-    ingestor.run(rx).await;
+    // The ingestion loop is the process's main future. Stop it on shutdown too, so the whole
+    // daemon exits (systemd then restarts it) instead of the consciousness loop alone draining.
+    let mut sd = shutdown_rx;
+    tokio::select! {
+        _ = ingestor.run(rx) => {}
+        _ = sd.changed() => eprintln!("dack: ingestion stopping — shutdown"),
+    }
+    eprintln!("dack: stopped cleanly.");
     Ok(())
 }
 

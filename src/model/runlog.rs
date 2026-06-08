@@ -22,6 +22,10 @@ pub struct ToolCallRecord {
     pub tool: String,
     /// "allow" | "deny: <reason>".
     pub decision: String,
+    /// A compact, truncated rendering of the tool input — so the runlog audit shows **what** the
+    /// duck did (the reply text it posted, the path it wrote), not merely which tool it reached.
+    #[serde(default)]
+    pub input: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

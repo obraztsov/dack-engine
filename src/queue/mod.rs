@@ -44,6 +44,14 @@ pub trait Queue: Send + Sync {
 
     /// Queue depth, for `dack status` (PRD §8.3).
     async fn depth(&self) -> Result<usize>;
+
+    /// Read a cross-poll dedup **cursor** (watermark) by key — `None` until first set. The
+    /// harness injects it into a polling sensor's env so it fetches only newer items (PRD §10.2).
+    async fn get_cursor(&self, key: &str) -> Result<Option<String>>;
+
+    /// Persist a cursor watermark (insert-or-replace). Called after a poll with the max seen
+    /// value; single-flight makes the read-modify-write race-free.
+    async fn set_cursor(&self, key: &str, value: &str) -> Result<()>;
 }
 
 mod memory_queue;

@@ -14,9 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::stimulus::TrustTier;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConsciousnessState {
     Perceive,
@@ -161,36 +159,16 @@ pub fn default_spec(state: ConsciousnessState) -> StateSpec {
 ///      It influences the future only indirectly, by writing `memory/` and `stimuli/`.
 pub fn allowed_transition(from: ConsciousnessState, to: ConsciousnessState) -> bool {
     use ConsciousnessState::*;
-    // Nothing may transition *into* Reflect (invariant 2).
-    if to == Reflect {
-        return false;
-    }
-    // Reflect transitions into nothing (invariant 3).
-    if from == Reflect {
-        return false;
-    }
-    matches!((from, to), (Perceive, Express) | (Perceive, Settle))
+    // The ONE structural constraint (invariants 2 & 3): nothing transitions INTO Reflect and
+    // Reflect transitions into nothing. Everything else (which tiers a state-prompt chain may
+    // walk, and how far) is now bounded by the operator **route ceiling** (`reach_rank` ≤ ceiling)
+    // — see `harness::dispatch` (MCP2-B). The soul declares the path; the ceiling caps it.
+    from != Reflect && to != Reflect
 }
 
-/// The highest consciousness state a stimulus of a given tier may **transition** toward — the
-/// deterministic tier-edge backstop (PRD §5.7), independent of the model's proposal and the
-/// operator's routing. **Only the irreversible `Settle` doorway is tier-gated** (operator_signed
-/// only); reversible **`Express` is open to *any* tier**, because the firebreak makes the Express
-/// action the duck's *own* digested choice (a bad reply is reversible — sovereign territory — and
-/// the dumb Settle predicate still backstops irreversible action). This is the *transition*
-/// ceiling, distinct from the *entry* state (which routing/`route.entry` decides — a public tweet
-/// still *enters* at Perceive). `Reflect` is harness-entered only and never transition-reachable.
-pub fn max_reachable_state(tier: TrustTier) -> ConsciousnessState {
-    match tier {
-        TrustTier::OperatorSigned => ConsciousnessState::Settle,
-        // public / authed_peer / self: up to reversible Express (Settle needs operator_signed).
-        _ => ConsciousnessState::Express,
-    }
-}
-
-/// Reachability rank for the tier-ceiling clamp: `Perceive < Express < Settle`. `Reflect` ranks
-/// above only so the comparison is total; it is harness-only and never compared in practice.
-fn reach_rank(s: ConsciousnessState) -> u8 {
+/// Reachability rank for the route-ceiling clamp: `Perceive < Express < Settle`. `Reflect` ranks
+/// above only so the comparison is total; it is harness-only and never a ceiling/transition target.
+pub fn reach_rank(s: ConsciousnessState) -> u8 {
     use ConsciousnessState::*;
     match s {
         Perceive => 0,
@@ -200,11 +178,13 @@ fn reach_rank(s: ConsciousnessState) -> u8 {
     }
 }
 
-/// Whether a `tier` stimulus may transition to `to` — the dumb tier-edge gate the harness
-/// applies before honoring a model-proposed transition (PRD §5.7). Compose with
-/// [`allowed_transition`] (the structural rule): a transition needs **both**.
-pub fn tier_permits_transition(tier: TrustTier, to: ConsciousnessState) -> bool {
-    reach_rank(to) <= reach_rank(max_reachable_state(tier))
+/// Whether opening `state` is within the operator-declared route `ceiling` (MCP2-B). The ceiling is
+/// the highest consciousness tier a payload-class may walk to; the operator sets it per route
+/// (`ceiling: settle` is the authority that lets a self-tier trade duty reach Settle — what the old
+/// `EntryState::PerceiveThenSettle` force did). A `settle` ceiling is additionally guarded at config
+/// load to non-public routes (`DackConfig::validate_capabilities`).
+pub fn within_ceiling(state: ConsciousnessState, ceiling: ConsciousnessState) -> bool {
+    reach_rank(state) <= reach_rank(ceiling)
 }
 
 #[cfg(test)]
@@ -264,40 +244,31 @@ mod tests {
 
     #[test]
     fn transition_invariants() {
-        // Perceive opens Express/Settle.
-        assert!(allowed_transition(Perceive, Express));
-        assert!(allowed_transition(Perceive, Settle));
-        // Reflect is harness-entered only: nothing transitions INTO it.
+        // The Reflect invariant (the only structural constraint): nothing INTO Reflect...
         for s in [Perceive, Express, Settle, Reflect] {
             assert!(!allowed_transition(s, Reflect), "{s:?} → Reflect must be forbidden");
         }
-        // Reflect is harness-exited only: it transitions into nothing.
+        // ...and Reflect transitions into nothing.
         for s in [Perceive, Express, Settle, Reflect] {
             assert!(!allowed_transition(Reflect, s), "Reflect → {s:?} must be forbidden");
         }
-        // Express/Settle do not originate transitions (Express returns transition:none).
-        assert!(!allowed_transition(Express, Settle));
-        assert!(!allowed_transition(Express, Perceive));
+        // Non-Reflect edges are structurally allowed; the OPERATOR CEILING (not this rule) bounds
+        // how far a chain walks. Perceive→Express and a same/higher-tier hop are all structurally OK.
+        assert!(allowed_transition(Perceive, Express));
+        assert!(allowed_transition(Perceive, Settle));
+        assert!(allowed_transition(Express, Settle));
+        assert!(allowed_transition(Express, Express));
     }
 
     #[test]
-    fn tier_ceiling_gates_settle_not_express() {
-        // Reversible Express is open to EVERY tier — the firebreak makes it the duck's own
-        // digested choice (a public mention → Perceive → Express reply is the core flow).
-        for t in [
-            TrustTier::Public,
-            TrustTier::AuthedPeer,
-            TrustTier::SelfTier,
-            TrustTier::OperatorSigned,
-        ] {
-            assert!(tier_permits_transition(t, Express), "{t:?} → Express must be permitted");
+    fn ceiling_clamps_how_far_a_chain_walks() {
+        // An Express ceiling admits Perceive + Express, never the irreversible Settle.
+        assert!(within_ceiling(Perceive, Express));
+        assert!(within_ceiling(Express, Express));
+        assert!(!within_ceiling(Settle, Express));
+        // A Settle ceiling admits the whole reversibility ladder up to Settle.
+        for s in [Perceive, Express, Settle] {
+            assert!(within_ceiling(s, Settle), "{s:?} must be within a Settle ceiling");
         }
-        // The irreversible Settle doorway is operator_signed ONLY.
-        assert!(tier_permits_transition(TrustTier::OperatorSigned, Settle));
-        for t in [TrustTier::Public, TrustTier::AuthedPeer, TrustTier::SelfTier] {
-            assert!(!tier_permits_transition(t, Settle), "{t:?} → Settle must be denied");
-        }
-        assert_eq!(max_reachable_state(TrustTier::Public), Express);
-        assert_eq!(max_reachable_state(TrustTier::OperatorSigned), Settle);
     }
 }

@@ -243,7 +243,7 @@ mod tests {
              sensor: ./scripts/emit.sh\ndirective_tier: self\n\
              emits:\n  type: poll_item\n  default_payload_tier: public\n\
              coalesce: { mode: batch, window_sec: 600, dedup_key: thread }\n\
-             route: perceive\n---\nPoll directive.\n",
+             entry: perceive\n---\nPoll directive.\n",
         )
         .unwrap();
 
@@ -306,7 +306,7 @@ mod tests {
             "---\nid: mtest\ntrigger: { type: cron, schedule: \"* * * * *\" }\n\
              sensor: ./scripts/emit.sh\ndirective_tier: self\n\
              emits:\n  type: mention\n  default_payload_tier: public\n\
-             cursor: { field: id, env: DACK_SINCE_ID }\nroute: perceive\n---\nPoll.\n",
+             cursor: { field: id, env: DACK_SINCE_ID }\nentry: perceive\n---\nPoll.\n",
         )
         .unwrap();
 

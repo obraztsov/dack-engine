@@ -8,33 +8,36 @@
 # The trusted operator DID — provenance check for the `operator_signed` tier (PRD §5.7).
 operator_did: "did:key:z6MkOperatorReplaceMe"
 
-# Routing table: (payload_tier, type) -> entry state + priority + coalesce policy.
-# Fixed states, configurable edges (the product-iteration surface). NO row routes to
-# `settle` in v1 — the irreversible doorway is structurally unreachable.
+# Routing table (MCP2-B): (payload_tier, type) -> priority + coalesce + the transition CEILING.
+# The ENTRY state-prompt is the STIMULUS's own `entry:` (a path under prompts/); the soul owns the
+# chain from there. `ceiling` is the highest consciousness tier a chain may walk to (default
+# express). A `ceiling: settle` is the operator authority that lets a self/operator route reach the
+# irreversible Settle (guarded at load to non-public routes); `reflect` is never a ceiling.
 routing:
-  - match: { tier: public, type: mention }
-    entry: perceive
+  - match: { tier: public, type: mention }         # twitter-mentions → perceive, then reply
     priority: low
     coalesce: { mode: batch, window_sec: 300, dedup_key: thread_id }
-  - match: { tier: public, type: clarity_post }
-    entry: perceive
-    priority: low
-    coalesce: { mode: batch, window_sec: 600, dedup_key: tweet_id }
-  - match: { tier: public, type: token_launch }
-    entry: perceive
-    priority: normal
-    coalesce: { mode: none }            # one-at-a-time; each launch judged individually
-  - match: { tier: self, type: scheduled_post }
-    entry: perceive_then_express
+    secrets: [x]                                   # SENSOR/skill secret (not MCP) — operator-gated.
   - match: { tier: public, type: feed_digest }     # twitter-feed → read the room (perceive only)
-    entry: perceive
     priority: low
-  - match: { tier: public, type: mention }         # twitter-mentions → perceive, then reply
-    entry: perceive
-    priority: low
-    secrets: [x]                                   # ACT-phase: Express may use X (to reply).
-                                                   # Operator-gated here — the agent can't grant
-                                                   # itself a secret; read-only Perceive gets none.
+  - match: { tier: self, type: scheduled_post }    # heartbeat shitpost cadence
+    ceiling: express
+  - match: { tier: self, type: trade_signal }      # a daily bounded-loss trade duty (SETTLE-B)
+    ceiling: settle                                # operator authority: this chain MAY reach Settle
+
+# Entry state-prompt for harness-synthesized stimuli (back-online ping, `dack say`).
+default_entry: perceive
+
+# ── MCP tier policy (MCP2-B, invariant I16): the operator's half of the capability handshake. ──
+# A state-prompt's `mcp:` request is admitted only here. `import` = operator `mcp_servers` a
+# state-prompt at this tier may import by name (token injected server-side, never agent context).
+# `mcp_whitelist: false` = an OPEN tier: the soul may ALSO inline any public, secret-less MCP
+# (forced read-tier — it can never self-grant post/settle). An unconfigured tier is locked + empty.
+tier_policy:
+  perceive: { mcp_whitelist: false, import: [cove-read] }   # open: self-plug public reads + cove-read
+  express:  { import: [twitter] }                           # locked: only the X post/reply server
+  settle:   { import: [cove-trading, cove-read] }           # locked: the irreversible trade server
+  reflect:  { import: [] }                                  # locked: no capabilities while self-editing
 
 # Names injected into the agent + sensor env. RECOVERABLE values only (PRD §7.2):
 # leak == rotate. The Soul DID key is deliberately absent — it lives in `secrets:`.
@@ -122,17 +125,26 @@ invoke_timeout_secs: 300
 #   settle → ToolClass::SettleTx → SETTLE only + allow_settle (irreversible: trade/transfer/vote)
 # `transport` is `{type: stdio, command, args}` (our own daemon) or `{type: http, url}` (remote).
 # `auth.secret` names a secrets provider; the token is injected into the http header / stdio env
-# so it reaches the server but NEVER the agent's context. Routes grant servers via `capabilities:`.
+# so it reaches the server but NEVER the agent's context. A state-prompt REQUESTS a server in its
+# `mcp:` frontmatter; the `tier_policy` above ADMITS it (the two-sided handshake, MCP2-B / I16).
+# `tools:` (optional) is a per-server tool ALLOWLIST (bare names). When set, ONLY those tools are
+# permitted — the wall denies any other tool under `mcp__<name>__` FAIL-CLOSED. This is essential
+# for an endpoint that serves its full surface to every token: cove returns all 37 tools (incl.
+# buy_token) on the read-only token, so `cove-read` MUST whitelist only the read tools, with the
+# trade tools living on the `cove-trading` (settle) sibling. Empty/omitted = expose everything.
 mcp_servers:
   - name: twitter
     transport: { type: stdio, command: bun, args: [run, openclaude-bridge/twitter-mcp.ts] }
     auth: { secret: x, env: X_BEARER_TOKEN }
     tier: post
   - name: cove-read       # remote http MCP — monitoring (read-only token)
-    transport: { type: http, url: "https://production.cove.trade/api/mcp" }
+    transport: { type: http, url: "https://staging.cove.trade/api/mcp" }   # cove enabled MCP on staging
     auth: { secret: cove_read }     # → Authorization: Bearer <token>; header/scheme overridable
     tier: read
+    tools: [get_balance, get_positions, search_tokens, get_token_info, get_token_stats,
+            get_price_history, get_token_security_report, scan_trending_tokens, simulate_swap]  # read subset
   - name: cove-trading    # remote http MCP — IRREVERSIBLE trading (read-write token); Settle only
-    transport: { type: http, url: "https://production.cove.trade/api/mcp" }
+    transport: { type: http, url: "https://staging.cove.trade/api/mcp" }
     auth: { secret: cove_trade }
     tier: settle
+    tools: [simulate_swap, buy_token, sell_token, create_limit_buy, cancel_limit_order]  # trade subset

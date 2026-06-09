@@ -40,14 +40,15 @@ const OUTPUT_INSTRUCTION =
   'MUST be ONLY a single JSON object (no prose, no markdown fence) with exactly this shape: ' +
   '{"thought": string, "memory_append": string|null, ' +
   '"proposal": {"intent": "reply"|"post"|"research"|"ignore"|"noop", "gist": string}|null, ' +
-  '"transition": {"to_state": "perceive"|"express"|"settle"|"reflect"|null, "reason": string}}. ' +
-  'Output nothing after the JSON.'
+  '"transition": {"to_prompt": string|null, "reason": string}}. ' +
+  'Set "to_prompt" to EXACTLY ONE of the state-prompt ids listed in your allowed-transitions ' +
+  'context block to continue to that next step, or null to stop here. Output nothing after the JSON.'
 
 /** Ensure the parsed/fallback output satisfies the Rust AgentOutput contract. */
 function normalize(o: any, fallbackText: string): unknown {
   const out = o && typeof o === 'object' ? { ...o } : {}
   if (typeof out.thought !== 'string') out.thought = fallbackText.trim().slice(0, 2000) || '(no output)'
-  if (!out.transition || typeof out.transition !== 'object') out.transition = { to_state: null }
+  if (!out.transition || typeof out.transition !== 'object') out.transition = { to_prompt: null }
   return out
 }
 

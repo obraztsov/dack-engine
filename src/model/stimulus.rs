@@ -6,7 +6,6 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::EntryState;
 
 /// Provenance-derived trust tier (PRD §5.7). Assigned *deterministically by the
 /// source*, never by the model. The tier does not decide what the agent thinks
@@ -143,8 +142,9 @@ pub struct Stimulus {
     /// The trusted directive text (the `.md` body) carried alongside the untrusted
     /// payload. Delimited as trusted-briefing when assembled into Perceive context.
     pub directive_body: String,
-    /// The consciousness entry state this cycle opens at — decided by the **bus** at ingest
-    /// (operator route `entry`, else the duty's frontmatter `route`). `PerceiveThenExpress`
-    /// makes dispatch open Express unconditionally after Perceive (the firebreak still holds).
-    pub entry: EntryState,
+    /// The **entry state-prompt id** this cycle opens at (MCP2-B) — the stimulus's own frontmatter
+    /// `entry:` (e.g. `twitter/perceive_mention`), or the operator `default_entry` for synthesized
+    /// stimuli. Dispatch resolves `prompts/<entry>.md`, runs it, then walks its `transitions`
+    /// (each hop ceiling-clamped; the firebreak holds across every hop).
+    pub entry: String,
 }

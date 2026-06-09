@@ -7,8 +7,6 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::state::ConsciousnessState;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Intent {
@@ -29,13 +27,16 @@ pub struct Proposal {
     pub refs: BTreeMap<String, String>,
 }
 
-/// A requested state transition. Whether it is *honored* is decided by the harness
-/// against [`crate::state::allowed_transition`] — the agent proposes, the harness opens.
+/// A requested state transition (MCP2-B). The agent names the **next state-prompt id** it chooses
+/// — exactly one of the current prompt's declared `transitions` (or `None` to terminate). Whether
+/// it is honored is decided by the harness: the id must be in the allowed set, resolve to a real
+/// `prompts/<id>.md`, sit within the route ceiling, and pass [`crate::state::allowed_transition`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transition {
-    /// `None` = stay / terminate this cycle.
+    /// `None` = terminate this cycle. Otherwise the chosen next state-prompt id (e.g.
+    /// `twitter/feed_reply`).
     #[serde(default)]
-    pub to_state: Option<ConsciousnessState>,
+    pub to_prompt: Option<String>,
     #[serde(default)]
     pub reason: String,
 }

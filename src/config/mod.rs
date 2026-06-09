@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{DackError, Result};
 use crate::model::stimulus::{Priority, StimulusType, TrustTier};
+use crate::state::ConsciousnessState;
 
 /// Coalescing policy — both an economics knob and a character decision (architecture §3).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,29 +36,21 @@ pub enum CoalesceMode {
     None,
 }
 
-/// The entry into the consciousness loop for a matched route.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EntryState {
-    Perceive,
-    /// Baseline cadence: Perceive then immediately Express (e.g. scheduled posts).
-    PerceiveThenExpress,
-    /// Perceive (research/analyse) then enter the **irreversible Settle** state to act — e.g. a
-    /// daily bounded-loss trade duty. This is **operator route authority**: only the operator can
-    /// configure a route to Settle, so it bypasses the trust-tier ceiling (a self-tier trade cron
-    /// can reach Settle *because the operator declared this route*). The risk is bounded externally
-    /// (the funded account balance) + at the tool tier (only `tier: settle` capabilities run here).
-    PerceiveThenSettle,
-}
-
-/// One routing rule: `(payload_tier, type)` → entry state + priority + coalesce policy.
-/// Fixed states, configurable edges — the product-iteration surface. The agent never
-/// edits this and never assigns its own tiers (PRD §5.6).
+/// One routing rule: `(payload_tier, type)` → priority + coalesce + the transition **ceiling**.
+/// Fixed states, configurable edges — the product-iteration surface. The agent never edits this and
+/// never assigns its own tiers (PRD §5.6). The *entry* state-prompt is now the **stimulus's** own
+/// frontmatter (`entry:`); this rule supplies the operator's dispatch concerns (MCP2-B).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingRule {
     #[serde(rename = "match")]
     pub match_: RouteMatch,
-    pub entry: EntryState,
+    /// The highest consciousness tier a chain matching this route may walk to (MCP2-B). The
+    /// soul's state-prompt transitions are clamped to it; `ceiling: settle` is the operator
+    /// authority that lets a self-tier trade duty reach Settle (what `PerceiveThenSettle` did).
+    /// Defaults to reversible `Express` (Settle unreachable) when omitted. A `settle` ceiling is
+    /// guarded at load to non-public routes (`validate_capabilities`). `Reflect` is never a ceiling.
+    #[serde(default)]
+    pub ceiling: Option<ConsciousnessState>,
     #[serde(default)]
     pub priority: Option<Priority>,
     #[serde(default)]
@@ -69,13 +62,6 @@ pub struct RoutingRule {
     /// §4.1; `docs/SECRETS-AND-SANDBOX.md`).
     #[serde(default)]
     pub secrets: Vec<String>,
-    /// MCP capability servers (by `mcp_servers` name) the **act phase** of cycles on this route
-    /// may use — **operator-controlled**, the agent can never grant itself a capability. The
-    /// harness exposes, per state, this route's capabilities filtered to the state's tier
-    /// (read→any · post→Express · settle→Settle); their auth tokens are materialized + injected
-    /// so they never enter the agent's context (PRD §6.3). Empty = no capabilities (least-privilege).
-    #[serde(default)]
-    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,6 +69,40 @@ pub struct RouteMatch {
     pub tier: TrustTier,
     #[serde(rename = "type")]
     pub type_: StimulusType,
+}
+
+/// Per-consciousness-tier MCP policy (MCP2-B, invariant I16) — the OPERATOR's half of the
+/// capability handshake. A state-prompt's `mcp:` requests are admitted only by this policy:
+/// - `import`: the operator-registered `mcp_servers` a state-prompt at this tier may import by name
+///   (its token is injected server-side, never the agent context). The allowlist of secret-bearing
+///   capabilities reachable here.
+/// - `mcp_whitelist`: when `true` (the safe default, like Settle) ONLY `import` refs are allowed —
+///   no self-plug. When `false` (an open tier, e.g. Perceive) the soul may ALSO inline ANY public,
+///   secret-less MCP `{name,url}` (forced read-tier — a soul can never self-grant post/settle).
+/// - `deny`: an explicit blocklist (belt-and-suspenders; a denied name is never admitted).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TierPolicy {
+    /// `true` (default) = imports only (locked); `false` = the soul may also inline public read MCPs.
+    #[serde(default = "default_true")]
+    pub mcp_whitelist: bool,
+    /// Operator-registered server names a state-prompt at this tier may import.
+    #[serde(default)]
+    pub import: Vec<String>,
+    /// Server names never admitted at this tier (overrides `import` and inline).
+    #[serde(default)]
+    pub deny: Vec<String>,
+}
+
+impl Default for TierPolicy {
+    /// The safe default for an unconfigured tier: **nothing grantable** — imports-only (locked) with
+    /// an empty import list (least privilege; the operator must explicitly open a tier).
+    fn default() -> Self {
+        Self { mcp_whitelist: true, import: Vec::new(), deny: Vec::new() }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// The control plane the Settle predicate reads (PRD §7.6, §8.2). v1: empty/zeroed —
@@ -175,6 +195,14 @@ pub struct McpServerConfig {
     #[serde(default)]
     pub auth: Option<McpAuth>,
     pub tier: CapabilityTier,
+    /// Optional tool **allowlist** (bare names, e.g. `get_balance`). When non-empty, ONLY these
+    /// tools are permitted from this server: the wall denies any other tool under its
+    /// `mcp__<name>__` prefix **fail-closed** (PRD §6.3). This is how a single endpoint that
+    /// exposes its full surface to every token (cove serves all 37 tools on the read-only token)
+    /// is held to a read-only subset under `cove-read`, with the trade tools reachable only via
+    /// the `cove-trading` (settle-tier) sibling. Empty = expose everything the server provides.
+    #[serde(default)]
+    pub tools: Vec<String>,
 }
 
 /// `dack.config.yaml` (PRD §8.2). Hot-reloadable.
@@ -184,6 +212,17 @@ pub struct DackConfig {
     pub operator_did: String,
     #[serde(default)]
     pub routing: Vec<RoutingRule>,
+    /// The state-prompt id harness-synthesized stimuli enter at (operator `dack say`, the
+    /// boot back-online ping) — duties that carry no `entry:` of their own (MCP2-B). Defaults to
+    /// the flat `perceive` prompt.
+    #[serde(default = "default_entry_prompt")]
+    pub default_entry: String,
+    /// Per-consciousness-tier MCP policy (MCP2-B, invariant I16) — the operator's half of the
+    /// capability handshake (which servers a state-prompt at each tier may import, and whether it
+    /// may self-plug public read MCPs). An unconfigured tier defaults to locked + empty (nothing
+    /// grantable). Keyed by `perceive`/`express`/`settle`/`reflect`.
+    #[serde(default)]
+    pub tier_policy: BTreeMap<ConsciousnessState, TierPolicy>,
     /// Names listed here are injected into the agent + sensor env. Reserved for
     /// recoverable/non-catastrophic values (API keys, handle, limits) — PRD §7.2.
     #[serde(default)]
@@ -264,16 +303,33 @@ pub struct DackConfig {
     pub mcp_servers: Vec<McpServerConfig>,
 }
 
+/// One capability tool prefix the wall classifies by, plus its optional per-server tool allowlist.
+/// `prefix` is `mcp__<server>__` (or an explicit `post_tools`/`settle_tools` entry); `tools` is the
+/// server's bare-name allowlist (empty = all tools of that prefix are in-class).
+#[derive(Debug, Clone)]
+pub struct CapabilityPrefix {
+    pub prefix: String,
+    pub tools: Vec<String>,
+}
+
+impl CapabilityPrefix {
+    /// A prefix with no tool allowlist (explicit `post_tools`/`settle_tools` entries, or a server
+    /// that exposes its full surface).
+    pub fn open(prefix: impl Into<String>) -> Self {
+        Self { prefix: prefix.into(), tools: Vec::new() }
+    }
+}
+
 /// The wall's capability tool-prefix classification (PRD §6.3), derived from the MCP registry
 /// tiers merged with the explicit `post_tools`/`settle_tools`. Single source of truth.
 #[derive(Debug, Clone, Default)]
 pub struct CapabilityPrefixes {
     /// → `ToolClass::Read` (monitoring MCPs; safe everywhere).
-    pub read: Vec<String>,
+    pub read: Vec<CapabilityPrefix>,
     /// → `ToolClass::Post` (reversible; Express).
-    pub post: Vec<String>,
+    pub post: Vec<CapabilityPrefix>,
     /// → `ToolClass::SettleTx` (irreversible; Settle + `allow_settle`).
-    pub settle: Vec<String>,
+    pub settle: Vec<CapabilityPrefix>,
 }
 
 /// `gl` identity directories per liability-boundary role (PRD §3.3). Each is a path to a dir
@@ -289,6 +345,9 @@ pub struct IdentityDirs {
     pub builder: Option<String>,
 }
 
+fn default_entry_prompt() -> String {
+    "perceive".to_string()
+}
 fn default_soul_repo() -> String {
     ".".to_string()
 }
@@ -342,15 +401,18 @@ impl DackConfig {
     pub fn capability_prefixes(&self) -> CapabilityPrefixes {
         let mut p = CapabilityPrefixes {
             read: Vec::new(),
-            post: self.post_tools.clone(),
-            settle: self.settle_tools.clone(),
+            post: self.post_tools.iter().map(CapabilityPrefix::open).collect(),
+            settle: self.settle_tools.iter().map(CapabilityPrefix::open).collect(),
         };
         for s in &self.mcp_servers {
-            let prefix = format!("mcp__{}__", s.name);
+            let cp = CapabilityPrefix {
+                prefix: format!("mcp__{}__", s.name),
+                tools: s.tools.clone(),
+            };
             match s.tier {
-                CapabilityTier::Read => p.read.push(prefix),
-                CapabilityTier::Post => p.post.push(prefix),
-                CapabilityTier::Settle => p.settle.push(prefix),
+                CapabilityTier::Read => p.read.push(cp),
+                CapabilityTier::Post => p.post.push(cp),
+                CapabilityTier::Settle => p.settle.push(cp),
             }
         }
         p
@@ -365,15 +427,58 @@ impl DackConfig {
         let overlaps = |a: &str, b: &str| a.starts_with(b) || b.starts_with(a);
         for s in &p.settle {
             for other in p.post.iter().chain(p.read.iter()) {
-                if overlaps(s, other) {
+                if overlaps(&s.prefix, &other.prefix) {
                     return Err(DackError::Config(format!(
-                        "capability prefixes overlap: settle `{s}` vs `{other}` — must be disjoint \
-                         (an irreversible tool must never classify as Post/Read and escape Settle)"
+                        "capability prefixes overlap: settle `{}` vs `{}` — must be disjoint \
+                         (an irreversible tool must never classify as Post/Read and escape Settle)",
+                        s.prefix, other.prefix
                     )));
                 }
             }
         }
+        // Route-ceiling guards (MCP2-B): `Reflect` is harness-only and never a ceiling; and an
+        // irreversible `Settle` ceiling may be declared ONLY on a non-public route (a self/operator
+        // duty) — an untrusted public payload can never be walked to Settle even by operator typo.
+        for r in &self.routing {
+            match r.ceiling {
+                Some(ConsciousnessState::Reflect) => {
+                    return Err(DackError::Config(format!(
+                        "route {:?}/{:?}: `ceiling: reflect` is invalid — Reflect is harness-entered only",
+                        r.match_.tier, r.match_.type_
+                    )));
+                }
+                Some(ConsciousnessState::Settle)
+                    if r.match_.tier.rank() < TrustTier::SelfTier.rank() =>
+                {
+                    return Err(DackError::Config(format!(
+                        "route {:?}/{:?}: `ceiling: settle` requires a self/operator_signed route \
+                         — an untrusted ({:?}) payload may never reach the irreversible Settle",
+                        r.match_.tier, r.match_.type_, r.match_.tier
+                    )));
+                }
+                _ => {}
+            }
+        }
         Ok(())
+    }
+
+    /// The transition ceiling for a `(tier, type)` route (MCP2-B) — the highest consciousness tier a
+    /// matching chain may walk to. Defaults to reversible **Express** when the route omits `ceiling`
+    /// or no route matches (Settle is never reachable without an explicit operator opt-in).
+    pub fn ceiling_for(&self, tier: TrustTier, type_: &StimulusType) -> ConsciousnessState {
+        self.lookup_route(tier, type_)
+            .and_then(|r| r.ceiling)
+            .unwrap_or(ConsciousnessState::Express)
+    }
+
+    /// The MCP [`TierPolicy`] for a consciousness `state` (MCP2-B) — the operator's half of the
+    /// capability handshake. An unconfigured tier returns the safe default (locked, nothing
+    /// grantable). Borrowed from the map when present, else a static default.
+    pub fn tier_policy_for(&self, state: ConsciousnessState) -> std::borrow::Cow<'_, TierPolicy> {
+        match self.tier_policy.get(&state) {
+            Some(p) => std::borrow::Cow::Borrowed(p),
+            None => std::borrow::Cow::Owned(TierPolicy::default()),
+        }
     }
 
     /// The configured `gl` identity dirs keyed by role — fed to
@@ -413,11 +518,10 @@ mod tests {
 operator_did: "did:key:z6MkOperator"
 routing:
   - match: { tier: public, type: mention }
-    entry: perceive
     priority: low
     coalesce: { mode: batch, window_sec: 300, dedup_key: thread_id }
   - match: { tier: self, type: scheduled_post }
-    entry: perceive_then_express
+    ceiling: express
 forwarded_env: [TWITTER_API_KEY, BANKR_API_KEY, BUILDER_DID_KEY, DACK_HANDLE, RATE_LIMIT]
 secrets:
   soul_did_key: "file:///run/secrets/soul_did_key"
@@ -450,15 +554,28 @@ control_plane:
     }
 
     #[test]
-    fn routes_public_mention_to_perceive() {
+    fn route_ceiling_defaults_to_express_and_guards_settle() {
         let cfg = DackConfig::from_yaml(SAMPLE).unwrap();
-        let rule = cfg
-            .lookup_route(TrustTier::Public, &StimulusType::from("mention"))
-            .expect("mention route exists");
-        assert_eq!(rule.entry, EntryState::Perceive);
-        // No row routes a public tier to settle — verify nothing escalates.
-        assert!(cfg
-            .lookup_route(TrustTier::Public, &StimulusType::from("token_launch"))
-            .is_none());
+        // A public mention route with no explicit ceiling → reversible Express (never Settle).
+        assert_eq!(
+            cfg.ceiling_for(TrustTier::Public, &StimulusType::from("mention")),
+            ConsciousnessState::Express
+        );
+        // An unmatched (tier,type) also defaults to Express.
+        assert_eq!(
+            cfg.ceiling_for(TrustTier::Public, &StimulusType::from("token_launch")),
+            ConsciousnessState::Express
+        );
+        // A `ceiling: settle` on a PUBLIC route is rejected at validation (untrusted → never Settle).
+        let bad = "operator_did: \"x\"\nrouting:\n  - match: { tier: public, type: mention }\n    ceiling: settle\n";
+        assert!(DackConfig::from_yaml(bad).unwrap().validate_capabilities().is_err());
+        // The same ceiling on a self-tier route is allowed (the trade-duty case).
+        let ok = "operator_did: \"x\"\nrouting:\n  - match: { tier: self, type: trade_signal }\n    ceiling: settle\n";
+        let okc = DackConfig::from_yaml(ok).unwrap();
+        assert!(okc.validate_capabilities().is_ok());
+        assert_eq!(
+            okc.ceiling_for(TrustTier::SelfTier, &StimulusType::from("trade_signal")),
+            ConsciousnessState::Settle
+        );
     }
 }

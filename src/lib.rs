@@ -48,6 +48,7 @@ pub mod secrets;
 pub mod sensor;
 pub mod sources;
 pub mod state;
+pub mod state_prompt;
 pub mod stimuli;
 pub mod webserver;
 

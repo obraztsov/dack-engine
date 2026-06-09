@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use super::classify::classify_tool;
 use super::settle::{allow_settle, Advisory, SettleAction, SettleDecision};
 use super::{ActionDecision, ActionRequest, ActionResponder};
-use crate::config::ControlPlane;
+use crate::config::{CapabilityPrefix, ControlPlane};
 use crate::model::stimulus::Stimulus;
 use crate::state::{StateSpec, ToolClass};
 
@@ -27,13 +27,14 @@ use crate::state::{StateSpec, ToolClass};
 /// harness does — there is no second, drifting copy of the policy.
 pub struct StatePolicyResponder {
     pub spec: StateSpec,
-    /// MCP tool-name prefixes treated as reversible capabilities (→ [`ToolClass::Post`]).
-    pub post_tools: Vec<String>,
-    /// MCP tool-name prefixes treated as irreversible authority (→ [`ToolClass::SettleTx`]).
-    pub settle_tools: Vec<String>,
-    /// MCP tool-name prefixes treated as monitoring/read capabilities (→ [`ToolClass::Read`]):
-    /// registered `tier: read` servers (e.g. `mcp__cove-read__`). Safe in every state.
-    pub read_tools: Vec<String>,
+    /// MCP capability prefixes treated as reversible capabilities (→ [`ToolClass::Post`]).
+    pub post_tools: Vec<CapabilityPrefix>,
+    /// MCP capability prefixes treated as irreversible authority (→ [`ToolClass::SettleTx`]).
+    pub settle_tools: Vec<CapabilityPrefix>,
+    /// MCP capability prefixes treated as monitoring/read capabilities (→ [`ToolClass::Read`]):
+    /// registered `tier: read` servers (e.g. `mcp__cove-read__`). Safe in every state. Each may
+    /// carry a `tools` allowlist the classifier enforces fail-closed (PRD §6.3).
+    pub read_tools: Vec<CapabilityPrefix>,
     /// Present only for a Settle run: the operator control plane + the triggering
     /// stimulus the Settle predicate reads. `None` in v1 (Settle is unreachable).
     pub settle_ctx: Option<SettleContext>,
@@ -68,8 +69,8 @@ impl StatePolicyResponder {
     /// A responder aware of the deployment's capability MCP tools (operator config).
     pub fn with_capabilities(
         spec: StateSpec,
-        post_tools: Vec<String>,
-        settle_tools: Vec<String>,
+        post_tools: Vec<CapabilityPrefix>,
+        settle_tools: Vec<CapabilityPrefix>,
     ) -> Self {
         Self {
             spec,
@@ -218,10 +219,14 @@ mod tests {
     use crate::state::{default_spec, ConsciousnessState};
     use serde_json::json;
 
-    fn caps() -> (Vec<String>, Vec<String>) {
+    fn caps() -> (Vec<CapabilityPrefix>, Vec<CapabilityPrefix>) {
         (
-            vec!["mcp__twitter__".to_string()],  // post tools
-            vec!["mcp__bankr__".to_string(), "mcp__dac__".to_string(), "mcp__cove-trading__".to_string()], // settle tools
+            vec![CapabilityPrefix::open("mcp__twitter__")],  // post tools
+            ["mcp__bankr__", "mcp__dac__", "mcp__cove-trading__"]
+                .iter()
+                .copied()
+                .map(CapabilityPrefix::open)
+                .collect(), // settle tools
         )
     }
 
@@ -310,6 +315,27 @@ mod tests {
             r.decide(&req("mcp__cove-trading__buy", json!({"token": "DOGE", "usd": "1"})))
                 .await,
             ActionDecision::Allow
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_server_allowlist_denies_offlist_tool() {
+        // cove-read (read tier) serves a full surface incl. buy_token on the read-only token; its
+        // `tools` allowlist holds it to read tools. In Perceive, a whitelisted read tool is allowed
+        // (Read is in scope everywhere); a non-listed trade tool under the SAME prefix is denied
+        // (fail-closed to Other) — it can NEVER ride the read tier into a reversible state.
+        let mut r = responder(ConsciousnessState::Perceive);
+        r.read_tools = vec![CapabilityPrefix {
+            prefix: "mcp__cove-read__".into(),
+            tools: vec!["get_balance".into(), "scan_trending_tokens".into()],
+        }];
+        assert!(matches!(
+            r.decide(&req("mcp__cove-read__get_balance", json!({}))).await,
+            ActionDecision::Allow
+        ));
+        assert!(matches!(
+            r.decide(&req("mcp__cove-read__buy_token", json!({"token": "DOGE", "usd": "1"}))).await,
+            ActionDecision::Deny(_)
         ));
     }
 

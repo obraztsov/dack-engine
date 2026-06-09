@@ -55,13 +55,10 @@ impl Bus {
                 .map(|c| c.min_trust(fm.emits.default_payload_tier))
                 .unwrap_or(fm.emits.default_payload_tier);
             let priority = self.classify_priority(payload_tier, &type_, fm.priority);
-            // Entry state: operator route wins, else the duty's own frontmatter `route`. Decided
-            // here (where both are known) and carried on the row so dispatch honors it (§5.6).
-            let entry = self
-                .config
-                .lookup_route(payload_tier, &type_)
-                .map(|r| r.entry)
-                .unwrap_or(fm.route);
+            // Entry **state-prompt** (MCP2-B): the duty's own frontmatter `entry:` (a state-prompt
+            // id like `twitter/perceive_mention`). The path the chain then walks is soul-owned; the
+            // operator route only supplies the *ceiling* (read at dispatch), not the entry.
+            let entry = fm.entry.clone();
 
             // Coalescing (PRD §5.6). `None` → always a fresh wake; `Latest` → supersede
             // prior pending rows for this key and enqueue the newest; `Batch` → fold the
@@ -193,7 +190,7 @@ mod tests {
         let text = format!(
             "---\nid: mentions\ntrigger: {{ type: cron, schedule: \"0 * * * *\" }}\n\
              directive_tier: self\nemits:\n  type: mention\n  default_payload_tier: public\n\
-             {coalesce_line}route: perceive\n---\nReply-guy duty.\n"
+             {coalesce_line}entry: perceive\n---\nReply-guy duty.\n"
         );
         StimulusDef::parse(&text, "stimuli/mentions/STIMULUS.md").unwrap()
     }

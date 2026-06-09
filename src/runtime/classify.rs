@@ -16,6 +16,7 @@
 
 use serde_json::Value;
 
+use crate::config::CapabilityPrefix;
 use crate::state::ToolClass;
 
 /// Returns `(class, target_path)`. `target_path` is `Some` only for file-write tools,
@@ -23,22 +24,31 @@ use crate::state::ToolClass;
 pub fn classify_tool(
     tool: &str,
     input: &Value,
-    settle_tools: &[String],
-    post_tools: &[String],
-    read_tools: &[String],
+    settle_tools: &[CapabilityPrefix],
+    post_tools: &[CapabilityPrefix],
+    read_tools: &[CapabilityPrefix],
 ) -> (ToolClass, Option<String>) {
     // Config-driven capability tools win first, most-privileged first (settle > post > read), so
     // an irreversible prefix can never be shadowed by a looser one. Derived from the `mcp_servers`
-    // registry tiers (PRD §6.3).
-    if settle_tools.iter().any(|p| tool.starts_with(p.as_str())) {
-        return (ToolClass::SettleTx, None);
-    }
-    if post_tools.iter().any(|p| tool.starts_with(p.as_str())) {
-        return (ToolClass::Post, None);
-    }
-    // Registered monitoring MCPs (e.g. cove-read) → Read: safe in every state.
-    if read_tools.iter().any(|p| tool.starts_with(p.as_str())) {
-        return (ToolClass::Read, None);
+    // registry tiers (PRD §6.3). The FIRST matching prefix CLAIMS the tool: if that server carries
+    // a `tools` allowlist and the bare tool isn't on it, the tool is denied **fail-closed**
+    // (→ `Other`), never re-classified by a looser prefix — this is how `cove-read` (read tier)
+    // can serve an endpoint that also exposes `buy_token` without that trade tool ever counting
+    // as Read. A non-whitelisted server (empty `tools`) admits its whole surface as before.
+    for (prefixes, class) in [
+        (settle_tools, ToolClass::SettleTx),
+        (post_tools, ToolClass::Post),
+        (read_tools, ToolClass::Read),
+    ] {
+        if let Some(cp) = prefixes.iter().find(|cp| tool.starts_with(cp.prefix.as_str())) {
+            if !cp.tools.is_empty() {
+                let bare = &tool[cp.prefix.len()..];
+                if !cp.tools.iter().any(|t| t == bare) {
+                    return (ToolClass::Other, None); // whitelisted server, tool not on the list.
+                }
+            }
+            return (class, None);
+        }
     }
 
     match tool {
@@ -78,14 +88,17 @@ mod tests {
     const SETTLE: &[&str] = &["mcp__bankr__", "mcp__dac__", "mcp__cove-trading__"];
     const READ: &[&str] = &["mcp__cove-read__"];
 
-    fn post() -> Vec<String> {
-        POST.iter().map(|s| s.to_string()).collect()
+    fn open(prefixes: &[&str]) -> Vec<CapabilityPrefix> {
+        prefixes.iter().copied().map(CapabilityPrefix::open).collect()
     }
-    fn settle() -> Vec<String> {
-        SETTLE.iter().map(|s| s.to_string()).collect()
+    fn post() -> Vec<CapabilityPrefix> {
+        open(POST)
     }
-    fn read() -> Vec<String> {
-        READ.iter().map(|s| s.to_string()).collect()
+    fn settle() -> Vec<CapabilityPrefix> {
+        open(SETTLE)
+    }
+    fn read() -> Vec<CapabilityPrefix> {
+        open(READ)
     }
 
     #[test]
@@ -103,6 +116,27 @@ mod tests {
         // A registered monitoring MCP → Read (safe); the trading sibling → SettleTx (irreversible).
         assert_eq!(classify_tool("mcp__cove-read__price", &json!({}), &settle(), &post(), &read()).0, ToolClass::Read);
         assert_eq!(classify_tool("mcp__cove-trading__buy", &json!({}), &settle(), &post(), &read()).0, ToolClass::SettleTx);
+    }
+
+    #[test]
+    fn server_tool_allowlist_is_fail_closed() {
+        // cove-read serves a full surface (incl. buy_token) on the read-only token; the operator's
+        // `tools` allowlist holds it to read tools. A whitelisted read tool → Read; a non-listed
+        // trade tool under the SAME prefix → Other (denied everywhere), NOT Read.
+        let read = vec![CapabilityPrefix {
+            prefix: "mcp__cove-read__".into(),
+            tools: vec!["get_balance".into(), "scan_trending_tokens".into()],
+        }];
+        let post = post();
+        let settle = settle();
+        assert_eq!(
+            classify_tool("mcp__cove-read__get_balance", &json!({}), &settle, &post, &read).0,
+            ToolClass::Read
+        );
+        assert_eq!(
+            classify_tool("mcp__cove-read__buy_token", &json!({}), &settle, &post, &read).0,
+            ToolClass::Other // fail-closed: not on the allowlist → denied, never Read.
+        );
     }
 
     #[test]

@@ -13,7 +13,12 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{CoalescePolicy, EntryState};
+use crate::config::CoalescePolicy;
+
+/// Default entry state-prompt id for a duty that omits `entry:` — the flat `prompts/perceive.md`.
+fn default_entry_id() -> String {
+    "perceive".to_string()
+}
 use crate::error::{DackError, Result};
 use crate::model::stimulus::{Priority, StimulusType, TrustTier};
 
@@ -74,7 +79,11 @@ pub struct StimulusFrontmatter {
     pub emits: Emits,
     #[serde(default)]
     pub coalesce: Option<CoalescePolicy>,
-    pub route: EntryState,
+    /// The **entry state-prompt id** this duty opens at (MCP2-B) — a path under `prompts/` without
+    /// the extension, e.g. `twitter/perceive_mention` or the flat `perceive`. The soul owns the
+    /// chain from here (the prompt's `transitions`); the operator route only sets the ceiling.
+    #[serde(default = "default_entry_id")]
+    pub entry: String,
     #[serde(default)]
     pub priority: Option<Priority>,
     /// Secrets-provider scopes this duty's sensor needs (by provider `name`). The harness
@@ -261,7 +270,7 @@ emits:
   type: clarity_post
   default_payload_tier: public
 coalesce: { mode: batch, window_sec: 600, dedup_key: tweet_id }
-route: perceive
+entry: perceive
 priority: low
 ---
 Standing directive (trusted): survey new posts discussing the CLARITY act and engage
@@ -296,7 +305,7 @@ selective; skip low-quality bait.
         format!(
             "---\nid: {id}\ntrigger: {{ type: cron, schedule: \"0 * * * *\" }}\n{sensor_line}\
              directive_tier: self\nemits:\n  type: t_{id}\n  default_payload_tier: public\n\
-             route: perceive\n---\nDirective for {id}.\n"
+             entry: perceive\n---\nDirective for {id}.\n"
         )
     }
 
@@ -347,7 +356,7 @@ selective; skip low-quality bait.
             "stimuli/inbox/STIMULUS.md",
             "---\nid: inbox\ntrigger: { type: webhook, path: /hooks/inbox }\n\
              directive_tier: self\nemits:\n  type: msg\n  default_payload_tier: public\n\
-             route: perceive\n---\nInbound webhook duty.\n",
+             entry: perceive\n---\nInbound webhook duty.\n",
         );
         let reg = Registry::load(&root).unwrap();
 

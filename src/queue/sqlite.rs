@@ -151,7 +151,7 @@ fn raw_to_stimulus(r: RawRow) -> Result<Stimulus> {
         priority: enum_from_db(&r.priority)?,
         status: enum_from_db(&r.status)?,
         directive_body: r.directive_body,
-        entry: enum_from_db(&r.entry)?,
+        entry: r.entry, // a plain state-prompt id (MCP2-B), stored verbatim.
     })
 }
 
@@ -178,7 +178,7 @@ impl Queue for SqliteQueue {
                 s.priority.numeric(),
                 enum_to_db(&s.status)?,
                 s.directive_body,
-                enum_to_db(&s.entry)?,
+                s.entry,
             ],
         )
         .map_err(db)?;
@@ -301,7 +301,6 @@ impl Queue for SqliteQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::EntryState;
     use crate::model::stimulus::{Priority, TrustTier};
     use serde_json::json;
 
@@ -319,7 +318,7 @@ mod tests {
             priority: prio,
             status: StimulusStatus::Pending,
             directive_body: "duty".into(),
-            entry: EntryState::Perceive,
+            entry: "perceive".into(),
         }
     }
 

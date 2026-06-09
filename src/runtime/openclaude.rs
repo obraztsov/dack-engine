@@ -352,7 +352,7 @@ mod tests {
             read invoke\n\
             printf '{\"kind\":\"permission\",\"tool\":\"Write\",\"tool_use_id\":\"tu_1\",\"input\":{\"file_path\":\"/x/p.txt\"}}\\n'\n\
             read decision\n\
-            printf '{\"kind\":\"result\",\"output\":{\"thought\":\"done\",\"transition\":{\"to_state\":null}}}\\n'\n";
+            printf '{\"kind\":\"result\",\"output\":{\"thought\":\"done\",\"transition\":{\"to_prompt\":null}}}\\n'\n";
         let client = mock_client(mock, "perm");
         let rec = Arc::new(Recorder {
             asked: Mutex::new(vec![]),
@@ -361,7 +361,7 @@ mod tests {
         let out = client.invoke(perceive_req(), rec.clone()).await.unwrap();
 
         assert_eq!(out.thought, "done");
-        assert!(out.transition.to_state.is_none());
+        assert!(out.transition.to_prompt.is_none());
         // The wall WAS consulted with the real tool; the mock only reached `result`
         // because the decision line was delivered (it blocks on `read decision`).
         assert_eq!(*rec.asked.lock().unwrap(), vec!["Write".to_string()]);

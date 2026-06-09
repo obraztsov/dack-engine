@@ -58,6 +58,7 @@ async fn run_state(
         session: None,
         workdir: Some(soul.to_path_buf()),
         secret_env: Default::default(),
+        mcp_servers: Default::default(),
     };
     let wall = Arc::new(Recording {
         inner: StatePolicyResponder::new(default_spec(state)).with_repo_root(soul.to_path_buf()),

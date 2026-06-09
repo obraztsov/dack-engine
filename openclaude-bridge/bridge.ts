@@ -29,21 +29,11 @@ console.log = (...a: unknown[]) => console.error('[bridge:log]', ...a)
 
 const emit = (obj: unknown) => process.stdout.write(JSON.stringify(obj) + '\n')
 
-// ── Twitter capability (Express act phase) ────────────────────────────────────────────────
-// Reversible external effect, exposed via a standalone **stdio MCP server** (`twitter-mcp.ts`)
-// the SDK spawns — `mcp__twitter__post`/`__reply` → the Rust wall gates them by clean name
-// (ToolClass::Post → Express only). The server inherits this bridge's env, so the harness-injected
-// `X_BEARER_TOKEN` (route `secrets: [x]`, act-phase only) and `DACK_TWITTER_DRY_RUN` reach it.
-const TWITTER_MCP = `${import.meta.dir}/twitter-mcp.ts`
-const twitterMcpServer = {
-  type: 'stdio' as const,
-  command: 'bun',
-  args: ['run', TWITTER_MCP],
-  // Pass the full env so `bun` (PATH), the bearer, and the dry-run flag reach the server.
-  env: Object.fromEntries(
-    Object.entries(process.env).filter(([, v]) => v !== undefined),
-  ) as Record<string, string>,
-}
+// MCP **capability** servers are now operator config (the `mcp_servers` registry), assembled
+// per-state by the Rust harness — which resolves each server's auth token into its http header
+// or stdio env so the token never reaches the agent — and passed in the `invoke` message. This
+// bridge stays generic: adding cove.trade or the next tool is a config entry, no code change here.
+// (`openclaude-bridge/twitter-mcp.ts` is the duck's own stdio capability server the registry points at.)
 
 const OUTPUT_INSTRUCTION =
   'When you have finished perceiving and taking any permitted actions, your FINAL message ' +
@@ -117,11 +107,17 @@ async function runInvoke(inv: any) {
   }
   if (inv.model) options.model = inv.model
   if (inv.allowed_tools) options.allowedTools = inv.allowed_tools
-  // The duck's act-phase capabilities. The wall still gates every call (canUseTool → Rust).
-  options.mcpServers = { twitter: twitterMcpServer }
+  // The duck's act-phase capabilities, assembled by the harness for this state (tokens injected
+  // into headers/env). The wall still gates EVERY call (canUseTool → Rust), tier-classified.
+  if (inv.mcp_servers && typeof inv.mcp_servers === 'object') options.mcpServers = inv.mcp_servers
 
   let finalText = ''
   for await (const m of query({ prompt: inv.user_prompt, options }) as AsyncIterable<any>) {
+    // Concise capability connection status (NOT the tool list — keep it grep-safe): an operator
+    // sees at a glance whether cove/twitter connected or failed.
+    if (m?.type === 'system' && m?.subtype === 'init' && Array.isArray(m.mcp_servers) && m.mcp_servers.length) {
+      console.error('[bridge:mcp]', JSON.stringify(m.mcp_servers.map((s: any) => `${s.name}:${s.status}`)))
+    }
     if (m?.type === 'assistant' && Array.isArray(m.message?.content)) {
       for (const b of m.message.content) if (b.type === 'text') finalText += b.text
     } else if (m?.type === 'result') {

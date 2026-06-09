@@ -80,6 +80,12 @@ pub struct InvocationRequest {
     /// route's `secrets:`; **empty for Perceive** (the read-only state holds no act creds).
     /// Overlaid on the bridge's static env at spawn.
     pub secret_env: BTreeMap<String, String>,
+    /// Resolved MCP **capability** servers for this invocation (PRD §6.3), keyed by server name,
+    /// each an SDK-shaped config (`{type:"http",url,headers}` or `{type:"stdio",command,args,env}`)
+    /// with the auth token **already injected** by the harness into headers/env — so the token
+    /// reaches the server but NEVER the agent's context. The harness picks these per state (the
+    /// route's `capabilities:` ∩ the state's tier); the bridge sets `options.mcpServers` verbatim.
+    pub mcp_servers: BTreeMap<String, serde_json::Value>,
 }
 
 /// The permission event surfaced by OpenClaude, as it *actually* arrives (grounded

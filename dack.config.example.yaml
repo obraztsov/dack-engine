@@ -111,3 +111,28 @@ gitlawb_node: "https://node.gitlawb.com"
 # Wall-clock budget (seconds) for one consciousness invocation incl. the wall round-trips. A hung
 # LLM/bridge elapses here → a logged Runtime error → dispatch continues (never a frozen loop).
 invoke_timeout_secs: 300
+
+# ── MCP capability registry (PRD §6.3) ────────────────────────────────────────────────────
+# Operator authority — the agent can NEVER add a capability (that would be self-granting). Adding
+# a tool (cove.trade, the next MCP) is an entry here + a token file behind a secrets provider —
+# NEVER a harness/bridge code change. `tier` is the single source of truth the wall classifies
+# from, and gates which state may reach it:
+#   read   → ToolClass::Read   → safe in every state (monitoring: balances, prices)
+#   post   → ToolClass::Post   → Express only (reversible: tweet/reply)
+#   settle → ToolClass::SettleTx → SETTLE only + allow_settle (irreversible: trade/transfer/vote)
+# `transport` is `{type: stdio, command, args}` (our own daemon) or `{type: http, url}` (remote).
+# `auth.secret` names a secrets provider; the token is injected into the http header / stdio env
+# so it reaches the server but NEVER the agent's context. Routes grant servers via `capabilities:`.
+mcp_servers:
+  - name: twitter
+    transport: { type: stdio, command: bun, args: [run, openclaude-bridge/twitter-mcp.ts] }
+    auth: { secret: x, env: X_BEARER_TOKEN }
+    tier: post
+  - name: cove-read       # remote http MCP — monitoring (read-only token)
+    transport: { type: http, url: "https://production.cove.trade/api/mcp" }
+    auth: { secret: cove_read }     # → Authorization: Bearer <token>; header/scheme overridable
+    tier: read
+  - name: cove-trading    # remote http MCP — IRREVERSIBLE trading (read-write token); Settle only
+    transport: { type: http, url: "https://production.cove.trade/api/mcp" }
+    auth: { secret: cove_trade }
+    tier: settle

@@ -31,6 +31,9 @@ pub struct StatePolicyResponder {
     pub post_tools: Vec<String>,
     /// MCP tool-name prefixes treated as irreversible authority (→ [`ToolClass::SettleTx`]).
     pub settle_tools: Vec<String>,
+    /// MCP tool-name prefixes treated as monitoring/read capabilities (→ [`ToolClass::Read`]):
+    /// registered `tier: read` servers (e.g. `mcp__cove-read__`). Safe in every state.
+    pub read_tools: Vec<String>,
     /// Present only for a Settle run: the operator control plane + the triggering
     /// stimulus the Settle predicate reads. `None` in v1 (Settle is unreachable).
     pub settle_ctx: Option<SettleContext>,
@@ -56,6 +59,7 @@ impl StatePolicyResponder {
             spec,
             post_tools: Vec::new(),
             settle_tools: Vec::new(),
+            read_tools: Vec::new(),
             settle_ctx: None,
             repo_root: None,
         }
@@ -71,6 +75,7 @@ impl StatePolicyResponder {
             spec,
             post_tools,
             settle_tools,
+            read_tools: Vec::new(),
             settle_ctx: None,
             repo_root: None,
         }
@@ -130,8 +135,13 @@ impl ActionResponder for StatePolicyResponder {
     async fn decide(&self, req: &ActionRequest) -> ActionDecision {
         // (0) Derive the class + target path from the raw (tool, input) event. Unknown
         //     tools classify as `Other` → default-denied by the scope check.
-        let (class, target_path) =
-            classify_tool(&req.tool, &req.input, &self.settle_tools, &self.post_tools);
+        let (class, target_path) = classify_tool(
+            &req.tool,
+            &req.input,
+            &self.settle_tools,
+            &self.post_tools,
+            &self.read_tools,
+        );
 
         // (1) Per-state class scoping — the first and primary gate.
         if !self.spec.tool_scope.allows(class) {
@@ -155,22 +165,29 @@ impl ActionResponder for StatePolicyResponder {
             }
         }
 
-        // (3) Irreversible authority: terminate on the dumb Settle predicate.
+        // (3) Irreversible authority. We are already IN Settle (the scope check above passed) and
+        // this is a REGISTERED `tier: settle` capability the harness exposed only here. Two regimes:
+        //   - **No settle context** (the cove / custodial-API case): allow at the TOOL TIER. The
+        //     bound is external — the funded account balance — and reaching Settle required an
+        //     operator-configured route (`PerceiveThenSettle`). Deliberate bounded-loss autonomy.
+        //   - **A settle context present** (the future on-chain / DAC-actor case with a private
+        //     key): apply the dumb `allow_settle` reflex (whitelist + operator_signed), where
+        //     address / calldata analysis belongs (PRD §7.6).
         if class == ToolClass::SettleTx {
-            // v1: no SettleContext is ever attached (Settle is unreachable). Defense in
-            // depth: deny if somehow reached without context.
-            let Some(ctx) = &self.settle_ctx else {
-                return ActionDecision::Deny("Settle unreachable in v1 (no routing edge)".into());
-            };
-            let action = SettleAction::from_tool_input(&req.tool, &req.input);
-            return match allow_settle(
-                &action,
-                &ctx.triggering_stimulus,
-                &ctx.control_plane,
-                ctx.advisory.as_deref(),
-            ) {
-                SettleDecision::Allow => ActionDecision::Allow,
-                SettleDecision::Deny(why) => ActionDecision::Deny(why),
+            return match &self.settle_ctx {
+                None => ActionDecision::Allow,
+                Some(ctx) => {
+                    let action = SettleAction::from_tool_input(&req.tool, &req.input);
+                    match allow_settle(
+                        &action,
+                        &ctx.triggering_stimulus,
+                        &ctx.control_plane,
+                        ctx.advisory.as_deref(),
+                    ) {
+                        SettleDecision::Allow => ActionDecision::Allow,
+                        SettleDecision::Deny(why) => ActionDecision::Deny(why),
+                    }
+                }
             };
         }
 
@@ -204,7 +221,7 @@ mod tests {
     fn caps() -> (Vec<String>, Vec<String>) {
         (
             vec!["mcp__twitter__".to_string()],  // post tools
-            vec!["mcp__bankr__".to_string(), "mcp__dac__".to_string()], // settle tools
+            vec!["mcp__bankr__".to_string(), "mcp__dac__".to_string(), "mcp__cove-trading__".to_string()], // settle tools
         )
     }
 
@@ -284,11 +301,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn settle_is_unreachable_in_v1() {
-        // The settle tool is in Settle's scope, but with no SettleContext the wall denies.
+    async fn settle_tier_tool_allowed_in_settle_by_tool_tier() {
+        // Custodial-API model (cove): a registered settle-tier tool, reached in Settle, is allowed
+        // at the tool tier (no settle_ctx). The bound is external (funded balance); reaching Settle
+        // required an operator route.
         let r = responder(ConsciousnessState::Settle);
         assert!(matches!(
-            r.decide(&req("mcp__bankr__send", json!({"to": "0xGOOD", "amount": "1"})))
+            r.decide(&req("mcp__cove-trading__buy", json!({"token": "DOGE", "usd": "1"})))
+                .await,
+            ActionDecision::Allow
+        ));
+    }
+
+    #[tokio::test]
+    async fn settle_tier_tool_denied_outside_settle() {
+        // The tool-tier exposure gate: a settle-class tool in Express is denied by SCOPE (Express
+        // does not scope SettleTx) — independent of any settle_ctx. (And the harness never even
+        // exposes a settle-tier MCP outside Settle.)
+        let r = responder(ConsciousnessState::Express);
+        assert!(matches!(
+            r.decide(&req("mcp__cove-trading__buy", json!({"token": "DOGE", "usd": "1"})))
                 .await,
             ActionDecision::Deny(_)
         ));

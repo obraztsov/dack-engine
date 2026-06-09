@@ -49,6 +49,8 @@ enum ToBridge<'a> {
         model: Option<&'a str>,
         /// The agent's working dir (the soul repo) → the bridge's `options.cwd`.
         cwd: Option<&'a str>,
+        /// Resolved MCP capability servers (SDK-shaped, tokens injected) → `options.mcpServers`.
+        mcp_servers: &'a std::collections::BTreeMap<String, serde_json::Value>,
     },
     Decision {
         tool_use_id: String,
@@ -199,6 +201,7 @@ impl RuntimeClient for OpenClaudeClient {
             allowed_tools: None,
             model: self.model.as_deref(),
             cwd: req.workdir.as_deref().and_then(|p| p.to_str()),
+            mcp_servers: &req.mcp_servers,
         };
 
         // The whole exchange (send → permission round-trips → result) runs under ONE wall-clock
@@ -337,6 +340,7 @@ mod tests {
             session: None,
             workdir: None,
             secret_env: Default::default(),
+            mcp_servers: Default::default(),
         }
     }
 

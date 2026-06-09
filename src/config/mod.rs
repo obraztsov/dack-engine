@@ -42,6 +42,12 @@ pub enum EntryState {
     Perceive,
     /// Baseline cadence: Perceive then immediately Express (e.g. scheduled posts).
     PerceiveThenExpress,
+    /// Perceive (research/analyse) then enter the **irreversible Settle** state to act — e.g. a
+    /// daily bounded-loss trade duty. This is **operator route authority**: only the operator can
+    /// configure a route to Settle, so it bypasses the trust-tier ceiling (a self-tier trade cron
+    /// can reach Settle *because the operator declared this route*). The risk is bounded externally
+    /// (the funded account balance) + at the tool tier (only `tier: settle` capabilities run here).
+    PerceiveThenSettle,
 }
 
 /// One routing rule: `(payload_tier, type)` → entry state + priority + coalesce policy.
@@ -63,6 +69,13 @@ pub struct RoutingRule {
     /// §4.1; `docs/SECRETS-AND-SANDBOX.md`).
     #[serde(default)]
     pub secrets: Vec<String>,
+    /// MCP capability servers (by `mcp_servers` name) the **act phase** of cycles on this route
+    /// may use — **operator-controlled**, the agent can never grant itself a capability. The
+    /// harness exposes, per state, this route's capabilities filtered to the state's tier
+    /// (read→any · post→Express · settle→Settle); their auth tokens are materialized + injected
+    /// so they never enter the agent's context (PRD §6.3). Empty = no capabilities (least-privilege).
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,6 +114,67 @@ pub struct SecretsProviderConfig {
     /// Env keys this provider is expected to emit (documentation / validation; optional).
     #[serde(default)]
     pub keys: Vec<String>,
+}
+
+/// Capability tier of an MCP server (PRD §4, §6.3) — maps its tools to a `ToolClass` and the
+/// states that may reach them. The OPERATOR declares it; the agent can never change it (it would
+/// be self-granting authority). This is the single source of truth the wall classifies from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CapabilityTier {
+    /// Read-only (balances, prices, search). Safe in every state.
+    Read,
+    /// Reversible external effect (post/reply). Express only.
+    Post,
+    /// Irreversible authority (trade/transfer/vote). Settle only — additionally gated by
+    /// `allow_settle` (whitelist + operator_signed). The most dangerous tier.
+    Settle,
+}
+
+/// How an MCP capability server is reached.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum McpTransport {
+    /// A remote streamable-HTTP MCP (e.g. `https://production.cove.trade/api/mcp`).
+    Http { url: String },
+    /// A locally-spawned stdio MCP (e.g. our own `twitter-mcp.ts`).
+    Stdio {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+    },
+}
+
+/// How the harness injects the materialized auth token into an MCP server — so the token reaches
+/// the server but NEVER the agent's context (http: a request header; stdio: the server's env).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpAuth {
+    /// Secrets-provider `name` whose materialized value is the token (operator-supplied).
+    pub secret: String,
+    /// Which env key the provider emits to use as the token. Defaults to the provider's sole key.
+    #[serde(default)]
+    pub key: Option<String>,
+    /// HTTP: header name to set (default `Authorization`) with `scheme` (default `Bearer`).
+    #[serde(default)]
+    pub header: Option<String>,
+    #[serde(default)]
+    pub scheme: Option<String>,
+    /// stdio: inject the token as this env var in the spawned server process.
+    #[serde(default)]
+    pub env: Option<String>,
+}
+
+/// An operator-declared MCP **capability server** (PRD §6.3). The registry is OPERATOR authority:
+/// adding cove.trade, the next tool, … is a config entry — never a harness/bridge code change.
+/// `tier` + the wall gate what its tools may do and which state reaches them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerConfig {
+    /// Server name → tool prefix `mcp__<name>__`. The wall classifies by this prefix + `tier`.
+    pub name: String,
+    pub transport: McpTransport,
+    #[serde(default)]
+    pub auth: Option<McpAuth>,
+    pub tier: CapabilityTier,
 }
 
 /// `dack.config.yaml` (PRD §8.2). Hot-reloadable.
@@ -182,6 +256,24 @@ pub struct DackConfig {
     /// (else a settle capability could classify as Post and run in Express). v1 Settle is unreachable.
     #[serde(default = "default_settle_tools")]
     pub settle_tools: Vec<String>,
+    /// **MCP capability registry** (PRD §6.3) — operator-declared servers the duck can use in its
+    /// act phases. Each server's `tier` derives the wall's classification (so declaring a server
+    /// `tier: settle` makes its tools Settle-only); routes grant them via `capabilities:`. Adding
+    /// a new tool (cove.trade, …) is an entry here + a token — never a harness/bridge code change.
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerConfig>,
+}
+
+/// The wall's capability tool-prefix classification (PRD §6.3), derived from the MCP registry
+/// tiers merged with the explicit `post_tools`/`settle_tools`. Single source of truth.
+#[derive(Debug, Clone, Default)]
+pub struct CapabilityPrefixes {
+    /// → `ToolClass::Read` (monitoring MCPs; safe everywhere).
+    pub read: Vec<String>,
+    /// → `ToolClass::Post` (reversible; Express).
+    pub post: Vec<String>,
+    /// → `ToolClass::SettleTx` (irreversible; Settle + `allow_settle`).
+    pub settle: Vec<String>,
 }
 
 /// `gl` identity directories per liability-boundary role (PRD §3.3). Each is a path to a dir
@@ -239,16 +331,44 @@ impl DackConfig {
         serde_yaml::from_str(text).map_err(DackError::from)
     }
 
+    /// Look up an MCP capability server by name.
+    pub fn mcp_server(&self, name: &str) -> Option<&McpServerConfig> {
+        self.mcp_servers.iter().find(|s| s.name == name)
+    }
+
+    /// The wall's capability prefix→class map (PRD §6.3): registry tiers (`mcp__<name>__`) merged
+    /// with the explicit `post_tools`/`settle_tools`. The single source of truth the responder
+    /// classifies from — so declaring a server `tier: settle` is what makes its tools Settle-only.
+    pub fn capability_prefixes(&self) -> CapabilityPrefixes {
+        let mut p = CapabilityPrefixes {
+            read: Vec::new(),
+            post: self.post_tools.clone(),
+            settle: self.settle_tools.clone(),
+        };
+        for s in &self.mcp_servers {
+            let prefix = format!("mcp__{}__", s.name);
+            match s.tier {
+                CapabilityTier::Read => p.read.push(prefix),
+                CapabilityTier::Post => p.post.push(prefix),
+                CapabilityTier::Settle => p.settle.push(prefix),
+            }
+        }
+        p
+    }
+
     /// Startup safety check (PRD §6.3): a settle (irreversible) capability prefix must NEVER be a
-    /// prefix-of / prefixed-by a post (reversible) prefix — else a settle tool could classify as
-    /// `Post` and run in Express. Called once at boot; a violation is a hard config error.
+    /// prefix-of / prefixed-by a reversible (post) or read prefix — else a settle tool could
+    /// classify as `Post`/`Read` and run outside Settle. Checks the FULL derived map (registry +
+    /// explicit lists). Called once at boot; a violation is a hard config error.
     pub fn validate_capabilities(&self) -> Result<()> {
-        for s in &self.settle_tools {
-            for p in &self.post_tools {
-                if s.starts_with(p.as_str()) || p.starts_with(s.as_str()) {
+        let p = self.capability_prefixes();
+        let overlaps = |a: &str, b: &str| a.starts_with(b) || b.starts_with(a);
+        for s in &p.settle {
+            for other in p.post.iter().chain(p.read.iter()) {
+                if overlaps(s, other) {
                     return Err(DackError::Config(format!(
-                        "capability prefixes overlap: settle `{s}` vs post `{p}` — must be disjoint \
-                         (a settle tool must never classify as reversible Post)"
+                        "capability prefixes overlap: settle `{s}` vs `{other}` — must be disjoint \
+                         (an irreversible tool must never classify as Post/Read and escape Settle)"
                     )));
                 }
             }

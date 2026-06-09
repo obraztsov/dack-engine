@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::bus::Bus;
-use crate::config::{DackConfig, EntryState};
+use crate::config::{CapabilityTier, DackConfig, EntryState, McpServerConfig, McpTransport};
 use crate::error::{DackError, Result};
 use crate::identity::{IdentityProvider, IdentityRole};
 use crate::secrets::providers::SecretsBroker;
@@ -184,17 +184,22 @@ impl Harness {
             )
             .await?;
 
-        // (6) Decide the next state. The model PROPOSES; the **harness decides**, bounded by
-        // three independent gates: the route's `entry` (PerceiveThenExpress forces Express —
-        // restoring the deterministic cadence the model could otherwise no-op), the trust-tier
-        // ceiling (a `public` stimulus can reach reversible Express but never irreversible
-        // Settle), and the structural transition rule (PRD §4.2, §5.7).
-        let forced =
-            (stimulus.entry == EntryState::PerceiveThenExpress).then_some(ConsciousnessState::Express);
-        if let Some(to) = forced.or(perceive_out.transition.to_state) {
-            if !tier_permits_transition(stimulus.payload_tier, to) {
+        // (6) Decide the next state. Two paths, two authorities:
+        //   - The route's `entry` FORCES a transition (operator authority — only the operator can
+        //     configure a route). It **bypasses the trust-tier ceiling**: PerceiveThenExpress →
+        //     Express (the deterministic cadence), PerceiveThenSettle → the irreversible Settle (a
+        //     bounded-loss trade duty the operator declared).
+        //   - Else the MODEL proposes a transition, subject to the tier ceiling (a `public` tweet
+        //     reaches reversible Express but NEVER irreversible Settle) + the structural rule.
+        let next = match stimulus.entry {
+            EntryState::PerceiveThenExpress => Some((ConsciousnessState::Express, true)),
+            EntryState::PerceiveThenSettle => Some((ConsciousnessState::Settle, true)),
+            EntryState::Perceive => perceive_out.transition.to_state.map(|to| (to, false)),
+        };
+        if let Some((to, operator_forced)) = next {
+            if !operator_forced && !tier_permits_transition(stimulus.payload_tier, to) {
                 eprintln!(
-                    "dispatch: dropped transition to {to:?} — above the {:?} tier ceiling ({})",
+                    "dispatch: dropped model transition to {to:?} — above the {:?} tier ceiling ({})",
                     stimulus.payload_tier, stimulus.id
                 );
             } else if allowed_transition(ConsciousnessState::Perceive, to) {
@@ -288,14 +293,56 @@ impl Harness {
     /// with the operator's capability prefixes (so `mcp__twitter__*` classifies as Post in
     /// Express) and the soul root (to relativize the absolute paths the SDK emits, PRD §4.1, §6.3).
     fn wall_for(&self, spec: StateSpec) -> Arc<RecordingResponder> {
-        RecordingResponder::wrap(
-            StatePolicyResponder::with_capabilities(
-                spec,
-                self.config.post_tools.clone(),
-                self.config.settle_tools.clone(),
-            )
-            .with_repo_root(self.soul_root()),
-        )
+        // The wall classifies from the FULL capability map (registry tiers + explicit lists).
+        let p = self.config.capability_prefixes();
+        let mut responder =
+            StatePolicyResponder::with_capabilities(spec, p.post, p.settle).with_repo_root(self.soul_root());
+        responder.read_tools = p.read;
+        RecordingResponder::wrap(responder)
+    }
+
+    /// Assemble the MCP capability servers exposed to `state` for this `stimulus` (PRD §6.3): the
+    /// stimulus's route `capabilities:` ∩ the servers whose tier fits the state (read→any ·
+    /// post→Express · settle→Settle). Each server's auth token is materialized via the broker and
+    /// injected into its http header / stdio env — so the token reaches the server, never the
+    /// agent. A missing registry entry or failed secret drops that one capability (fail-closed),
+    /// never the cycle.
+    async fn assemble_mcp_servers(
+        &self,
+        state: ConsciousnessState,
+        stimulus: &Stimulus,
+    ) -> BTreeMap<String, serde_json::Value> {
+        let caps = self
+            .config
+            .lookup_route(stimulus.payload_tier, &stimulus.type_)
+            .map(|r| r.capabilities.clone())
+            .unwrap_or_default();
+        let mut out = BTreeMap::new();
+        for name in &caps {
+            let Some(server) = self.config.mcp_server(name) else {
+                eprintln!("capability `{name}` not in mcp_servers registry — skipped");
+                continue;
+            };
+            if !tier_fits_state(server.tier, state) {
+                continue; // e.g. a settle-tier trading tool is never exposed outside Settle.
+            }
+            let token = match &server.auth {
+                Some(auth) => match self.broker.env_for(&[auth.secret.clone()]).await {
+                    Ok(env) => auth
+                        .key
+                        .clone()
+                        .or_else(|| env.keys().next().cloned())
+                        .and_then(|k| env.get(&k).cloned()),
+                    Err(e) => {
+                        eprintln!("capability `{name}` secret `{}`: {e}", auth.secret);
+                        continue; // fail-closed: no token → don't expose a half-authed server.
+                    }
+                },
+                None => None,
+            };
+            out.insert(name.clone(), build_mcp_config(server, token.as_deref()));
+        }
+        out
     }
 
     /// The act-phase secret env for a stimulus, from its **route's** `secrets:` (operator-gated;
@@ -351,6 +398,11 @@ impl Harness {
             },
         ];
         let system_prompt = self.system_prompt_for(&spec).await;
+        // Read-only monitoring capabilities the route grants (e.g. cove-read prices). No post/settle
+        // tier fits Perceive, so this is read-tier only — Perceive holds no act capability.
+        let mcp_servers = self
+            .assemble_mcp_servers(ConsciousnessState::Perceive, stimulus)
+            .await;
         Ok(InvocationRequest {
             system_prompt,
             spec,
@@ -360,6 +412,7 @@ impl Harness {
             session: None,
             workdir: Some(self.soul_root()),
             secret_env: Default::default(),
+            mcp_servers,
         })
     }
 
@@ -474,6 +527,9 @@ impl Harness {
         }];
         let recorder = self.wall_for(spec.clone());
         let system_prompt = self.system_prompt_for(&spec).await;
+        // Act-phase capabilities for this state: the route's grants filtered to the state's tier
+        // (Express → post + read; Settle → settle + read). Tokens injected, never in agent context.
+        let mcp_servers = self.assemble_mcp_servers(to, stimulus).await;
         let req = InvocationRequest {
             system_prompt,
             spec,
@@ -483,6 +539,7 @@ impl Harness {
             session: None,
             workdir: Some(self.soul_root()),
             secret_env,
+            mcp_servers,
         };
         let out = self.runtime.invoke(req, recorder.clone()).await?;
         // Honor the structured memory line (gated to this write-capable state) — its own
@@ -534,6 +591,67 @@ impl Harness {
         };
         self.runlog.append(&entry).await
     }
+}
+
+/// Whether a capability tier is exposed in `state` (PRD §6.3): read everywhere, post in Express,
+/// settle ONLY in Settle (the irreversible doorway). The state half of the gate; the wall +
+/// `allow_settle` are the rest.
+fn tier_fits_state(tier: CapabilityTier, state: ConsciousnessState) -> bool {
+    use ConsciousnessState::*;
+    match tier {
+        CapabilityTier::Read => true,
+        CapabilityTier::Post => matches!(state, Express),
+        CapabilityTier::Settle => matches!(state, Settle),
+    }
+}
+
+/// Resolve a registry [`McpServerConfig`] + its materialized `token` into an SDK-shaped MCP config
+/// (an `options.mcpServers` value) with the token injected into the http header / stdio env — so
+/// the token reaches the server but never the agent's context.
+fn build_mcp_config(server: &McpServerConfig, token: Option<&str>) -> serde_json::Value {
+    use serde_json::json;
+    match &server.transport {
+        McpTransport::Http { url } => {
+            let mut headers = serde_json::Map::new();
+            if let (Some(auth), Some(tok)) = (&server.auth, token) {
+                let header = auth.header.clone().unwrap_or_else(|| "Authorization".into());
+                let scheme = auth.scheme.clone().unwrap_or_else(|| "Bearer".into());
+                let value =
+                    if scheme.is_empty() { tok.to_string() } else { format!("{scheme} {tok}") };
+                headers.insert(header, json!(value));
+            }
+            json!({ "type": "http", "url": url, "headers": headers })
+        }
+        McpTransport::Stdio { command, args } => {
+            // The SDK spawns the server with cwd = the soul repo, so relative path args (our own
+            // `twitter-mcp.ts`) are absolutized here.
+            let args: Vec<String> = args.iter().map(|a| absolutize_arg(a)).collect();
+            let mut env = serde_json::Map::new();
+            for k in ["PATH", "HOME", "DACK_TWITTER_DRY_RUN"] {
+                if let Ok(v) = std::env::var(k) {
+                    env.insert(k.to_string(), json!(v));
+                }
+            }
+            if let (Some(auth), Some(tok)) = (&server.auth, token) {
+                if let Some(envk) = &auth.env {
+                    env.insert(envk.clone(), json!(tok));
+                }
+            }
+            json!({ "type": "stdio", "command": command, "args": args, "env": env })
+        }
+    }
+}
+
+/// Absolutize a relative path arg that exists (the SDK spawns stdio servers from the soul cwd);
+/// non-path args (e.g. `run`) are returned unchanged.
+fn absolutize_arg(arg: &str) -> String {
+    let p = std::path::Path::new(arg);
+    if p.is_relative() {
+        if let Ok(abs) = std::fs::canonicalize(p) {
+            return abs.to_string_lossy().into_owned();
+        }
+    }
+    arg.to_string()
 }
 
 /// Short lowercase state tag for the `run_id` anchor (`run-<stim>-perceive`).
@@ -1031,6 +1149,52 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
+    /// SETTLE-A: a `PerceiveThenSettle` route (operator authority) forces the cycle into the
+    /// irreversible Settle state **bypassing the trust-tier ceiling** — a self-tier trade duty
+    /// reaches Settle *because the operator declared the route*, unlike a model-proposed Settle
+    /// (which the tier ceiling blocks, see `public_stimulus_cannot_reach_settle`).
+    #[tokio::test]
+    async fn perceive_then_settle_forces_settle_bypassing_tier_ceiling() {
+        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::queue::InMemoryQueue;
+        use crate::repo::git::PlainGitRepo;
+        use crate::runlog::FileRunLog;
+        use std::collections::HashMap;
+
+        let tmp = std::env::temp_dir().join(format!("dack-pts-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let runtime = Arc::new(RecordingRuntime {
+            seen: std::sync::Mutex::new(Vec::new()),
+            out: perceive_output(),
+        });
+        let config = Arc::new(DackConfig::from_yaml("operator_did: \"did:x\"").unwrap());
+        let queue: Arc<dyn Queue> = Arc::new(InMemoryQueue::new());
+        let harness = Harness {
+            config: config.clone(),
+            queue: queue.clone(),
+            bus: Arc::new(Bus::new(config.clone(), queue.clone())),
+            runtime: runtime.clone(),
+            repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
+            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
+            broker: Arc::new(SecretsBroker::new(vec![])),
+        };
+
+        // A self-tier trade duty whose operator route enters Settle. payload_tier is NOT
+        // operator_signed, so a model-proposed Settle would be blocked — but the route forces it.
+        let mut stim = poisoned_stimulus();
+        stim.entry = EntryState::PerceiveThenSettle;
+        harness.dispatch(stim).await.unwrap();
+
+        let seen = runtime.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "Perceive then a forced Settle");
+        assert_eq!(seen[1].spec.state, ConsciousnessState::Settle, "the act state is Settle");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
     /// Phase 7 / invariant I13: post-run soul reconciliation. Against a REAL git soul repo,
     /// an Express run's tool-driven writes are reconciled — the allowlisted `memory/` write is
     /// committed as the Soul DID, an out-of-allowlist `skills/` write is reverted + alarmed.
@@ -1162,6 +1326,105 @@ mod tests {
         // Nothing left stuck `dispatched` — every processed row reached a terminal state.
         assert_eq!(queue.reclaim_orphans().await.unwrap(), 0, "no orphaned dispatched rows remain");
 
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    // ── MCP capability framework (PRD §6.3) ─────────────────────────────────────────────
+
+    #[test]
+    fn mcp_config_http_injects_bearer_header() {
+        use crate::config::{CapabilityTier, McpAuth, McpServerConfig, McpTransport};
+        let server = McpServerConfig {
+            name: "cove-read".into(),
+            transport: McpTransport::Http { url: "https://cove/api/mcp".into() },
+            auth: Some(McpAuth { secret: "cove_read".into(), key: None, header: None, scheme: None, env: None }),
+            tier: CapabilityTier::Read,
+        };
+        let cfg = build_mcp_config(&server, Some("tok123"));
+        assert_eq!(cfg["type"], "http");
+        assert_eq!(cfg["url"], "https://cove/api/mcp");
+        assert_eq!(cfg["headers"]["Authorization"], "Bearer tok123");
+    }
+
+    #[test]
+    fn mcp_config_stdio_injects_env_token() {
+        use crate::config::{CapabilityTier, McpAuth, McpServerConfig, McpTransport};
+        let server = McpServerConfig {
+            name: "twitter".into(),
+            transport: McpTransport::Stdio {
+                command: "bun".into(),
+                args: vec!["run".into(), "nonexistent-xyz.ts".into()],
+            },
+            auth: Some(McpAuth { secret: "x".into(), key: None, header: None, scheme: None, env: Some("X_BEARER_TOKEN".into()) }),
+            tier: CapabilityTier::Post,
+        };
+        let cfg = build_mcp_config(&server, Some("bearer42"));
+        assert_eq!(cfg["type"], "stdio");
+        assert_eq!(cfg["env"]["X_BEARER_TOKEN"], "bearer42");
+        assert_eq!(cfg["args"][1], "nonexistent-xyz.ts", "non-path arg left as-is");
+    }
+
+    #[test]
+    fn tier_gates_state_settle_never_in_express() {
+        use crate::config::CapabilityTier;
+        use ConsciousnessState::*;
+        assert!(tier_fits_state(CapabilityTier::Read, Perceive) && tier_fits_state(CapabilityTier::Read, Settle));
+        assert!(tier_fits_state(CapabilityTier::Post, Express) && !tier_fits_state(CapabilityTier::Post, Perceive));
+        // The load-bearing one: an irreversible trading tool is exposed ONLY in Settle.
+        assert!(tier_fits_state(CapabilityTier::Settle, Settle));
+        assert!(!tier_fits_state(CapabilityTier::Settle, Express));
+        assert!(!tier_fits_state(CapabilityTier::Settle, Perceive));
+    }
+
+    #[tokio::test]
+    async fn assemble_exposes_capabilities_by_tier_and_never_trading_outside_settle() {
+        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::queue::InMemoryQueue;
+        use crate::repo::git::PlainGitRepo;
+        use crate::runlog::FileRunLog;
+        use crate::secrets::providers::StaticEnvProvider;
+        use std::collections::HashMap;
+
+        std::env::set_var("DACK_COVE_TEST", "cove-tok");
+        let config = Arc::new(
+            DackConfig::from_yaml(
+                "operator_did: \"did:x\"\n\
+                 routing:\n  - match: { tier: public, type: mention }\n    entry: perceive\n    capabilities: [cove-read, cove-trading]\n\
+                 mcp_servers:\n  \
+                   - name: cove-read\n    transport: { type: http, url: \"https://cove/api/mcp\" }\n    auth: { secret: cove, key: DACK_COVE_TEST }\n    tier: read\n  \
+                   - name: cove-trading\n    transport: { type: http, url: \"https://cove/api/mcp\" }\n    auth: { secret: cove, key: DACK_COVE_TEST }\n    tier: settle\n",
+            )
+            .unwrap(),
+        );
+        let queue: Arc<dyn Queue> = Arc::new(InMemoryQueue::new());
+        let tmp = std::env::temp_dir().join(format!("dack-mcp-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).ok();
+        let harness = Harness {
+            config: config.clone(),
+            queue: queue.clone(),
+            bus: Arc::new(Bus::new(config.clone(), queue.clone())),
+            runtime: Arc::new(RecordingRuntime { seen: std::sync::Mutex::new(Vec::new()), out: perceive_output() }),
+            repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
+            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
+            broker: Arc::new(SecretsBroker::new(vec![Arc::new(StaticEnvProvider::new("cove", vec!["DACK_COVE_TEST".into()]))])),
+        };
+        let stim = poisoned_stimulus(); // payload_tier=public, type=mention → matches the route
+
+        // Perceive: only read-tier cove-read; trading (settle) is NOT exposed.
+        let p = harness.assemble_mcp_servers(ConsciousnessState::Perceive, &stim).await;
+        assert!(p.contains_key("cove-read") && !p.contains_key("cove-trading"));
+        assert_eq!(p["cove-read"]["headers"]["Authorization"], "Bearer cove-tok", "token injected, not in agent ctx");
+
+        // Express: read but NEVER trading.
+        let e = harness.assemble_mcp_servers(ConsciousnessState::Express, &stim).await;
+        assert!(e.contains_key("cove-read") && !e.contains_key("cove-trading"), "trading never in Express");
+
+        // Settle: trading IS exposed (the only state that reaches it).
+        let s = harness.assemble_mcp_servers(ConsciousnessState::Settle, &stim).await;
+        assert!(s.contains_key("cove-trading") && s.contains_key("cove-read"));
+
+        std::env::remove_var("DACK_COVE_TEST");
         std::fs::remove_dir_all(&tmp).ok();
     }
 }

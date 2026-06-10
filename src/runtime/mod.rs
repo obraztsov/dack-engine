@@ -85,6 +85,10 @@ pub struct InvocationRequest {
     /// reaches the server but NEVER the agent's context. The harness picks these per state (the
     /// route's `capabilities:` ∩ the state's tier); the bridge sets `options.mcpServers` verbatim.
     pub mcp_servers: BTreeMap<String, serde_json::Value>,
+    /// Per-invocation model override (8.7) — the harness-resolved effective model for THIS state-
+    /// prompt (operator `tier_policy` default, or a soul `model:` where override is allowed). `None`
+    /// ⇒ the runtime client's configured `config.model`. The bridge maps it to `options.model`.
+    pub model: Option<String>,
 }
 
 /// The permission event surfaced by OpenClaude, as it *actually* arrives (grounded

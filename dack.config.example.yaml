@@ -48,11 +48,16 @@ default_entry: perceive
 # state-prompt at this tier may import by name (token injected server-side, never agent context).
 # `mcp_whitelist: false` = an OPEN tier: the soul may ALSO inline any public, secret-less MCP
 # (forced read-tier — it can never self-grant post/settle). An unconfigured tier is locked + empty.
+#
+# MODEL handshake (8.7), same operator-boundary / soul-self-select shape:
+#   `model:` here = the operator's default model for this tier (unset → the global `model:` below).
+#   `allow_model_override: true` = a state-prompt at this tier MAY name its own `model:` (e.g. let
+#   Reflect pick a stronger model); default false = the operator's choice is fixed for the tier.
 tier_policy:
   perceive: { mcp_whitelist: false, import: [cove-read] }   # open: self-plug public reads + cove-read
   express:  { import: [twitter] }                           # locked: only the X post/reply server
   settle:   { import: [cove-trading, cove-read] }           # locked: the irreversible trade server
-  reflect:  { import: [] }                                  # locked: no capabilities while self-editing
+  reflect:  { import: [], allow_model_override: true }      # locked caps; may self-select its model
 
 # Names injected into the agent + sensor env. RECOVERABLE values only (PRD §7.2):
 # leak == rotate. The Soul DID key is deliberately absent — it lives in `secrets:`.
@@ -90,9 +95,10 @@ secrets:
 # custodial/wallet limits (cove daily caps / no-withdraw; on-chain the wallet's native allowances) +
 # Coasean peer error-correction. (See trust_tiers above.)
 
-# Cron for the scheduled Reflect run (PRD §4.2). Reflect is ALSO reachable via a transition — but
-# only from an UNCONTAMINATED cycle whose trust tier `reaches: reflect`, and rate-limited by
-# `reflect_min_interval_secs` above (TIER-4). Omit for manual `dack reflect-now`.
+# Cron for the scheduled Reflect run (PRD §4.2) — wired by a harness-owned ticker that enqueues a
+# Reflect at each fire (gated by `reflect_min_interval_secs`). Reflect is ALSO reachable via a
+# transition — but only from an UNCONTAMINATED cycle whose trust tier `reaches: reflect`, and
+# rate-limited by `reflect_min_interval_secs` above (TIER-4). Omit for manual `dack reflect-now` only.
 reflect_schedule: "0 4 * * *"           # nightly 04:00 — "sleep-with-dreams"
 
 # Where the harness runs (Phase 3). All optional — these are the defaults.

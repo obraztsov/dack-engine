@@ -20,10 +20,11 @@ use crate::harness::ingest::{spawn_stimuli_watcher, Ingestor};
 use crate::harness::Harness;
 use crate::identity::gitlawb::GitlawbIdentity;
 use crate::identity::{IdentityProvider, IdentityRole};
+use crate::model::stimulus::{Priority, Stimulus, StimulusId, StimulusStatus, StimulusType, TrustTier};
 use crate::queue::{Queue, SqliteQueue};
 use crate::repo::git::PlainGitRepo;
 use crate::repo::gitlawb::GitlawbRepo;
-use crate::repo::RepoHost;
+use crate::repo::{CommitMeta, RepoHost, RepoPath};
 use crate::runlog::{DailyFileRunLog, RunLogWriter};
 use crate::runtime::openclaude::OpenClaudeClient;
 use crate::runtime::RuntimeClient;
@@ -62,34 +63,31 @@ pub enum Command {
     Resume,
     /// Stop processes (hard).
     Kill,
-    /// (placeholder) extend VPS/inference runway.
-    Fund,
-    /// Force a Reflect run (the only non-scheduled way to enter Reflect, PRD §4.2).
+    /// Force a Reflect run now (an explicit operator override of the scheduled cadence, PRD §4.2).
     ReflectNow,
+    /// Commit external/hand edits to the soul tree (memory/prompts/stimuli) as the operator, so
+    /// the daemon's per-run integrity tripwire doesn't revert them (PRD §7.5, §8.3).
+    Reconcile,
 }
 
-/// Dispatch a parsed CLI command. SCAFFOLD: command bodies land alongside their phases
-/// (run/status = Phase 3; log/pause/kill = Phase 7-8; say + reflect-now = Phase 8;
-/// reflect-now = Phase 8).
+/// Dispatch a parsed CLI command. `run`/`status`/`log` are the daemon + read surfaces; `say`/
+/// `pause`/`resume`/`reflect-now`/`reconcile` are the operator controls that act on the shared
+/// SQLite queue (cursor flags + injected stimuli) the running daemon observes (PRD §8.3).
 pub async fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Run => run(&cli.config).await,
         Command::Status => status(&cli.config).await,
         Command::Log { follow } => log_cmd(&cli.config, follow).await,
-        // Clean `NotImplemented` (not a panic): a stray invocation logs, never crashes (PRD §7.5).
-        Command::Say { instruction: _ } => Err(DackError::NotImplemented(
-            "dack say — Phase 8 (verified operator_signed stimulus, signed by operator DID)",
-        )),
-        Command::Pause => Err(DackError::NotImplemented("dack pause — kill-switch, Phase 8")),
-        Command::Resume => Err(DackError::NotImplemented("dack resume — Phase 8")),
-        // The hard stop is SIGTERM (graceful drain) — `systemctl stop dack` / Ctrl-C.
+        Command::Say { instruction } => say(&cli.config, instruction).await,
+        Command::Pause => set_paused(&cli.config, true).await,
+        Command::Resume => set_paused(&cli.config, false).await,
+        // The hard stop is SIGTERM (graceful drain) — `systemctl stop dack` / Ctrl-C. A pidfile
+        // kill buys nothing over the signal the daemon already drains on cleanly (PRD §11.8).
         Command::Kill => Err(DackError::NotImplemented(
             "dack kill — use SIGTERM (systemctl stop / Ctrl-C) for a graceful drain",
         )),
-        Command::Fund => Err(DackError::NotImplemented("dack fund — runway placeholder")),
-        Command::ReflectNow => Err(DackError::NotImplemented(
-            "dack reflect-now — Phase 8 (enqueue a harness-entered Reflect run)",
-        )),
+        Command::ReflectNow => reflect_now(&cli.config).await,
+        Command::Reconcile => reconcile(&cli.config).await,
     }
 }
 
@@ -112,6 +110,127 @@ async fn log_cmd(config_path: &str, follow: bool) -> Result<()> {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    }
+    Ok(())
+}
+
+/// `dack say` (PRD §8.3) — the operator→agent channel. Signs the instruction with the operator
+/// key and enqueues it as an `operator_signed`-CLAIMING stimulus; the running daemon VERIFIES the
+/// signature at dispatch (invariant I18) before honoring the tier — a self-asserted label is never
+/// trusted. The operator key signs HERE; the daemon needs only the public operator DID to verify,
+/// so the soul/operator private keys never have to meet (PRD §3.3, §7.2).
+async fn say(config_path: &str, instruction: String) -> Result<()> {
+    let config = DackConfig::load(config_path)?;
+    let identity = GitlawbIdentity::resolve("gl", config.identity_dirs()).await?;
+    if identity.did(IdentityRole::Operator).is_none() {
+        return Err(DackError::Config(
+            "dack say: no operator identity dir (identities.operator) — cannot sign".into(),
+        ));
+    }
+    let sig = identity
+        .sign(IdentityRole::Operator, instruction.as_bytes())
+        .await?;
+    let sig_b64 = String::from_utf8_lossy(&sig.0).trim().to_string();
+
+    let now = chrono::Utc::now().timestamp();
+    let stim = Stimulus {
+        id: StimulusId(format!("say-{now}")),
+        source: "operator-say".into(),
+        type_: StimulusType::from("operator_instruction"),
+        // CLAIMED operator_signed — the daemon re-derives the REAL tier by verifying the signature.
+        directive_tier: TrustTier::operator(),
+        payload_tier: TrustTier::self_(),
+        payload: serde_json::json!({ "instruction": instruction }),
+        provenance: Some(format!("operator_sig:{sig_b64}")),
+        received_at: now,
+        dedup_key: None,
+        // The operator's word is the highest-trust stimulus — let it jump the queue.
+        priority: Priority::Urgent,
+        status: StimulusStatus::Pending,
+        directive_body: instruction,
+        entry: config.default_entry.clone(),
+    };
+    SqliteQueue::open(&config.db_path)?.enqueue(stim).await?;
+    println!("dack: operator instruction enqueued (signed; the daemon verifies on dispatch).");
+    Ok(())
+}
+
+/// `dack pause` / `dack resume` (PRD §8.3) — the soft kill-switch. A shared flag in the queue
+/// `cursor` table (the daemon and the CLI open the same SQLite); the consciousness loop checks it
+/// at each cycle boundary and idles while set. An in-flight dispatch always finishes first.
+async fn set_paused(config_path: &str, paused: bool) -> Result<()> {
+    let config = DackConfig::load(config_path)?;
+    let queue = SqliteQueue::open(&config.db_path)?;
+    queue.set_cursor("paused", if paused { "1" } else { "" }).await?;
+    println!(
+        "dack: dispatch {} (in-flight runs finish; the loop {} new stimuli).",
+        if paused { "PAUSED" } else { "RESUMED" },
+        if paused { "stops popping" } else { "resumes popping" }
+    );
+    Ok(())
+}
+
+/// `dack reflect-now` (PRD §4.2, §8.3) — force a Reflect run now, an explicit operator override of
+/// the scheduled cadence. Enqueues the same harness-entered Reflect stimulus the nightly schedule
+/// would; entry-Reflect is not rate-limited (the rate-limit guards the *cadence*, which the operator
+/// is deliberately overriding here). The running daemon picks it up single-flight.
+async fn reflect_now(config_path: &str) -> Result<()> {
+    let config = DackConfig::load(config_path)?;
+    let now = chrono::Utc::now().timestamp();
+    SqliteQueue::open(&config.db_path)?
+        .enqueue(crate::harness::reflect_stimulus(now))
+        .await?;
+    println!("dack: Reflect run enqueued (the daemon will pick it up).");
+    Ok(())
+}
+
+/// `dack reconcile` (PRD §7.5, §8.3) — commit external/hand edits to the soul tree
+/// (memory/prompts/stimuli) so the daemon's per-run integrity tripwire (`reconcile_soul`, which
+/// reverts anything outside the running state's writable dirs) doesn't clobber them. Commits are
+/// authored as the **operator DID** (the human shaping the soul, distinct from the duck's Soul-DID
+/// Reflect output) and pushed with the soul key (the node credential — author and push are
+/// independent: `commit_paths` stamps the author, `push` uses `GITLAWB_KEY`).
+async fn reconcile(config_path: &str) -> Result<()> {
+    let config = DackConfig::load(config_path)?;
+    let repo_root = std::fs::canonicalize(&config.soul_repo)
+        .unwrap_or_else(|_| PathBuf::from(&config.soul_repo));
+    let author = config.operator_did.clone();
+    let repo: Arc<dyn RepoHost> = match (&config.soul_remote, &config.identities.soul) {
+        (Some(remote), Some(soul_dir)) => {
+            let soul_dir =
+                std::fs::canonicalize(soul_dir).unwrap_or_else(|_| PathBuf::from(soul_dir));
+            Arc::new(GitlawbRepo::new(
+                &repo_root,
+                author.clone(),
+                remote.clone(),
+                soul_dir,
+                config.gitlawb_node.clone(),
+            ))
+        }
+        _ => Arc::new(PlainGitRepo::new(&repo_root, author.clone())),
+    };
+
+    let changes = repo.status().await?;
+    if changes.is_empty() {
+        println!("dack: soul tree clean — nothing to reconcile.");
+        return Ok(());
+    }
+    let paths: Vec<RepoPath> = changes.iter().map(|c| c.path.clone()).collect();
+    let commit = CommitMeta {
+        message: format!("reconcile {} external path(s) (operator)", paths.len()),
+        author_did: author,
+    };
+    match repo.commit_paths(&paths, &commit).await? {
+        Some(id) => {
+            for p in &paths {
+                println!("  + {}", p.0);
+            }
+            println!("dack: committed {} path(s) as operator ({}).", paths.len(), id.0);
+            if let Err(e) = repo.push().await {
+                eprintln!("dack: push failed (kept local; the daemon re-pushes next cycle): {e}");
+            }
+        }
+        None => println!("dack: nothing staged — tree already clean at HEAD."),
     }
     Ok(())
 }
@@ -240,6 +359,14 @@ async fn run(config_path: &str) -> Result<()> {
         }
     });
     eprintln!("dack: consciousness loop up (queue → Perceive → wall → Express).");
+    // The scheduled Reflect ticker (PRD §4.2): enqueues a harness-entered Reflect at `reflect_schedule`
+    // (no-op if unset). Harness-owned so it survives `stimuli/` hot-reloads. `dack reflect-now` is the
+    // out-of-band manual trigger of the same run.
+    tokio::spawn({
+        let h = harness.clone();
+        let sd = shutdown_rx.clone();
+        async move { h.reflect_scheduler(sd).await }
+    });
 
     let ingestor = Arc::new(Ingestor {
         repo_root,

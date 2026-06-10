@@ -78,6 +78,7 @@ async fn main() -> anyhow::Result<()> {
         workdir: None,
         secret_env: Default::default(),
         mcp_servers: Default::default(),
+        model: None,
     };
 
     let wall = Arc::new(Recording {

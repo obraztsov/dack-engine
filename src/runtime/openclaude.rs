@@ -199,7 +199,8 @@ impl RuntimeClient for OpenClaudeClient {
             user_prompt: Self::render_blocks(&req.blocks),
             disallowed_tools: ALWAYS_DISALLOWED.iter().map(|s| s.to_string()).collect(),
             allowed_tools: None,
-            model: self.model.as_deref(),
+            // Per-invocation override (8.7) wins; else the client's configured default.
+            model: req.model.as_deref().or(self.model.as_deref()),
             cwd: req.workdir.as_deref().and_then(|p| p.to_str()),
             mcp_servers: &req.mcp_servers,
         };
@@ -341,6 +342,7 @@ mod tests {
             workdir: None,
             secret_env: Default::default(),
             mcp_servers: Default::default(),
+            model: None,
         }
     }
 

@@ -61,13 +61,29 @@ pub struct TierPolicy {
     /// Server names never admitted at this tier (overrides `import` and inline).
     #[serde(default)]
     pub deny: Vec<String>,
+    /// The OPERATOR's model for this tier — the default model a state-prompt at this tier runs on.
+    /// `None` falls back to the global `config.model`. (The model handshake, mirroring `mcp_whitelist`.)
+    #[serde(default)]
+    pub model: Option<String>,
+    /// `false` (default) = the operator's `model` (or global) is fixed for this tier; a state-prompt's
+    /// own `model:` is ignored. `true` = the soul may self-select a per-prompt `model:` (e.g. a Reflect
+    /// tier the operator lets pick a stronger model). Operator boundary; soul self-selects within it.
+    #[serde(default)]
+    pub allow_model_override: bool,
 }
 
 impl Default for TierPolicy {
     /// The safe default for an unconfigured tier: **nothing grantable** — imports-only (locked) with
-    /// an empty import list (least privilege; the operator must explicitly open a tier).
+    /// an empty import list (least privilege; the operator must explicitly open a tier). Model: the
+    /// global default, no soul override.
     fn default() -> Self {
-        Self { mcp_whitelist: true, import: Vec::new(), deny: Vec::new() }
+        Self {
+            mcp_whitelist: true,
+            import: Vec::new(),
+            deny: Vec::new(),
+            model: None,
+            allow_model_override: false,
+        }
     }
 }
 

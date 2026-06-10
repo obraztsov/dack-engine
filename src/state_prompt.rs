@@ -57,6 +57,11 @@ pub struct StatePromptFrontmatter {
     /// the chosen target's `state` tier is ceiling-checked before it opens. Empty = terminal.
     #[serde(default)]
     pub transitions: Vec<String>,
+    /// Optional per-prompt model override (the soul's half of the model handshake). Honored ONLY
+    /// where the operator's `tier_policy[state].allow_model_override` is set; otherwise ignored in
+    /// favour of the operator's per-state default, then the global `config.model` (I16 shape).
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 /// A parsed state-prompt: its id (path), frontmatter, and the trusted directive body.
@@ -67,6 +72,8 @@ pub struct StatePrompt {
     pub state: ConsciousnessState,
     pub mcp: Vec<McpRef>,
     pub transitions: Vec<String>,
+    /// Soul-requested model override (operator-gated at assembly). `None` = the configured default.
+    pub model: Option<String>,
     /// The directive text (the body below the frontmatter fence). Trusted.
     pub body: String,
 }
@@ -84,6 +91,7 @@ impl StatePrompt {
             state: fm.state,
             mcp: fm.mcp,
             transitions: fm.transitions,
+            model: fm.model,
             body: body.trim().to_string(),
         })
     }

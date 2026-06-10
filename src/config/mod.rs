@@ -1,10 +1,10 @@
-//! Operator control plane + config (PRD §8.2) — the non-LLM authority surface.
+//! Operator config (PRD §8.2) — the non-LLM authority surface.
 //!
-//! A rich YAML the operator owns and the harness reads (hot-reloadable). Holds the
-//! routing table, the control plane (cap/whitelist — future), forwarded-env *names*,
-//! secret *references* (names/paths, never values), and the trusted operator DID.
-//! The agent may *read* select fields (it should know it can be killed) but can
-//! **never write** this — it is operator writer-of-record (PRD §7.1).
+//! A rich YAML the operator owns and the harness reads (hot-reloadable). Holds the trust lattice
+//! (the taint model), the MCP registry + per-tier policy, secrets-provider refs, the reflect
+//! rate-limit, forwarded-env *names*, secret *references* (never values), and the trusted operator
+//! DID. The agent may *read* select fields (it should know it can be killed) but can **never
+//! write** this — it is operator writer-of-record (PRD §7.1).
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -147,19 +147,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// The control plane the Settle predicate reads (PRD §7.6, §8.2). v1: empty/zeroed —
-/// no Settle wired. **Amount/cap is enforced by the DAC treasury, not duplicated here**
-/// (PRD §7.6); `cap_remaining` is retained only as a future operator-visible field.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ControlPlane {
-    #[serde(default)]
-    pub cap_remaining: u64,
-    /// Whitelisted contracts — set membership, the dumb half of `allow_settle`.
-    #[serde(default)]
-    pub whitelist: Vec<String>,
-    #[serde(default)]
-    pub allowed_action_types: Vec<String>,
-}
 
 /// One secrets provider (a trusted, harness-owned script) — see [`DackConfig::secrets_providers`].
 /// The `command` is run with `env` (its config — e.g. creds-file/token-store paths) injected;
@@ -197,8 +184,8 @@ pub enum CapabilityTier {
     Read,
     /// Reversible external effect (post/reply). Express only.
     Post,
-    /// Irreversible authority (trade/transfer/vote). Settle only — additionally gated by
-    /// `allow_settle` (whitelist + operator_signed). The most dangerous tier.
+    /// Irreversible authority (trade/transfer/vote). Settle only — reachable only by an
+    /// uncontaminated cycle (the taint model); externally bounded by the custodial/wallet limits.
     Settle,
 }
 
@@ -317,8 +304,6 @@ pub struct DackConfig {
     /// entry + a script — **never a harness change** (PRD §7.2; `docs/SECRETS-AND-SANDBOX.md`).
     #[serde(default)]
     pub secrets_providers: Vec<SecretsProviderConfig>,
-    #[serde(default)]
-    pub control_plane: ControlPlane,
     /// Cron schedule for the harness-entered Reflect run (PRD §4.2). `None` = manual
     /// (`dack reflect-now`) only.
     #[serde(default)]
@@ -369,8 +354,8 @@ pub struct DackConfig {
     #[serde(default = "default_post_tools")]
     pub post_tools: Vec<String>,
     /// MCP tool-name **prefixes** the wall treats as IRREVERSIBLE authority → `ToolClass::SettleTx`
-    /// (Settle only, additionally gated by `allow_settle`). MUST stay disjoint from `post_tools`
-    /// (else a settle capability could classify as Post and run in Express). v1 Settle is unreachable.
+    /// (Settle only). MUST stay disjoint from `post_tools` (else a settle capability could classify
+    /// as Post and run in Express). Settle is reachable only by an uncontaminated cycle (taint).
     #[serde(default = "default_settle_tools")]
     pub settle_tools: Vec<String>,
     /// **MCP capability registry** (PRD §6.3) — operator-declared servers the duck can use in its
@@ -406,7 +391,7 @@ pub struct CapabilityPrefixes {
     pub read: Vec<CapabilityPrefix>,
     /// → `ToolClass::Post` (reversible; Express).
     pub post: Vec<CapabilityPrefix>,
-    /// → `ToolClass::SettleTx` (irreversible; Settle + `allow_settle`).
+    /// → `ToolClass::SettleTx` (irreversible; Settle only).
     pub settle: Vec<CapabilityPrefix>,
 }
 
@@ -586,10 +571,6 @@ operator_did: "did:key:z6MkOperator"
 forwarded_env: [TWITTER_API_KEY, BANKR_API_KEY, BUILDER_DID_KEY, DACK_HANDLE, RATE_LIMIT]
 secrets:
   soul_did_key: "file:///run/secrets/soul_did_key"
-control_plane:
-  cap_remaining: 0
-  whitelist: []
-  allowed_action_types: []
 "#;
 
     #[test]

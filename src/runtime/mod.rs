@@ -29,7 +29,6 @@ pub mod action_required;
 pub mod classify;
 pub mod claude_cli;
 pub mod openclaude;
-pub mod settle;
 
 /// An engine session handle (OpenClaude `Query.sessionId`, PRD §6 / vision). Reusing a
 /// session preserves context across wakes — cheaper, more coherent ("reads the room"),
@@ -101,8 +100,8 @@ pub struct ActionRequest {
     /// Correlation id — the SDK's `toolUseID`; the decision is returned via
     /// `query.respondToPermission(tool_use_id, …)`.
     pub tool_use_id: String,
-    /// Raw tool arguments. The responder reads this to derive class + target path and,
-    /// for Settle, to extract the destination/contract for `allow_settle`.
+    /// Raw tool arguments. The responder reads this to derive class + target path, and the
+    /// runlog records a truncated rendering so the audit shows WHAT the duck did.
     pub input: serde_json::Value,
 }
 

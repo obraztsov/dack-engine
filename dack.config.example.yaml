@@ -85,12 +85,10 @@ secrets_providers:
 secrets:
   soul_did_key: "file:///run/secrets/soul_did_key"
 
-# The Settle predicate reads this (PRD §7.6). v1: empty/zeroed — Settle unwired.
-# Amount/cap is enforced by the DAC treasury, NOT duplicated here.
-control_plane:
-  cap_remaining: 0
-  whitelist: []
-  allowed_action_types: []
+# `allow_settle` + `control_plane` removed (2026-06-10): the runtime carries NO settle predicate.
+# Irreversibility is bounded by the taint ceiling (a contaminated cycle can't reach Settle) + the
+# custodial/wallet limits (cove daily caps / no-withdraw; on-chain the wallet's native allowances) +
+# Coasean peer error-correction. (See trust_tiers above.)
 
 # Cron for the scheduled Reflect run (PRD §4.2). Reflect is ALSO reachable via a transition — but
 # only from an UNCONTAMINATED cycle whose trust tier `reaches: reflect`, and rate-limited by

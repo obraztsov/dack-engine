@@ -32,7 +32,7 @@ impl TrustTier {
         Self("self".into())
     }
     /// An RFC 9421 signature from the operator DID — the top tier (`dack say`). The only tier that
-    /// may precondition the on-chain `allow_settle` predicate (PRD §7.6).
+    /// the top tier (`dack say`); by default its cycles `reach` the whole ladder (PRD §5.7).
     pub fn operator() -> Self {
         Self("operator_signed".into())
     }

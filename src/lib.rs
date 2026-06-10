@@ -26,7 +26,7 @@
 //! - [`stimuli`]  — the job-description registry (`STIMULUS.md` format)
 //! - [`sensor`]   — the pure-perceiver sensor contract
 //! - [`bus`] / [`queue`] / [`sources`] / [`webserver`] — the dumb stimulus pipeline
-//! - [`runtime`]  — the OpenClaude stdio-bridge seam + the `action_required` wall + `allow_settle`
+//! - [`runtime`]  — the OpenClaude stdio-bridge seam + the `action_required` wall (taint-gated Settle)
 //! - [`identity`] / [`repo`] — the swappable seams (Gitlawb v1; corp later). Memory has **no**
 //!   Rust seam — the agent reaches it through the path-gated file tools (`docs/VERIFICATION.md`).
 //! - [`secrets`] / [`runlog`] — harness-owned plumbing stores

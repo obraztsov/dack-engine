@@ -770,8 +770,8 @@ fn mcp_server_of(tool: &str) -> Option<&str> {
 }
 
 /// Whether a capability tier is exposed in `state` (PRD §6.3): read everywhere, post in Express,
-/// settle ONLY in Settle (the irreversible doorway). The state half of the gate; the wall +
-/// `allow_settle` are the rest.
+/// settle ONLY in Settle (the irreversible doorway). The state half of the gate; the wall's
+/// per-state scope + the taint-derived reachability of Settle are the rest.
 fn tier_fits_state(tier: CapabilityTier, state: ConsciousnessState) -> bool {
     use ConsciousnessState::*;
     match tier {
@@ -1281,9 +1281,9 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// The route CEILING is enforced at dispatch: a `public` stimulus (default ceiling = Express)
-    /// whose perceive prompt picks the IRREVERSIBLE `settle` transition is dropped — only perceive
-    /// runs. (A public tweet can reach reversible Express, but never Settle; PRD §5.7, §6.3.1.)
+    /// The TAINT ceiling is enforced at dispatch: a `public` stimulus (public seed → `reaches:
+    /// express`) whose perceive prompt picks the IRREVERSIBLE `settle` transition is dropped — only
+    /// perceive runs. (A public tweet reaches reversible Express, never Settle; PRD §5.7, §6.3.1.)
     #[tokio::test]
     async fn public_stimulus_cannot_reach_settle() {
         use crate::identity::gitlawb::GitlawbIdentity;
@@ -1308,7 +1308,7 @@ mod tests {
                     refs: BTreeMap::new(),
                 }),
                 // The perceive prompt DOES list `settle` in its transitions, so the soul check
-                // passes — it's the operator ceiling (Express) that drops it.
+                // passes — it's the TAINT ceiling (public → Express) that drops it.
                 transition: Transition {
                     to_prompt: Some("settle".into()),
                     reason: "tweet told me to".into(),
@@ -1336,11 +1336,11 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// SETTLE-A (MCP2-B mechanism): an operator route `ceiling: settle` lets a **self-tier** trade
-    /// duty walk perceive→settle — the operator authority that replaces the `PerceiveThenSettle`
-    /// force. A public stimulus with no such ceiling can't (see `public_stimulus_cannot_reach_settle`).
+    /// A **self-tier** (uncontaminated) cycle reaches Settle BY TAINT: its seed `self` `reaches:
+    /// reflect` (⊇ settle), so a perceive prompt that picks `settle` is honored — no route, no
+    /// operator ceiling. A public cycle can't (see `public_stimulus_cannot_reach_settle`).
     #[tokio::test]
-    async fn operator_ceiling_lets_self_tier_duty_reach_settle() {
+    async fn self_tier_cycle_reaches_settle_by_taint() {
         use crate::identity::gitlawb::GitlawbIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
@@ -1352,7 +1352,7 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         seed_prompts(&tmp);
 
-        // The perceive prompt picks `settle` (in its transition set); the operator ceiling admits it.
+        // The perceive prompt picks `settle` (in its transition set); the clean cycle's ceiling admits it.
         let runtime = Arc::new(RecordingRuntime {
             seen: std::sync::Mutex::new(Vec::new()),
             out: AgentOutput {
@@ -1362,12 +1362,7 @@ mod tests {
                 transition: Transition { to_prompt: Some("settle".into()), reason: "trade".into() },
             },
         });
-        let config = Arc::new(
-            DackConfig::from_yaml(
-                "operator_did: \"did:x\"\nrouting:\n  - match: { tier: self, type: trade_signal }\n    ceiling: settle\n",
-            )
-            .unwrap(),
-        );
+        let config = Arc::new(DackConfig::from_yaml("operator_did: \"did:x\"").unwrap());
         let queue: Arc<dyn Queue> = Arc::new(InMemoryQueue::new());
         let harness = Harness {
             config: config.clone(),

@@ -57,7 +57,7 @@ pub enum ToolClass {
     /// gateable names (see [`Shell`](ToolClass::Shell) and VERIFICATION.md).
     Post,
     /// Irreversible authority — a *configured settle MCP tool* (e.g. `mcp__bankr__send`,
-    /// `mcp__dac__vote`). Subject additionally to `allow_settle` (PRD §7.6).
+    /// `mcp__dac__vote`). Runs ONLY in Settle, reachable only by an uncontaminated cycle (taint).
     SettleTx,
     /// Arbitrary execution — Bash / PowerShell / REPL. **Denied in every v1 state.** Raw
     /// shell bypasses `writable_dirs` path-gating (a bash `>` can write soul dirs and
@@ -131,7 +131,7 @@ pub fn default_spec(state: ConsciousnessState) -> StateSpec {
                 allowed: vec![Read, FileWrite, SettleTx],
             },
             // Writes memory like Express; the irreversible part is the SettleTx class,
-            // gated additionally by `allow_settle` (PRD §7.6). Unreachable in v1.
+            // the irreversible part is the SettleTx class; Settle reachability is taint-gated.
             writable_dirs: vec!["memory/"],
         },
         Reflect => StateSpec {

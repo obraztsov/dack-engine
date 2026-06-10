@@ -6,20 +6,21 @@
 //!   1. Is this tool's class in the **current state's allowed set**? (per-state scoping)
 //!   2. For file-writes: is `target_path` under one of the state's `writable_dirs`?
 //!      And NEVER `runlogs/` — the harness authors the record (PRD §4.1, §7.5).
-//!   3. For Settle (future): does [`super::settle::allow_settle`] pass?
+//!   3. Settle needs NO extra predicate: a `tier: settle` tool only ever runs IN Settle, which is
+//!      reachable only by an uncontaminated cycle (the taint model). The old `allow_settle`
+//!      whitelist+operator_signed reflex was removed — irreversibility is bounded by taint-
+//!      reachability here + the custodial/wallet limits externally.
 //!
-//! v1 net effect: Perceive auto-denies all write/network-write; Express allows only
-//! post/reply + memory-append; everything else denied (PRD §6.3).
+//! Net effect: Perceive auto-denies all write/network-write; Express allows post/reply +
+//! memory-append; Settle allows its registered settle-tier tools; everything else denied (PRD §6.3).
 
 use std::path::{Component, Path, PathBuf};
 
 use async_trait::async_trait;
 
 use super::classify::classify_tool;
-use super::settle::{allow_settle, Advisory, SettleAction, SettleDecision};
 use super::{ActionDecision, ActionRequest, ActionResponder};
-use crate::config::{CapabilityPrefix, ControlPlane};
-use crate::model::stimulus::Stimulus;
+use crate::config::CapabilityPrefix;
 use crate::state::{StateSpec, ToolClass};
 
 /// One responder per invocation, bound to the running state's spec. Holding the spec
@@ -35,21 +36,10 @@ pub struct StatePolicyResponder {
     /// registered `tier: read` servers (e.g. `mcp__cove-read__`). Safe in every state. Each may
     /// carry a `tools` allowlist the classifier enforces fail-closed (PRD §6.3).
     pub read_tools: Vec<CapabilityPrefix>,
-    /// Present only for a Settle run: the operator control plane + the triggering
-    /// stimulus the Settle predicate reads. `None` in v1 (Settle is unreachable).
-    pub settle_ctx: Option<SettleContext>,
     /// The soul-repo root, for relativizing the **absolute** `file_path`s the SDK emits
     /// before the `writable_dirs` prefix check (PRD §4.1). `None` in unit tests, which use
     /// repo-relative paths directly.
     pub repo_root: Option<PathBuf>,
-}
-
-pub struct SettleContext {
-    pub control_plane: ControlPlane,
-    pub triggering_stimulus: Stimulus,
-    /// The single extension point (PRD §7.6): human-approval hook / verifier model.
-    /// Can only make the gate *stricter*, never looser.
-    pub advisory: Option<std::sync::Arc<dyn Advisory>>,
 }
 
 impl StatePolicyResponder {
@@ -61,7 +51,6 @@ impl StatePolicyResponder {
             post_tools: Vec::new(),
             settle_tools: Vec::new(),
             read_tools: Vec::new(),
-            settle_ctx: None,
             repo_root: None,
         }
     }
@@ -77,7 +66,6 @@ impl StatePolicyResponder {
             post_tools,
             settle_tools,
             read_tools: Vec::new(),
-            settle_ctx: None,
             repo_root: None,
         }
     }
@@ -166,31 +154,14 @@ impl ActionResponder for StatePolicyResponder {
             }
         }
 
-        // (3) Irreversible authority. We are already IN Settle (the scope check above passed) and
-        // this is a REGISTERED `tier: settle` capability the harness exposed only here. Two regimes:
-        //   - **No settle context** (the cove / custodial-API case): allow at the TOOL TIER. The
-        //     bound is external — the funded account balance — and reaching Settle required an
-        //     operator-configured route (`PerceiveThenSettle`). Deliberate bounded-loss autonomy.
-        //   - **A settle context present** (the future on-chain / DAC-actor case with a private
-        //     key): apply the dumb `allow_settle` reflex (whitelist + operator_signed), where
-        //     address / calldata analysis belongs (PRD §7.6).
-        if class == ToolClass::SettleTx {
-            return match &self.settle_ctx {
-                None => ActionDecision::Allow,
-                Some(ctx) => {
-                    let action = SettleAction::from_tool_input(&req.tool, &req.input);
-                    match allow_settle(
-                        &action,
-                        &ctx.triggering_stimulus,
-                        &ctx.control_plane,
-                        ctx.advisory.as_deref(),
-                    ) {
-                        SettleDecision::Allow => ActionDecision::Allow,
-                        SettleDecision::Deny(why) => ActionDecision::Deny(why),
-                    }
-                }
-            };
-        }
+        // (3) Irreversible authority needs NO extra runtime predicate (the `allow_settle`
+        // whitelist+operator_signed reflex was removed — it was never wired). Being here means a
+        // REGISTERED `tier: settle` capability is running IN Settle, and Settle is reachable only by
+        // an UNCONTAMINATED cycle whose accumulated trust `reaches: settle` (the taint model). So
+        // irreversibility is bounded UPSTREAM (taint-reachability + this state-scope gate + the
+        // per-server tool allowlist) and EXTERNALLY (the custodial/wallet limits — cove daily caps /
+        // no-withdraw, on-chain the wallet's native allowances). A settle-tier tool in Settle is
+        // therefore allowed — it falls through to the final decision below.
 
         ActionDecision::Allow
     }
@@ -307,9 +278,9 @@ mod tests {
 
     #[tokio::test]
     async fn settle_tier_tool_allowed_in_settle_by_tool_tier() {
-        // Custodial-API model (cove): a registered settle-tier tool, reached in Settle, is allowed
-        // at the tool tier (no settle_ctx). The bound is external (funded balance); reaching Settle
-        // required an operator route.
+        // A registered settle-tier tool, reached in Settle, is allowed — no extra predicate. The
+        // bound is external (the funded cove balance + cove's own limits); reaching Settle required
+        // an uncontaminated cycle (the taint model).
         let r = responder(ConsciousnessState::Settle);
         assert!(matches!(
             r.decide(&req("mcp__cove-trading__buy", json!({"token": "DOGE", "usd": "1"})))
@@ -341,9 +312,8 @@ mod tests {
 
     #[tokio::test]
     async fn settle_tier_tool_denied_outside_settle() {
-        // The tool-tier exposure gate: a settle-class tool in Express is denied by SCOPE (Express
-        // does not scope SettleTx) — independent of any settle_ctx. (And the harness never even
-        // exposes a settle-tier MCP outside Settle.)
+        // The state gate: a settle-class tool in Express is denied by SCOPE (Express does not scope
+        // SettleTx). (And the harness never even exposes a settle-tier MCP outside Settle.)
         let r = responder(ConsciousnessState::Express);
         assert!(matches!(
             r.decide(&req("mcp__cove-trading__buy", json!({"token": "DOGE", "usd": "1"})))

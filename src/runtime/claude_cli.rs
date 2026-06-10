@@ -10,7 +10,7 @@
 //! 1. **No live approval round-trip.** `claude -p` decides permissions from flags
 //!    (`--allowedTools` / `--disallowedTools` / `--permission-mode`), not a callback. So
 //!    per-state scoping is delivered as a *pre-declared* tool allow/deny list, and there
-//!    is no dynamic `allow_settle` check mid-run.
+//!    is no dynamic permission callback mid-run.
 //! 2. **⇒ Settle is unsupported in one-shot mode** — the irreversibility wall needs the
 //!    live callback runtime. This is fine: degraded mode is for reversible shitposting;
 //!    anything irreversible requires the OpenClaude (or equivalent callback) runtime.

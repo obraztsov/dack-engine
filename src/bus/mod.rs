@@ -32,11 +32,15 @@ impl Bus {
     /// supplied by the caller (the harness stamps wall-clock time) so the bus stays
     /// deterministic and testable. Returns the ids of *newly enqueued* rows (a candidate
     /// folded into an existing batch row mints no new wake).
+    /// `payload_seed` is the cycle's PAYLOAD trust seed (TIER-3) — derived by the [`Ingestor`] from
+    /// the source (signed-script hash / webhook tier / pure-cron `self`), met with the sensor
+    /// secrets. Each candidate's tier is clamped DOWN to it (a sensor may only lower trust).
     pub async fn ingest(
         &self,
         def: &StimulusDef,
         candidates: Vec<SensorCandidate>,
         received_at: i64,
+        payload_seed: TrustTier,
     ) -> Result<Vec<StimulusId>> {
         let fm = &def.frontmatter;
         let mut enqueued = Vec::new();
@@ -48,13 +52,16 @@ impl Bus {
                 dedup_key,
                 payload_tier: cand_tier,
             } = c;
-            // The source assigns the tier; a sensor may only *lower* it. A candidate claiming a
-            // tier above the duty's `default_payload_tier` is clamped down — closing a trust-tier
-            // escalation primitive (arbitrary Reflect-authored sensor code, PRD §5.7).
-            let payload_tier = cand_tier
-                .map(|c| c.min_trust(fm.emits.default_payload_tier))
-                .unwrap_or(fm.emits.default_payload_tier);
-            let priority = self.classify_priority(payload_tier, &type_, fm.priority);
+            // The source assigns the tier; a sensor may only *LOWER* it. A candidate claiming a tier
+            // above the source-derived `payload_seed` is clamped down (the taint `meet`) — closing a
+            // trust-tier escalation primitive (arbitrary Reflect-authored sensor code, PRD §5.7).
+            let lattice = self.config.lattice();
+            let payload_tier = match cand_tier {
+                Some(c) => lattice.meet(&c, &payload_seed),
+                None => payload_seed.clone(),
+            };
+            // Priority is the duty's own frontmatter hint (TIER-4 — the routing table is gone).
+            let priority = fm.priority.unwrap_or(Priority::Low);
             // Entry **state-prompt** (MCP2-B): the duty's own frontmatter `entry:` (a state-prompt
             // id like `twitter/perceive_mention`). The path the chain then walks is soul-owned; the
             // operator route only supplies the *ceiling* (read at dispatch), not the entry.
@@ -104,7 +111,7 @@ impl Bus {
                     id: id.clone(),
                     source: fm.id.clone(),
                     type_,
-                    directive_tier: fm.directive_tier,
+                    directive_tier: fm.directive_tier.clone(),
                     payload_tier,
                     payload,
                     provenance: None,
@@ -140,21 +147,6 @@ impl Bus {
         Ok(rows)
     }
 
-    /// Priority from the routing table, falling back to the duty's own hint, then Low.
-    /// The routing table is operator config; the agent's authored priority is only a
-    /// hint (PRD §5.6).
-    fn classify_priority(
-        &self,
-        tier: TrustTier,
-        type_: &StimulusType,
-        duty_hint: Option<Priority>,
-    ) -> Priority {
-        self.config
-            .lookup_route(tier, type_)
-            .and_then(|r| r.priority)
-            .or(duty_hint)
-            .unwrap_or(Priority::Low)
-    }
 }
 
 /// Fold a new payload into a batch accumulator. Shape: `{"_coalesced": true, "items":[…]}`.
@@ -209,7 +201,7 @@ mod tests {
         let b = bus();
         let def = duty("coalesce: { mode: none }\n");
         let ids = b
-            .ingest(&def, vec![cand("a", "t1"), cand("b", "t1"), cand("c", "t1")], 1000)
+            .ingest(&def, vec![cand("a", "t1"), cand("b", "t1"), cand("c", "t1")], 1000, TrustTier::self_())
             .await
             .unwrap();
         assert_eq!(ids.len(), 3);
@@ -220,8 +212,8 @@ mod tests {
     async fn latest_supersedes_prior_pending() {
         let b = bus();
         let def = duty("coalesce: { mode: latest, dedup_key: thread_id }\n");
-        b.ingest(&def, vec![cand("old", "t1")], 1000).await.unwrap();
-        b.ingest(&def, vec![cand("new", "t1")], 1001).await.unwrap();
+        b.ingest(&def, vec![cand("old", "t1")], 1000, TrustTier::self_()).await.unwrap();
+        b.ingest(&def, vec![cand("new", "t1")], 1001, TrustTier::self_()).await.unwrap();
         // Only the newest stays pending; the older is coalesced away.
         assert_eq!(b.queue.depth().await.unwrap(), 1);
         let popped = b.queue.next().await.unwrap().unwrap();
@@ -238,6 +230,7 @@ mod tests {
                 &def,
                 vec![cand("m1", "t1"), cand("m2", "t1"), cand("m3", "t1")],
                 1000,
+                TrustTier::self_(),
             )
             .await
             .unwrap();
@@ -252,34 +245,34 @@ mod tests {
     async fn batch_outside_window_starts_a_new_row() {
         let b = bus();
         let def = duty("coalesce: { mode: batch, window_sec: 600, dedup_key: thread_id }\n");
-        b.ingest(&def, vec![cand("early", "t1")], 1000).await.unwrap();
+        b.ingest(&def, vec![cand("early", "t1")], 1000, TrustTier::self_()).await.unwrap();
         // 700s later: outside the 600s window → a fresh accumulator, not a fold.
-        b.ingest(&def, vec![cand("late", "t1")], 1700).await.unwrap();
+        b.ingest(&def, vec![cand("late", "t1")], 1700, TrustTier::self_()).await.unwrap();
         assert_eq!(b.queue.depth().await.unwrap(), 2);
     }
 
     #[tokio::test]
-    async fn sensor_cannot_raise_tier_above_duty_default() {
+    async fn sensor_cannot_raise_tier_above_the_seed() {
         let b = bus();
-        let def = duty("coalesce: { mode: none }\n"); // default_payload_tier: public
-        // A sensor lies, claiming operator_signed to try to escalate its row's trust.
+        let def = duty("coalesce: { mode: none }\n");
+        // A sensor lies, claiming operator_signed to try to escalate above the source-derived seed.
         let candidate = SensorCandidate {
             type_: StimulusType::from("mention"),
             payload: json!({ "text": "trust me" }),
             dedup_key: None,
-            payload_tier: Some(TrustTier::OperatorSigned),
+            payload_tier: Some(TrustTier::operator()),
         };
-        b.ingest(&def, vec![candidate], 1000).await.unwrap();
+        // Seed = self; the candidate's operator claim is clamped DOWN to the seed (the meet).
+        b.ingest(&def, vec![candidate], 1000, TrustTier::self_()).await.unwrap();
         let row = b.queue.next().await.unwrap().unwrap();
-        // Clamped down to the duty's declared ceiling — the lie is ignored.
-        assert_eq!(row.payload_tier, TrustTier::Public);
+        assert_eq!(row.payload_tier, TrustTier::self_(), "a sensor may only LOWER trust, never raise it");
     }
 
     #[tokio::test]
     async fn different_keys_do_not_coalesce() {
         let b = bus();
         let def = duty("coalesce: { mode: batch, window_sec: 600, dedup_key: thread_id }\n");
-        b.ingest(&def, vec![cand("a", "t1"), cand("b", "t2")], 1000).await.unwrap();
+        b.ingest(&def, vec![cand("a", "t1"), cand("b", "t2")], 1000, TrustTier::self_()).await.unwrap();
         assert_eq!(b.queue.depth().await.unwrap(), 2);
     }
 }

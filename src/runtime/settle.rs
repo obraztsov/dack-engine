@@ -94,8 +94,8 @@ pub fn allow_settle(
     // The directive (the standing duty) must be operator-authored AND the world-data
     // that justified acting must itself be operator-signed — only `operator_signed`
     // tier may precondition a Settle edge (PRD §5.7).
-    if triggering_stimulus.directive_tier != TrustTier::OperatorSigned
-        || triggering_stimulus.payload_tier != TrustTier::OperatorSigned
+    if triggering_stimulus.directive_tier != TrustTier::operator()
+        || triggering_stimulus.payload_tier != TrustTier::operator()
     {
         return SettleDecision::Deny("triggering stimulus is not operator_signed".into());
     }
@@ -138,7 +138,7 @@ mod tests {
     #[test]
     fn denies_non_whitelisted_contract() {
         let action = SettleAction { contract: "0xEVIL".into(), action_type: "vote".into() };
-        let s = stim(TrustTier::OperatorSigned, TrustTier::OperatorSigned);
+        let s = stim(TrustTier::operator(), TrustTier::operator());
         assert!(matches!(
             allow_settle(&action, &s, &cp(&["0xGOOD"]), None),
             SettleDecision::Deny(_)
@@ -150,7 +150,7 @@ mod tests {
         let action = SettleAction { contract: "0xGOOD".into(), action_type: "vote".into() };
         // The laundered-conclusion attack target: a public payload must never settle,
         // no matter how persuasive (PRD §7.6).
-        let s = stim(TrustTier::OperatorSigned, TrustTier::Public);
+        let s = stim(TrustTier::operator(), TrustTier::public());
         assert!(matches!(
             allow_settle(&action, &s, &cp(&["0xGOOD"]), None),
             SettleDecision::Deny(_)
@@ -160,7 +160,7 @@ mod tests {
     #[test]
     fn allows_only_when_both_dumb_predicates_pass() {
         let action = SettleAction { contract: "0xGOOD".into(), action_type: "vote".into() };
-        let s = stim(TrustTier::OperatorSigned, TrustTier::OperatorSigned);
+        let s = stim(TrustTier::operator(), TrustTier::operator());
         assert!(matches!(
             allow_settle(&action, &s, &cp(&["0xGOOD"]), None),
             SettleDecision::Allow

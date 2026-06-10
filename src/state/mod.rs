@@ -157,13 +157,14 @@ pub fn default_spec(state: ConsciousnessState) -> StateSpec {
 ///      is real but rate-limited by the harness clock.
 ///   3. **Reflect is harness-exited only** — Reflect transitions into no other state.
 ///      It influences the future only indirectly, by writing `memory/` and `stimuli/`.
-pub fn allowed_transition(from: ConsciousnessState, to: ConsciousnessState) -> bool {
+pub fn allowed_transition(from: ConsciousnessState, _to: ConsciousnessState) -> bool {
     use ConsciousnessState::*;
-    // The ONE structural constraint (invariants 2 & 3): nothing transitions INTO Reflect and
-    // Reflect transitions into nothing. Everything else (which tiers a state-prompt chain may
-    // walk, and how far) is now bounded by the operator **route ceiling** (`reach_rank` ≤ ceiling)
-    // — see `harness::dispatch` (MCP2-B). The soul declares the path; the ceiling caps it.
-    from != Reflect && to != Reflect
+    // The ONE remaining structural constraint (invariant 3): **Reflect exits to nothing**. Reflect
+    // is now REACHABLE via transition (TIER-4) — but only from an UNCONTAMINATED cycle whose trust
+    // tier `reaches: reflect`, and rate-limited by the harness clock (the injection-resistance the
+    // old into-Reflect ban gave is now the taint guarantee + the rate-limit; see `harness::dispatch`
+    // and invariant I6). How far any chain walks is bounded by the taint-derived ceiling.
+    from != Reflect
 }
 
 /// Reachability rank for the route-ceiling clamp: `Perceive < Express < Settle`. `Reflect` ranks
@@ -244,18 +245,14 @@ mod tests {
 
     #[test]
     fn transition_invariants() {
-        // The Reflect invariant (the only structural constraint): nothing INTO Reflect...
-        for s in [Perceive, Express, Settle, Reflect] {
-            assert!(!allowed_transition(s, Reflect), "{s:?} → Reflect must be forbidden");
-        }
-        // ...and Reflect transitions into nothing.
+        // Reflect EXITS to nothing (the one remaining structural ban).
         for s in [Perceive, Express, Settle, Reflect] {
             assert!(!allowed_transition(Reflect, s), "Reflect → {s:?} must be forbidden");
         }
-        // Non-Reflect edges are structurally allowed; the OPERATOR CEILING (not this rule) bounds
-        // how far a chain walks. Perceive→Express and a same/higher-tier hop are all structurally OK.
+        // Reflect is now REACHABLE via transition (TIER-4) — gated by the taint ceiling + the
+        // rate-limit, NOT a structural ban. Every non-Reflect→* edge is structurally allowed.
+        assert!(allowed_transition(Perceive, Reflect));
         assert!(allowed_transition(Perceive, Express));
-        assert!(allowed_transition(Perceive, Settle));
         assert!(allowed_transition(Express, Settle));
         assert!(allowed_transition(Express, Express));
     }

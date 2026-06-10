@@ -12,7 +12,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{DackError, Result};
-use crate::model::stimulus::{Priority, StimulusType, TrustTier};
+use crate::model::stimulus::TrustTier;
 use crate::state::ConsciousnessState;
 
 /// Coalescing policy — both an economics knob and a character decision (architecture §3).
@@ -36,40 +36,10 @@ pub enum CoalesceMode {
     None,
 }
 
-/// One routing rule: `(payload_tier, type)` → priority + coalesce + the transition **ceiling**.
-/// Fixed states, configurable edges — the product-iteration surface. The agent never edits this and
-/// never assigns its own tiers (PRD §5.6). The *entry* state-prompt is now the **stimulus's** own
-/// frontmatter (`entry:`); this rule supplies the operator's dispatch concerns (MCP2-B).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RoutingRule {
-    #[serde(rename = "match")]
-    pub match_: RouteMatch,
-    /// The highest consciousness tier a chain matching this route may walk to (MCP2-B). The
-    /// soul's state-prompt transitions are clamped to it; `ceiling: settle` is the operator
-    /// authority that lets a self-tier trade duty reach Settle (what `PerceiveThenSettle` did).
-    /// Defaults to reversible `Express` (Settle unreachable) when omitted. A `settle` ceiling is
-    /// guarded at load to non-public routes (`validate_capabilities`). `Reflect` is never a ceiling.
-    #[serde(default)]
-    pub ceiling: Option<ConsciousnessState>,
-    #[serde(default)]
-    pub priority: Option<Priority>,
-    #[serde(default)]
-    pub coalesce: Option<CoalescePolicy>,
-    /// Secrets-provider scopes the **act (Express/Settle) phase** of cycles matching this route
-    /// may use (by provider `name`). **Operator-controlled** — the agent can't grant itself a
-    /// secret; it can only select from the operator's `secrets_providers`. Materialized by the
-    /// harness when opening Express; the read-only **Perceive never receives these** (PRD §7.2,
-    /// §4.1; `docs/SECRETS-AND-SANDBOX.md`).
-    #[serde(default)]
-    pub secrets: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RouteMatch {
-    pub tier: TrustTier,
-    #[serde(rename = "type")]
-    pub type_: StimulusType,
-}
+// The `(payload_tier, type)` routing table is GONE (TIER-4). The transition ceiling is now derived
+// from the taint model (`TrustLattice::reaches`); `priority` + `coalesce` live in the stimulus
+// frontmatter; the `entry` state-prompt is the stimulus's own `entry:`. Capability grants are the
+// `tier_policy` handshake. Nothing remains to route by an agent-self-assigned `type`.
 
 /// Per-consciousness-tier MCP policy (MCP2-B, invariant I16) — the OPERATOR's half of the
 /// capability handshake. A state-prompt's `mcp:` requests are admitted only by this policy:
@@ -105,6 +75,78 @@ fn default_true() -> bool {
     true
 }
 
+/// One tier in the operator-configured **trust lattice** (the taint/IFC model). A `name` plus the
+/// highest consciousness state a cycle whose accumulated trust is this tier may walk to (`reaches`).
+/// **Rank = position** in `DackConfig.trust_tiers` (low→high); the lattice is a total order.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustTierDef {
+    pub name: String,
+    /// State ceiling for a cycle at this tier. `public→express`, `org→settle`, `self→reflect`, …
+    #[serde(default = "default_reaches")]
+    pub reaches: ConsciousnessState,
+}
+
+fn default_reaches() -> ConsciousnessState {
+    ConsciousnessState::Express
+}
+
+fn default_reflect_interval() -> i64 {
+    86_400 // one day — a sane self-modification cadence; the operator may loosen or `0` to disable.
+}
+
+/// The resolved trust lattice — built from `DackConfig.trust_tiers` (or the safe default). A total
+/// order by rank; the taint `meet` (greatest-lower-bound) is just the lower-ranked tier. An unknown
+/// tier name fails SAFE (rank 0 / `reaches: express`) so a mislabel can never *raise* a ceiling.
+#[derive(Debug, Clone)]
+pub struct TrustLattice {
+    tiers: Vec<TrustTierDef>, // index = rank
+}
+
+impl TrustLattice {
+    /// Privilege rank (higher = more trusted). Unknown name → 0 (lowest), fail-safe.
+    pub fn rank(&self, t: &TrustTier) -> usize {
+        self.tiers.iter().position(|d| d.name == t.name()).unwrap_or(0)
+    }
+    /// The state ceiling a cycle at tier `t` may walk to. Unknown name → `Express` (safe).
+    pub fn reaches(&self, t: &TrustTier) -> ConsciousnessState {
+        self.tiers
+            .iter()
+            .find(|d| d.name == t.name())
+            .map(|d| d.reaches)
+            .unwrap_or(ConsciousnessState::Express)
+    }
+    /// The taint **meet**: the lower-trust (most-degraded) of two tiers. Monotonic down (I17).
+    pub fn meet(&self, a: &TrustTier, b: &TrustTier) -> TrustTier {
+        if self.rank(a) <= self.rank(b) {
+            a.clone()
+        } else {
+            b.clone()
+        }
+    }
+    pub fn contains(&self, name: &str) -> bool {
+        self.tiers.iter().any(|d| d.name == name)
+    }
+}
+
+/// The safe default lattice (when `trust_tiers:` is omitted) — reproduces the pre-taint behavior:
+/// `public(→express) < self(→reflect) < operator_signed(→reflect)`.
+fn default_trust_tiers() -> Vec<TrustTierDef> {
+    use ConsciousnessState::*;
+    vec![
+        TrustTierDef { name: "public".into(), reaches: Express },
+        TrustTierDef { name: "self".into(), reaches: Reflect },
+        TrustTierDef { name: "operator_signed".into(), reaches: Reflect },
+    ]
+}
+
+/// Lowercase-hex sha256 of `bytes` — the key into `signed_scripts` (operator code-review-as-signing).
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// The control plane the Settle predicate reads (PRD §7.6, §8.2). v1: empty/zeroed —
 /// no Settle wired. **Amount/cap is enforced by the DAC treasury, not duplicated here**
 /// (PRD §7.6); `cap_remaining` is retained only as a future operator-visible field.
@@ -134,6 +176,15 @@ pub struct SecretsProviderConfig {
     /// Env keys this provider is expected to emit (documentation / validation; optional).
     #[serde(default)]
     pub keys: Vec<String>,
+    /// **Trust tier** of the data this secret puts in play (the taint model). A sensor using this
+    /// provider seeds its cycle at (at most) this tier — e.g. the X bearer touches the public world
+    /// so `trust: public` caps any twitter cycle at Express. Default `self` (the operator's own).
+    #[serde(default = "default_self_trust")]
+    pub trust: TrustTier,
+}
+
+fn default_self_trust() -> TrustTier {
+    TrustTier::self_()
 }
 
 /// Capability tier of an MCP server (PRD §4, §6.3) — maps its tools to a `ToolClass` and the
@@ -203,6 +254,14 @@ pub struct McpServerConfig {
     /// the `cove-trading` (settle-tier) sibling. Empty = expose everything the server provides.
     #[serde(default)]
     pub tools: Vec<String>,
+    /// **Trust tier** of the data this server puts in play (the taint model — distinct from the
+    /// capability `tier` above). Actually *calling* a tool from this server degrades the cycle's
+    /// trust to (at most) this tier, capping how far the chain may then walk: e.g. `rootai`
+    /// (3rd-party signals) `trust: public` → Express; `cove-read` (the operator's own wallet)
+    /// `trust: self` → no degradation. Default `self`. A soul-inlined MCP isn't in this registry,
+    /// so it taints **public** at access time (a soul can never self-grant trust).
+    #[serde(default = "default_self_trust")]
+    pub trust: TrustTier,
 }
 
 /// `dack.config.yaml` (PRD §8.2). Hot-reloadable.
@@ -210,8 +269,27 @@ pub struct McpServerConfig {
 pub struct DackConfig {
     /// The trusted operator DID — provenance check for `operator_signed` (PRD §5.7).
     pub operator_did: String,
+    /// The operator-configured **trust lattice** (the taint/IFC model). Ranked low→high; each tier
+    /// declares the max state it `reaches`. Omit to use the safe default
+    /// (`public→express < self→reflect < operator_signed→reflect`).
+    #[serde(default = "default_trust_tiers")]
+    pub trust_tiers: Vec<TrustTierDef>,
+    /// **Operator-signed sensor scripts** (the taint seed, TIER-3): `sha256(source-hex) → trust`.
+    /// A sensor whose source hashes to a listed entry seeds its cycle at that tier; an unsigned (or
+    /// since-edited) script seeds `public`. This is operator code-review-as-signing — the agent
+    /// authors a sensor, the operator reviews the EXACT bytes and signs the hash.
     #[serde(default)]
-    pub routing: Vec<RoutingRule>,
+    pub signed_scripts: BTreeMap<String, TrustTier>,
+    /// **Per-webhook trust** (TIER-3): a registered webhook path → the tier its payload is trusted
+    /// at (e.g. an operator Telegram channel → `self`). An unlisted path seeds `public`.
+    #[serde(default)]
+    pub webhooks: BTreeMap<String, TrustTier>,
+    /// **Reflect rate-limit** (TIER-4): the minimum seconds between self-modification (Reflect) runs,
+    /// enforced by the harness clock for BOTH the scheduled Reflect and any transition-reached one —
+    /// the rate-limit half of the I6 guarantee (the taint ceiling is the other half). `0` disables.
+    /// Default 1 day.
+    #[serde(default = "default_reflect_interval")]
+    pub reflect_min_interval_secs: i64,
     /// The state-prompt id harness-synthesized stimuli enter at (operator `dack say`, the
     /// boot back-online ping) — duties that carry no `entry:` of their own (MCP2-B). Defaults to
     /// the flat `perceive` prompt.
@@ -395,6 +473,34 @@ impl DackConfig {
         self.mcp_servers.iter().find(|s| s.name == name)
     }
 
+    /// The resolved trust lattice (the taint model's order + state ceilings).
+    pub fn lattice(&self) -> TrustLattice {
+        TrustLattice { tiers: self.trust_tiers.clone() }
+    }
+
+    /// The trust seed for a sensor SCRIPT (TIER-3): the tier the operator signed its `sha256(source)`
+    /// at, else `public` (an unsigned or since-edited script is untrusted code).
+    pub fn script_trust(&self, source: &[u8]) -> TrustTier {
+        self.signed_scripts
+            .get(&sha256_hex(source))
+            .cloned()
+            .unwrap_or_else(TrustTier::public)
+    }
+
+    /// The trust seed for a webhook `path` (TIER-3): the operator-registered tier, else `public`.
+    pub fn webhook_trust(&self, path: &str) -> TrustTier {
+        self.webhooks.get(path).cloned().unwrap_or_else(TrustTier::public)
+    }
+
+    /// The trust label of a secrets provider by name (for the seed `meet`), or `self` if unknown.
+    pub fn secret_trust(&self, name: &str) -> TrustTier {
+        self.secrets_providers
+            .iter()
+            .find(|p| p.name == name)
+            .map(|p| p.trust.clone())
+            .unwrap_or_else(TrustTier::self_)
+    }
+
     /// The wall's capability prefix→class map (PRD §6.3): registry tiers (`mcp__<name>__`) merged
     /// with the explicit `post_tools`/`settle_tools`. The single source of truth the responder
     /// classifies from — so declaring a server `tier: settle` is what makes its tools Settle-only.
@@ -436,39 +542,7 @@ impl DackConfig {
                 }
             }
         }
-        // Route-ceiling guards (MCP2-B): `Reflect` is harness-only and never a ceiling; and an
-        // irreversible `Settle` ceiling may be declared ONLY on a non-public route (a self/operator
-        // duty) — an untrusted public payload can never be walked to Settle even by operator typo.
-        for r in &self.routing {
-            match r.ceiling {
-                Some(ConsciousnessState::Reflect) => {
-                    return Err(DackError::Config(format!(
-                        "route {:?}/{:?}: `ceiling: reflect` is invalid — Reflect is harness-entered only",
-                        r.match_.tier, r.match_.type_
-                    )));
-                }
-                Some(ConsciousnessState::Settle)
-                    if r.match_.tier.rank() < TrustTier::SelfTier.rank() =>
-                {
-                    return Err(DackError::Config(format!(
-                        "route {:?}/{:?}: `ceiling: settle` requires a self/operator_signed route \
-                         — an untrusted ({:?}) payload may never reach the irreversible Settle",
-                        r.match_.tier, r.match_.type_, r.match_.tier
-                    )));
-                }
-                _ => {}
-            }
-        }
         Ok(())
-    }
-
-    /// The transition ceiling for a `(tier, type)` route (MCP2-B) — the highest consciousness tier a
-    /// matching chain may walk to. Defaults to reversible **Express** when the route omits `ceiling`
-    /// or no route matches (Settle is never reachable without an explicit operator opt-in).
-    pub fn ceiling_for(&self, tier: TrustTier, type_: &StimulusType) -> ConsciousnessState {
-        self.lookup_route(tier, type_)
-            .and_then(|r| r.ceiling)
-            .unwrap_or(ConsciousnessState::Express)
     }
 
     /// The MCP [`TierPolicy`] for a consciousness `state` (MCP2-B) — the operator's half of the
@@ -501,13 +575,6 @@ impl DackConfig {
         m
     }
 
-    /// Look up the routing rule for a `(payload_tier, type)` pair. Returns the first
-    /// match (operator authoring order is significant).
-    pub fn lookup_route(&self, tier: TrustTier, type_: &StimulusType) -> Option<&RoutingRule> {
-        self.routing
-            .iter()
-            .find(|r| r.match_.tier == tier && &r.match_.type_ == type_)
-    }
 }
 
 #[cfg(test)]
@@ -516,12 +583,6 @@ mod tests {
 
     const SAMPLE: &str = r#"
 operator_did: "did:key:z6MkOperator"
-routing:
-  - match: { tier: public, type: mention }
-    priority: low
-    coalesce: { mode: batch, window_sec: 300, dedup_key: thread_id }
-  - match: { tier: self, type: scheduled_post }
-    ceiling: express
 forwarded_env: [TWITTER_API_KEY, BANKR_API_KEY, BUILDER_DID_KEY, DACK_HANDLE, RATE_LIMIT]
 secrets:
   soul_did_key: "file:///run/secrets/soul_did_key"
@@ -535,7 +596,6 @@ control_plane:
     fn parses_sample_config() {
         let cfg = DackConfig::from_yaml(SAMPLE).expect("config parses");
         assert_eq!(cfg.operator_did, "did:key:z6MkOperator");
-        assert_eq!(cfg.routing.len(), 2);
         assert!(cfg.forwarded_env.contains(&"TWITTER_API_KEY".to_string()));
         // Soul key is a reference, never forwarded.
         assert!(cfg.secrets.contains_key("soul_did_key"));
@@ -554,28 +614,51 @@ control_plane:
     }
 
     #[test]
-    fn route_ceiling_defaults_to_express_and_guards_settle() {
-        let cfg = DackConfig::from_yaml(SAMPLE).unwrap();
-        // A public mention route with no explicit ceiling → reversible Express (never Settle).
-        assert_eq!(
-            cfg.ceiling_for(TrustTier::Public, &StimulusType::from("mention")),
-            ConsciousnessState::Express
+    fn trust_lattice_ranks_meets_and_reaches() {
+        let cfg = DackConfig::from_yaml(
+            "operator_did: \"x\"\ntrust_tiers:\n  - { name: public, reaches: express }\n  \
+             - { name: org, reaches: settle }\n  - { name: self, reaches: reflect }\n  \
+             - { name: operator_signed, reaches: reflect }\n",
+        )
+        .unwrap();
+        let l = cfg.lattice();
+        // Rank ascends with the list; meet (taint) returns the lower-trust tier.
+        assert!(l.rank(&TrustTier::public()) < l.rank(&TrustTier::from("org")));
+        assert!(l.rank(&TrustTier::from("org")) < l.rank(&TrustTier::self_()));
+        assert_eq!(l.meet(&TrustTier::self_(), &TrustTier::public()), TrustTier::public());
+        assert_eq!(l.meet(&TrustTier::from("org"), &TrustTier::self_()), TrustTier::from("org"));
+        // Each tier's state ceiling.
+        assert_eq!(l.reaches(&TrustTier::public()), ConsciousnessState::Express);
+        assert_eq!(l.reaches(&TrustTier::from("org")), ConsciousnessState::Settle);
+        assert_eq!(l.reaches(&TrustTier::self_()), ConsciousnessState::Reflect);
+        // An unknown tier fails SAFE: rank 0 (lowest), reaches Express (never raises a ceiling).
+        assert_eq!(l.rank(&TrustTier::from("bogus")), 0);
+        assert_eq!(l.reaches(&TrustTier::from("bogus")), ConsciousnessState::Express);
+        // The default lattice (no `trust_tiers:`) reproduces the pre-taint behavior.
+        let d = DackConfig::from_yaml("operator_did: \"x\"").unwrap().lattice();
+        assert_eq!(d.reaches(&TrustTier::self_()), ConsciousnessState::Reflect);
+        assert_eq!(d.reaches(&TrustTier::public()), ConsciousnessState::Express);
+    }
+
+    #[test]
+    fn seed_trust_from_signed_script_webhook_and_secret() {
+        use sha2::{Digest, Sha256};
+        let src = b"print('hi')\n";
+        let hash: String = Sha256::digest(src).iter().map(|b| format!("{b:02x}")).collect();
+        let yaml = format!(
+            "operator_did: \"x\"\nsigned_scripts:\n  \"{hash}\": self\nwebhooks:\n  \"/telegram/op\": self\n\
+             secrets_providers:\n  - {{ name: x, command: [echo], trust: public }}\n  - {{ name: cove, command: [echo], trust: self }}\n"
         );
-        // An unmatched (tier,type) also defaults to Express.
-        assert_eq!(
-            cfg.ceiling_for(TrustTier::Public, &StimulusType::from("token_launch")),
-            ConsciousnessState::Express
-        );
-        // A `ceiling: settle` on a PUBLIC route is rejected at validation (untrusted → never Settle).
-        let bad = "operator_did: \"x\"\nrouting:\n  - match: { tier: public, type: mention }\n    ceiling: settle\n";
-        assert!(DackConfig::from_yaml(bad).unwrap().validate_capabilities().is_err());
-        // The same ceiling on a self-tier route is allowed (the trade-duty case).
-        let ok = "operator_did: \"x\"\nrouting:\n  - match: { tier: self, type: trade_signal }\n    ceiling: settle\n";
-        let okc = DackConfig::from_yaml(ok).unwrap();
-        assert!(okc.validate_capabilities().is_ok());
-        assert_eq!(
-            okc.ceiling_for(TrustTier::SelfTier, &StimulusType::from("trade_signal")),
-            ConsciousnessState::Settle
-        );
+        let cfg = DackConfig::from_yaml(&yaml).unwrap();
+        // A SIGNED script's source hashes to its tier; an unsigned/edited script → public.
+        assert_eq!(cfg.script_trust(src), TrustTier::self_());
+        assert_eq!(cfg.script_trust(b"edited"), TrustTier::public());
+        // A registered webhook path → its tier; an unknown path → public.
+        assert_eq!(cfg.webhook_trust("/telegram/op"), TrustTier::self_());
+        assert_eq!(cfg.webhook_trust("/random"), TrustTier::public());
+        // Secret provider trust labels; an unknown provider → self (a no-op in the seed meet).
+        assert_eq!(cfg.secret_trust("x"), TrustTier::public());
+        assert_eq!(cfg.secret_trust("cove"), TrustTier::self_());
+        assert_eq!(cfg.secret_trust("nope"), TrustTier::self_());
     }
 }

@@ -29,8 +29,8 @@ use serde::Deserialize;
 use crate::error::Result;
 use crate::model::stimulus::{StimulusType, TrustTier};
 
-/// One candidate row a sensor emits on stdout (PRD §5.2). `payload_tier` is optional;
-/// the harness falls back to the stimulus definition's `default_payload_tier`.
+/// One candidate row a sensor emits on stdout (PRD §5.2). `payload_tier` is optional and may only
+/// LOWER trust: the bus clamps it down to the source-derived seed (TIER-3); absent → the seed.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SensorCandidate {
     #[serde(rename = "type")]
@@ -45,8 +45,8 @@ pub struct SensorCandidate {
 /// Whether a stimulus's script reference is honored, by the directive's trust tier
 /// (PRD §5.2/§5.3). The trusted-dir check is the caller's (the registry only registers
 /// defs from trusted repo dirs); this is the tier half.
-pub fn scripts_honored(directive_tier: TrustTier) -> bool {
-    matches!(directive_tier, TrustTier::OperatorSigned | TrustTier::SelfTier)
+pub fn scripts_honored(directive_tier: &TrustTier) -> bool {
+    *directive_tier == TrustTier::operator() || *directive_tier == TrustTier::self_()
 }
 
 #[async_trait]

@@ -11,43 +11,39 @@ use serde::{Deserialize, Serialize};
 /// source*, never by the model. The tier does not decide what the agent thinks
 /// (cognition is sovereign); it decides — as a dumb edge rule in the bus — which
 /// consciousness state a stimulus may route *toward*.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TrustTier {
-    /// RFC 9421 signature from the operator DID in the control plane. The only tier
-    /// that may precondition a Settle edge (PRD §7.6).
-    OperatorSigned,
-    /// Known DAC agent over A2A with a verifiable DID. Trusted *as that peer*, not
-    /// trusted to instruct. (Future — not wired in v1.)
-    AuthedPeer,
-    /// The duck's own scheduled wakes / Reflect-authored directives.
-    #[serde(rename = "self")]
-    SelfTier,
-    /// A tweet, a random webhook payload. Read-only (Perceive) and always delimited
-    /// as untrusted.
-    Public,
-}
+/// A trust-tier **name**. The lattice itself — which tiers exist, their rank, and the state each
+/// `reaches` — is **operator-configured** ([`crate::config::TrustLattice`]), so this is a newtype
+/// over the bare name (wire form: `public` / `self` / `operator_signed` / a custom `org`, …), not a
+/// fixed enum. Equality is by name (`tier == TrustTier::public()`); ORDER + the state ceiling come
+/// from the lattice (`lattice.rank` / `meet` / `reaches`), never from the type. The three
+/// well-known names below MUST exist in every lattice (the default provides them).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TrustTier(pub String);
 
 impl TrustTier {
-    /// Trust-privilege rank (higher = more privileged): `public < authed_peer < self <
-    /// operator_signed`. The source assigns the tier; a payload-producer (sensor) may only
-    /// **lower** it (PRD §5.7 — "the source assigns the tier, never the payload-producer").
-    pub fn rank(self) -> u8 {
-        match self {
-            TrustTier::Public => 0,
-            TrustTier::AuthedPeer => 1,
-            TrustTier::SelfTier => 2,
-            TrustTier::OperatorSigned => 3,
-        }
+    /// A tweet / a random webhook payload — the lowest default tier (read-only, always delimited
+    /// untrusted). The default lattice maps it to a reversible `Express` ceiling.
+    pub fn public() -> Self {
+        Self("public".into())
     }
+    /// The duck's own scheduled wakes / Reflect-authored directives — the clean baseline a cycle
+    /// starts at. Default lattice: reaches `Reflect`.
+    pub fn self_() -> Self {
+        Self("self".into())
+    }
+    /// An RFC 9421 signature from the operator DID — the top tier (`dack say`). The only tier that
+    /// may precondition the on-chain `allow_settle` predicate (PRD §7.6).
+    pub fn operator() -> Self {
+        Self("operator_signed".into())
+    }
+    pub fn name(&self) -> &str {
+        &self.0
+    }
+}
 
-    /// The lower-trust of two tiers — the clamp a sensor-declared tier may not exceed.
-    pub fn min_trust(self, ceiling: TrustTier) -> TrustTier {
-        if self.rank() <= ceiling.rank() {
-            self
-        } else {
-            ceiling
-        }
+impl From<&str> for TrustTier {
+    fn from(s: &str) -> Self {
+        TrustTier(s.to_string())
     }
 }
 

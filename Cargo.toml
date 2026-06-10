@@ -31,6 +31,7 @@ cron = "0.12"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 axum = "0.7"
 notify = "6"
+sha2 = "0.10"   # operator-signed sensor scripts: sha256(source) → trust tier (the taint seed)
 
 [profile.release]
 # Disposable $10 box: favour a small static binary over raw speed.

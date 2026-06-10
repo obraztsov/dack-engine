@@ -8,22 +8,37 @@
 # The trusted operator DID — provenance check for the `operator_signed` tier (PRD §5.7).
 operator_did: "did:key:z6MkOperatorReplaceMe"
 
-# Routing table (MCP2-B): (payload_tier, type) -> priority + coalesce + the transition CEILING.
-# The ENTRY state-prompt is the STIMULUS's own `entry:` (a path under prompts/); the soul owns the
-# chain from there. `ceiling` is the highest consciousness tier a chain may walk to (default
-# express). A `ceiling: settle` is the operator authority that lets a self/operator route reach the
-# irreversible Settle (guarded at load to non-public routes); `reflect` is never a ceiling.
-routing:
-  - match: { tier: public, type: mention }         # twitter-mentions → perceive, then reply
-    priority: low
-    coalesce: { mode: batch, window_sec: 300, dedup_key: thread_id }
-    secrets: [x]                                   # SENSOR/skill secret (not MCP) — operator-gated.
-  - match: { tier: public, type: feed_digest }     # twitter-feed → read the room (perceive only)
-    priority: low
-  - match: { tier: self, type: scheduled_post }    # heartbeat shitpost cadence
-    ceiling: express
-  - match: { tier: self, type: trade_signal }      # a daily bounded-loss trade duty (SETTLE-B)
-    ceiling: settle                                # operator authority: this chain MAY reach Settle
+# ── Trust lattice (the taint/IFC model, TIER-1..4) ────────────────────────────────────────────
+# The `(payload_tier, type)` routing table is GONE. A cycle's reachability ceiling is now DERIVED
+# from the trust of what it touches: it starts at a source-seeded tier (TIER-3) and ratchets DOWN
+# as it calls lower-trust capabilities (TIER-2); the accumulated tier's `reaches` is the highest
+# consciousness state it may walk to. Ranked low→high; an omitted `reaches` defaults to express; an
+# unknown tier name fails SAFE (lowest rank, reaches express — a mislabel can never RAISE a ceiling).
+# Omit this whole block to use the safe default (public→express < self→reflect < operator_signed→reflect).
+# The three well-known names (public/self/operator_signed) MUST exist in any custom lattice.
+trust_tiers:
+  - { name: public, reaches: express }             # tweets, 3rd-party MCPs — reversible only
+  - { name: self,   reaches: reflect }             # the duck's own clean cycles may even self-edit
+  # - { name: org, reaches: settle }               # example custom tier: a trusted peer/org → may trade
+  - { name: operator_signed, reaches: reflect }
+
+# Reflect rate-limit (TIER-4): minimum seconds between self-modification (Reflect) runs — enforced
+# by the harness clock for BOTH the scheduled Reflect and any transition-reached one (persisted via a
+# `reflect:last` queue cursor). The cadence half of the I6 guarantee; the taint ceiling is the other
+# half. `0` disables. Default 1 day.
+reflect_min_interval_secs: 86400
+
+# Operator-signed sensor scripts (the taint SEED, TIER-3): sha256(source-hex) -> trust tier. This is
+# operator code-review-as-signing — the agent authors a sensor, the operator reviews the EXACT bytes
+# and signs the hash. A sensor whose source hashes to a listed entry seeds its cycle at that tier; an
+# unsigned (or since-edited) script seeds `public`. Provenance seeds trust, NEVER agent frontmatter (I18).
+# signed_scripts:
+#   "<sha256 of fetch_mentions.py>": public        # a public-world poller, reviewed + pinned by hash
+
+# Per-webhook trust (TIER-3): a registered webhook path -> the tier its payload is trusted at. An
+# unlisted path seeds `public`.
+# webhooks:
+#   "/telegram/op": self                           # an operator-only Telegram channel → self-trusted
 
 # Entry state-prompt for harness-synthesized stimuli (back-online ping, `dack say`).
 default_entry: perceive
@@ -48,6 +63,9 @@ forwarded_env: [BANKR_API_KEY, BUILDER_DID_KEY, DACK_HANDLE, RATE_LIMIT]
 # in its `secrets:` list; the harness runs the script and injects its JSON output into ONLY
 # that duty's sensor. Adding a new secret (cove.trade, …) is a new entry here + a script —
 # never a harness change. The provider holds the ROOT creds; the sensor only sees the bearer.
+# `trust:` is the taint label of the DATA the secret puts in play (TIER-3): a sensor using it seeds
+# its cycle at (at most) this tier. Default `self`. CRITICAL: a secret that touches the PUBLIC world
+# (the X bearer) MUST be `trust: public` — else a tweet cycle would wrongly be allowed to trade/self-edit.
 secrets_providers:
   - name: x                                    # twitter duties declare `secrets: [x]`
     command: ["python3", "secrets-providers/x_oauth2.py"]
@@ -55,10 +73,12 @@ secrets_providers:
       X_CREDS_FILE: "agentdack.rw.x.txt"       # gitignored OAuth2 bootstrap creds (RW)
       X_TOKEN_STORE: "agentdack.rw.x.txt.tokens.json"   # rotated tokens (gitignored, 0600)
     keys: [X_BEARER_TOKEN]
-  # - name: cove                               # future: cove.trade trading key, same shape
-  #   command: ["python3", "secrets-providers/cove.py"]
-  #   env: { COVE_KEY_FILE: "cove.key.txt" }
-  #   keys: [COVE_API_KEY]
+    trust: public                              # the X bearer fetches/posts the PUBLIC world → caps at Express
+  - name: cove                                 # cove.trade key (static bearer from a gitignored file)
+    command: ["python3", "secrets-providers/file_token.py"]
+    env: { TOKEN_KEY: COVE_TOKEN, TOKEN_FILE: "secrets/cove.token" }
+    keys: [COVE_TOKEN]
+    trust: self                                # the operator's OWN wallet — no contamination
 
 # References only — values live in a separate store the YAML never inlines, so config
 # is inspectable without exposing keys. The Soul DID key is harness-only (never forwarded).
@@ -72,8 +92,9 @@ control_plane:
   whitelist: []
   allowed_action_types: []
 
-# Cron for the harness-entered Reflect run (PRD §4.2). The ONLY scheduled way in;
-# no consciousness state can transition into Reflect. Omit for manual `dack reflect-now`.
+# Cron for the scheduled Reflect run (PRD §4.2). Reflect is ALSO reachable via a transition — but
+# only from an UNCONTAMINATED cycle whose trust tier `reaches: reflect`, and rate-limited by
+# `reflect_min_interval_secs` above (TIER-4). Omit for manual `dack reflect-now`.
 reflect_schedule: "0 4 * * *"           # nightly 04:00 — "sleep-with-dreams"
 
 # Where the harness runs (Phase 3). All optional — these are the defaults.
@@ -132,19 +153,35 @@ invoke_timeout_secs: 300
 # for an endpoint that serves its full surface to every token: cove returns all 37 tools (incl.
 # buy_token) on the read-only token, so `cove-read` MUST whitelist only the read tools, with the
 # trade tools living on the `cove-trading` (settle) sibling. Empty/omitted = expose everything.
+# `trust:` is the taint label (TIER-2) — distinct from the capability `tier`: CALLING a tool from
+# this server degrades the cycle to (at most) this tier, capping how far the chain may then walk.
+# CRITICAL: anything touching the PUBLIC world (twitter, rootai, x) MUST be `trust: public`, or a
+# tweet cycle would wrongly keep enough trust to trade or self-edit. cove → `self` (the operator's
+# own wallet, no contamination). A soul-INLINED MCP isn't in this registry, so it taints `public`.
 mcp_servers:
   - name: twitter
     transport: { type: stdio, command: bun, args: [run, openclaude-bridge/twitter-mcp.ts] }
     auth: { secret: x, env: X_BEARER_TOKEN }
     tier: post
-  - name: cove-read       # remote http MCP — monitoring (read-only token)
+    trust: public           # touches the public timeline → floors the cycle to an Express ceiling
+  - name: rootai            # example: a 3rd-party market-signals read MCP (public data)
+    transport: { type: http, url: "https://rootai.example/api/mcp" }
+    tier: read
+    trust: public           # 3rd-party signals are untrusted → Express ceiling
+  - name: cove-read         # remote http MCP — monitoring (read-only token)
     transport: { type: http, url: "https://staging.cove.trade/api/mcp" }   # cove enabled MCP on staging
     auth: { secret: cove_read }     # → Authorization: Bearer <token>; header/scheme overridable
     tier: read
+    trust: self             # the operator's OWN wallet data → no degradation (could still reach Reflect)
     tools: [get_balance, get_positions, search_tokens, get_token_info, get_token_stats,
             get_price_history, get_token_security_report, scan_trending_tokens, simulate_swap]  # read subset
-  - name: cove-trading    # remote http MCP — IRREVERSIBLE trading (read-write token); Settle only
+  - name: cove-trading      # remote http MCP — IRREVERSIBLE trading (read-write token); Settle only
     transport: { type: http, url: "https://staging.cove.trade/api/mcp" }
     auth: { secret: cove_trade }
     tier: settle
+    trust: self             # the operator's own wallet — a clean trade cycle
     tools: [simulate_swap, buy_token, sell_token, create_limit_buy, cancel_limit_order]  # trade subset
+  # - name: dac-cloud       # example: a trusted peer/org MCP, labelled at a custom `org` trust tier
+  #   transport: { type: http, url: "https://dac-cloud.example/api/mcp" }
+  #   tier: read
+  #   trust: org            # needs a matching `org` entry in `trust_tiers:` above (reaches: settle)

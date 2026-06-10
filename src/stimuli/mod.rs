@@ -37,8 +37,6 @@ pub enum Trigger {
 pub struct Emits {
     #[serde(rename = "type")]
     pub type_: StimulusType,
-    /// Tier carried by sensor output items unless a candidate overrides it.
-    pub default_payload_tier: TrustTier,
 }
 
 /// Cross-poll dedup cursor (PRD §10.2) — a monotonic **watermark** the harness persists in the
@@ -145,7 +143,7 @@ impl StimulusDef {
     /// The trusted-*dir* half is enforced at registration (only trusted repo dirs are
     /// walked); this is the tier half (PRD §5.2/§5.3).
     pub fn sensor_honored(&self) -> bool {
-        crate::sensor::scripts_honored(self.frontmatter.directive_tier)
+        crate::sensor::scripts_honored(&self.frontmatter.directive_tier)
     }
 
     /// Absolute path to this duty's sensor executable, if it declares one **and** its
@@ -282,9 +280,8 @@ selective; skip low-quality bait.
     fn parses_the_clarity_reply_guy_duty() {
         let def = StimulusDef::parse(CLARITY, "stimuli/clarity-reply-guy/STIMULUS.md").unwrap();
         assert_eq!(def.frontmatter.id, "clarity-reply-guy");
-        assert_eq!(def.frontmatter.directive_tier, TrustTier::SelfTier);
+        assert_eq!(def.frontmatter.directive_tier, TrustTier::self_());
         assert_eq!(def.frontmatter.emits.type_, StimulusType::from("clarity_post"));
-        assert_eq!(def.frontmatter.emits.default_payload_tier, TrustTier::Public);
         assert!(matches!(def.frontmatter.trigger, Trigger::Cron { .. }));
         assert!(def.frontmatter.sensor.is_some());
         // self-tier directive → sensor honored.

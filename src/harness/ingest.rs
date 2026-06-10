@@ -102,7 +102,43 @@ impl Ingestor {
             }
         }
 
-        self.bus.ingest(&def, candidates, now).await
+        // The cycle's PAYLOAD trust seed (TIER-3): derived from the SOURCE (a signed sensor script
+        // met with its sensor-secret tiers, a registered webhook tier, or a pure-cron `self`). The
+        // bus clamps each candidate's tier down to it (a sensor may only LOWER trust).
+        let payload_seed = self.payload_seed(&def).await;
+        self.bus.ingest(&def, candidates, now, payload_seed).await
+    }
+
+    /// Derive a duty's payload trust seed from its source (TIER-3, invariant I18 — provenance seeds
+    /// trust, never agent-asserted frontmatter):
+    /// - a sensor SCRIPT → `config.script_trust(sha256(source))` (operator-signed, else `public`),
+    ///   met with each declared sensor-secret's trust (so a script signed `self` that fetches via a
+    ///   `public` secret seeds `public` — code-integrity and data-trust met together);
+    /// - a webhook trigger → `config.webhook_trust(path)` (operator-registered, else `public`);
+    /// - a pure-cron self-prompt (no sensor) → `self` (the duck's own trusted directive).
+    async fn payload_seed(
+        &self,
+        def: &crate::stimuli::StimulusDef,
+    ) -> crate::model::stimulus::TrustTier {
+        use crate::model::stimulus::TrustTier;
+        use crate::stimuli::Trigger;
+        match def.resolved_sensor(&self.repo_root) {
+            Some(exe) => {
+                let mut t = match tokio::fs::read(&exe).await {
+                    Ok(src) => self.config.script_trust(&src),
+                    Err(_) => TrustTier::public(), // can't read the source → assume untrusted.
+                };
+                let lat = self.config.lattice();
+                for secret in &def.frontmatter.secrets {
+                    t = lat.meet(&t, &self.config.secret_trust(secret));
+                }
+                t
+            }
+            None => match &def.frontmatter.trigger {
+                Trigger::Webhook { path } => self.config.webhook_trust(path),
+                Trigger::Cron { .. } => TrustTier::self_(),
+            },
+        }
     }
 
     /// Drain the unified `FiredTrigger` channel forever. A failed duty is a logged line,

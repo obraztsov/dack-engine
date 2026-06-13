@@ -100,6 +100,7 @@ async fn main() -> anyhow::Result<()> {
         "openclaude-bridge",
         env,
         std::env::var("DACK_MODEL").ok(),
+        std::env::var("CLAUDE_CODE_USE_OPENAI").is_ok(), // gateway → model via OPENAI_MODEL env
         std::time::Duration::from_secs(300),
     );
 

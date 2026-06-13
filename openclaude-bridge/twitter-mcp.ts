@@ -5,8 +5,9 @@
  * to Express; the Rust wall still gates every call via the bridge's `canUseTool`.
  *
  * The bearer is `X_BEARER_TOKEN` (injected by the harness ONLY for routes whose `secrets: [x]`
- * grant it). `DACK_TWITTER_DRY_RUN=1` composes without posting — first-run safety for an
- * irreversible outward action. stdout is the MCP protocol channel: NEVER log to it — use stderr.
+ * grant it). Dry-run is enforced at the **Rust wall** (`config.dry_run`), which denies the post call
+ * before it reaches here — so this server always posts for real when actually invoked. stdout is the
+ * MCP protocol channel: NEVER log to it — use stderr.
  */
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
@@ -15,10 +16,6 @@ import { z } from 'zod'
 async function xPostTweet(body: Record<string, unknown>): Promise<unknown> {
   const token = process.env.X_BEARER_TOKEN
   if (!token) return { ok: false, error: 'X_BEARER_TOKEN not set — no act-secret was injected for this route' }
-  if (process.env.DACK_TWITTER_DRY_RUN === '1') {
-    console.error('[twitter-mcp] DRY RUN — would post:', JSON.stringify(body))
-    return { ok: true, dry_run: true, would_post: body }
-  }
   const r = await fetch('https://api.twitter.com/2/tweets', {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },

@@ -240,7 +240,8 @@ impl Harness {
         let mut step = StepInput::Entry;
         let mut hops = 0usize;
         loop {
-            let (out, runlog_ref, accessed) = self.run_step(&current, &step, &stimulus, ceiling).await?;
+            let (out, runlog_ref, accessed) =
+                self.run_step(&current, &step, &stimulus, &cycle_trust, ceiling).await?;
             // Taint by ACTUAL access: degrade the cycle trust by what this step actually called,
             // then recompute the ceiling the NEXT transition is checked against (monotonic, I17).
             if let Some(a) = accessed {
@@ -321,6 +322,7 @@ impl Harness {
         prompt: &StatePrompt,
         step: &StepInput,
         stimulus: &Stimulus,
+        cycle_trust: &TrustTier,
         ceiling: ConsciousnessState,
     ) -> Result<(AgentOutput, String, Option<TrustTier>)> {
         let spec = default_spec(prompt.state);
@@ -333,16 +335,23 @@ impl Harness {
         // even an offered hop (enforced post-step in `dispatch`).
         let reachable = self.reachable_transitions(prompt, ceiling).await;
 
-        let blocks = match step {
+        // ORIENTATION first (where am I · what may I do here · what's plugged · how far this cycle
+        // walks) — grounds the model so it stops guessing paths / out-of-scope tools. Then the
+        // state's own context (directive+payload, or the digested Baton). Then allowed transitions.
+        let mut blocks = vec![orientation_block(
+            prompt,
+            &self.soul_root(),
+            &mcp_servers,
+            cycle_trust,
+            ceiling,
+        )];
+        match step {
             // ENTRY: directive (trusted) + payload (untrusted) kept SEPARATE + memory + runlog.
-            StepInput::Entry => {
-                let mut blocks = self.entry_blocks(stimulus).await;
-                blocks.push(transitions_block(&reachable));
-                blocks
-            }
+            StepInput::Entry => blocks.extend(self.entry_blocks(stimulus).await),
             // ACT: the agent's own digested product + harness-trusted refs — NOT raw bytes.
-            StepInput::Act(baton) => vec![baton_block(baton), transitions_block(&reachable)],
-        };
+            StepInput::Act(baton) => blocks.push(baton_block(baton)),
+        }
+        blocks.push(transitions_block(&reachable));
         // The agent never receives a raw secret env (TIER-4): capability tokens are injected into
         // the MCP transport server-side, never the agent's context. Sensor secrets live in ingest.
         let secret_env = BTreeMap::new();
@@ -636,6 +645,8 @@ impl Harness {
         let mut responder =
             StatePolicyResponder::with_capabilities(spec, p.post, p.settle).with_repo_root(self.soul_root());
         responder.read_tools = p.read;
+        // Dry-run (testing): the wall denies these tool prefixes so the agent composes-but-doesn't-execute.
+        responder.dry_run_block = self.config.dry_run.active_block();
         RecordingResponder::wrap(responder)
     }
 
@@ -879,6 +890,43 @@ enum StepInput {
     Act(Baton),
 }
 
+/// The harness-authored **ORIENTATION** block (trusted) — ONLY the live, derived facts for this
+/// step (never instruction prose; SOUL.md owns the how-to-operate text). Variables the model can't
+/// read from a file: the working dir, the capabilities actually plugged here, and the cycle's
+/// trust → reachable ceiling. Keeps text in the soul repo and the harness to "fill in the blanks."
+fn orientation_block(
+    prompt: &StatePrompt,
+    soul_root: &std::path::Path,
+    mcp_servers: &BTreeMap<String, serde_json::Value>,
+    cycle_trust: &TrustTier,
+    ceiling: ConsciousnessState,
+) -> ContextBlock {
+    let caps = if mcp_servers.is_empty() {
+        "none this step (built-in file tools only)".to_string()
+    } else {
+        mcp_servers
+            .keys()
+            .map(|n| format!("mcp__{n}__*"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    // Live facts only — SOUL.md says how to use them (navigation, the one-outward-action rule, …).
+    let body = format!(
+        "state: {:?} (prompt `{}`)\n\
+         working_dir: {}\n\
+         capabilities_this_step: {}\n\
+         cycle_trust: {} -> may reach up to: {:?}\n\
+         next_steps: see the allowed-transitions block.",
+        prompt.state,
+        prompt.id,
+        soul_root.display(),
+        caps,
+        cycle_trust.name(),
+        ceiling,
+    );
+    ContextBlock { label: "orientation".into(), body, trusted: true }
+}
+
 /// Render a [`Baton`] as the act-step context block — the agent's own digested product + the
 /// harness-derived refs (e.g. `source_tweet_id`), NOT raw untrusted bytes. `payload_tier` rides
 /// along so the act state stays skeptical (PRD §6.4).
@@ -959,7 +1007,8 @@ fn build_mcp_config(server: &McpServerConfig, token: Option<&str>) -> serde_json
             // `twitter-mcp.ts`) are absolutized here.
             let args: Vec<String> = args.iter().map(|a| absolutize_arg(a)).collect();
             let mut env = serde_json::Map::new();
-            for k in ["PATH", "HOME", "DACK_TWITTER_DRY_RUN"] {
+            // Dry-run is enforced at the WALL now (config.dry_run), not via a per-server env.
+            for k in ["PATH", "HOME"] {
                 if let Ok(v) = std::env::var(k) {
                     env.insert(k.to_string(), json!(v));
                 }
@@ -1240,6 +1289,7 @@ mod tests {
                 cwd: None,
                 env,
                 model: None,
+                model_via_env: false,
                 sandbox: Arc::new(crate::sandbox::HostSandbox),
                 policy: crate::sandbox::IsolationPolicy::host_passthrough(),
                 timeout: std::time::Duration::from_secs(30),
@@ -2101,13 +2151,13 @@ mod tests {
 
         // perceive: the soul's `model:` is honored (override allowed).
         let p = prompt(ConsciousnessState::Perceive, "frontier-x");
-        harness.run_step(&p, &StepInput::Entry, &stim, ConsciousnessState::Reflect).await.unwrap();
+        harness.run_step(&p, &StepInput::Entry, &stim, &TrustTier::self_(), ConsciousnessState::Reflect).await.unwrap();
         // express: the soul's `model:` is IGNORED (locked) — the operator default stands.
         let e = prompt(ConsciousnessState::Express, "sneaky-upgrade");
-        harness.run_step(&e, &StepInput::Entry, &stim, ConsciousnessState::Reflect).await.unwrap();
+        harness.run_step(&e, &StepInput::Entry, &stim, &TrustTier::self_(), ConsciousnessState::Reflect).await.unwrap();
         // settle: no policy → None (→ the client's configured model).
         let s = prompt(ConsciousnessState::Settle, "nope");
-        harness.run_step(&s, &StepInput::Entry, &stim, ConsciousnessState::Reflect).await.unwrap();
+        harness.run_step(&s, &StepInput::Entry, &stim, &TrustTier::self_(), ConsciousnessState::Reflect).await.unwrap();
 
         let seen = runtime.seen.lock().unwrap();
         assert_eq!(seen[0].model.as_deref(), Some("frontier-x"), "override honored on an open tier");

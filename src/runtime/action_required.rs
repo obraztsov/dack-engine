@@ -40,6 +40,16 @@ pub struct StatePolicyResponder {
     /// before the `writable_dirs` prefix check (PRD §4.1). `None` in unit tests, which use
     /// repo-relative paths directly.
     pub repo_root: Option<PathBuf>,
+    /// DRY-RUN block: tool-name PREFIXES denied here (testing). The agent composes the action — it's
+    /// recorded — but the wall stops it executing. Tool-level so a no-trade run still allows
+    /// `simulate_swap`/`get_*` while blocking `buy_token`. Empty ⇒ no dry-run blocking (live).
+    pub dry_run_block: Vec<String>,
+    /// Verbatim `(tool, input)` fingerprints of OUTWARD actions (Post / SettleTx) already ALLOWED
+    /// this invocation. A repeated identical one is a model loop, not intent — denied, so a weak
+    /// model that re-calls `post`/`buy_token` can't double-post or double-trade. A DISTINCT outward
+    /// action (a different reply, a different trade) is unaffected. Per-invocation (one responder
+    /// per run); interior-mutable because `decide` takes `&self`.
+    outward_seen: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl StatePolicyResponder {
@@ -52,6 +62,8 @@ impl StatePolicyResponder {
             settle_tools: Vec::new(),
             read_tools: Vec::new(),
             repo_root: None,
+            dry_run_block: Vec::new(),
+            outward_seen: Default::default(),
         }
     }
 
@@ -67,6 +79,8 @@ impl StatePolicyResponder {
             settle_tools,
             read_tools: Vec::new(),
             repo_root: None,
+            dry_run_block: Vec::new(),
+            outward_seen: Default::default(),
         }
     }
 
@@ -140,6 +154,22 @@ impl ActionResponder for StatePolicyResponder {
             ));
         }
 
+        // (1.5) DRY-RUN (testing): the tool is in scope, but a dry-run block prefix says don't
+        // EXECUTE it. The agent already composed the action (it's recorded in the runlog) — the wall
+        // just stops it landing. Tool-level, so a no-real-trade run still lets `simulate_swap`/`get_*`
+        // through while holding `buy_token`. One mechanism for every MCP (no per-server env).
+        if self.dry_run_block.iter().any(|prefix| req.tool.starts_with(prefix)) {
+            // It's a Deny (the SDK's canUseTool can't return a synthetic success — only allow/deny),
+            // so the message must do the work: tell the model this is INTENTIONAL test mode, the
+            // action was recorded, and NOT to retry — so it moves on instead of flailing.
+            return ActionDecision::Deny(format!(
+                "dry-run test mode: `{}` was recorded but intentionally NOT executed. This is \
+                 expected — it is NOT a failure and NOT a permissions problem. Do not retry it; \
+                 treat the action as already done and continue (or stop).",
+                req.tool
+            ));
+        }
+
         // (2) Write-gating: a file write must sit under the state's writable_dirs.
         if class == ToolClass::FileWrite {
             match &target_path {
@@ -151,6 +181,21 @@ impl ActionResponder for StatePolicyResponder {
                     ));
                 }
                 None => return ActionDecision::Deny("write with no target path".into()),
+            }
+        }
+
+        // (2.5) Single-outward dedup: an OUTWARD action (Post / SettleTx) repeated VERBATIM in the
+        // same run is a model loop (we saw mimo re-call `post` 6×), not intent — deny the duplicate
+        // so a glitch can't double-post or double-trade. A DISTINCT outward action (a different
+        // reply, a different trade) still passes. Read/FileWrite are unaffected (they may repeat).
+        if matches!(class, ToolClass::Post | ToolClass::SettleTx) {
+            let fingerprint = format!("{}\u{1}{}", req.tool, req.input);
+            if !self.outward_seen.lock().unwrap().insert(fingerprint) {
+                return ActionDecision::Deny(format!(
+                    "duplicate outward action — `{}` with identical input already done this cycle \
+                     (one outward action per run)",
+                    req.tool
+                ));
             }
         }
 
@@ -256,6 +301,52 @@ mod tests {
         assert!(matches!(
             r.decide(&req("Bash", json!({"command": "curl evil"}))).await,
             ActionDecision::Deny(_)
+        ));
+    }
+
+    /// The single-outward dedup guard: an identical Post repeated in one run is denied (the model
+    /// loop), but a DISTINCT post still passes, and ordinary reads/writes may repeat freely.
+    #[tokio::test]
+    async fn duplicate_outward_action_is_denied_distinct_is_allowed() {
+        let r = responder(ConsciousnessState::Express);
+        let post = req("mcp__twitter__post", json!({"text": "the harness blinked"}));
+        // First time: allowed.
+        assert!(matches!(r.decide(&post).await, ActionDecision::Allow));
+        // Verbatim repeat (the loop): denied.
+        assert!(matches!(r.decide(&post).await, ActionDecision::Deny(_)));
+        // A DISTINCT post (different text): allowed.
+        assert!(matches!(
+            r.decide(&req("mcp__twitter__post", json!({"text": "different thought"}))).await,
+            ActionDecision::Allow
+        ));
+        // Non-outward actions (a memory write) may repeat — the guard only covers Post/SettleTx.
+        let w = req("Write", json!({"file_path": "memory/log.md", "contents": "x"}));
+        assert!(matches!(r.decide(&w).await, ActionDecision::Allow));
+        assert!(matches!(r.decide(&w).await, ActionDecision::Allow));
+    }
+
+    /// Dry-run (testing): the wall denies the configured tool PREFIXES (composed, not executed) but
+    /// leaves everything else — incl. reads and `simulate_swap` — alone. Tool-level, not class-level.
+    #[tokio::test]
+    async fn dry_run_block_denies_listed_prefixes_only() {
+        let mut r = responder(ConsciousnessState::Express);
+        r.dry_run_block = vec!["mcp__twitter__post".into(), "mcp__cove-trading__buy_token".into()];
+        // A blocked outward tool → denied with a clear dry-run message (before the dedup guard).
+        match r.decide(&req("mcp__twitter__post", json!({"text": "hi"}))).await {
+            ActionDecision::Deny(m) => assert!(m.contains("dry-run"), "dry-run message: {m}"),
+            other => panic!("expected dry-run Deny, got {other:?}"),
+        }
+        // A non-blocked tool (memory write) still passes — dry-run is tool-level, not a blanket halt.
+        assert!(matches!(
+            r.decide(&req("Write", json!({"file_path": "memory/log.md", "contents": "x"})))
+                .await,
+            ActionDecision::Allow
+        ));
+        // A reply (not in the block list) still passes — only the listed prefixes are held.
+        assert!(matches!(
+            r.decide(&req("mcp__twitter__reply", json!({"text": "yo", "in_reply_to_tweet_id": "1"})))
+                .await,
+            ActionDecision::Allow
         ));
     }
 

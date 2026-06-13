@@ -90,6 +90,11 @@ pub struct OpenClaudeClient {
     pub env: HashMap<String, String>,
     /// Model id passed to the SDK (e.g. `mimo-v2.5-pro`); `None` = bridge/provider default.
     pub model: Option<String>,
+    /// The **connector's model channel** (set from `config.runtime.connector`): `true` routes the
+    /// per-invocation model via the child's `OPENAI_MODEL` env (an OpenAI-compatible gateway, which
+    /// rejects a gateway name as `options.model`); `false` routes it via `options.model` (the
+    /// Anthropic catalog). Replaces the former `CLAUDE_CODE_USE_OPENAI` env-sniff.
+    pub model_via_env: bool,
     /// Isolation backend for the bridge process (default [`HostSandbox`]). Under a container
     /// backend the **soul repo (`workdir`) is mounted as a writable volume** so the agent's
     /// memory/skill writes land while the rest of the box stays out of reach.
@@ -107,6 +112,7 @@ impl OpenClaudeClient {
         bridge_dir: impl Into<PathBuf>,
         env: HashMap<String, String>,
         model: Option<String>,
+        model_via_env: bool,
         timeout: Duration,
     ) -> Self {
         Self {
@@ -114,6 +120,7 @@ impl OpenClaudeClient {
             cwd: Some(bridge_dir.into()),
             env,
             model,
+            model_via_env,
             sandbox: Arc::new(HostSandbox),
             policy: IsolationPolicy::host_passthrough(),
             timeout,
@@ -139,6 +146,26 @@ impl OpenClaudeClient {
     }
 }
 
+/// Route the effective per-invocation model to the channel the engine reads, returning
+/// `(openai_model_env, options_model)`. On an **OpenAI-compatible gateway** (`CLAUDE_CODE_USE_OPENAI`
+/// set) the SDK takes the model from the `OPENAI_MODEL` env and REJECTS a gateway name passed as
+/// `options.model` against its Anthropic catalog — so the model goes to `OPENAI_MODEL` and
+/// `options.model` stays `None`. On the **Anthropic catalog** path it's the reverse. The effective
+/// model is the per-invocation override (8.7) if present, else the client's configured default.
+/// (Pure + total so the routing is unit-testable without spawning the bridge.)
+fn resolve_model_env(
+    openai_mode: bool,
+    req_model: Option<&str>,
+    self_model: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let effective = req_model.or(self_model).map(str::to_string);
+    if openai_mode {
+        (effective, None)
+    } else {
+        (None, effective)
+    }
+}
+
 #[async_trait]
 impl RuntimeClient for OpenClaudeClient {
     async fn invoke(
@@ -154,6 +181,16 @@ impl RuntimeClient for OpenClaudeClient {
         let mut env: std::collections::BTreeMap<String, String> =
             self.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         env.extend(req.secret_env.clone());
+        // Per-invocation model (8.7) routed to the channel the engine actually reads (see
+        // [`resolve_model_env`]): on an OpenAI-compatible gateway the resolved model goes to the
+        // child's `OPENAI_MODEL` env (the SDK rejects a gateway name as `options.model`); on the
+        // Anthropic catalog it goes to `options.model`. The channel is the connector's choice
+        // (`config.runtime.connector`), set at construction — no longer sniffed from the env.
+        let (openai_model_env, options_model) =
+            resolve_model_env(self.model_via_env, req.model.as_deref(), self.model.as_deref());
+        if let Some(m) = &openai_model_env {
+            env.insert("OPENAI_MODEL".to_string(), m.clone());
+        }
         let spec = ProcessSpec {
             command: self.command.clone(),
             cwd: self.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
@@ -199,8 +236,8 @@ impl RuntimeClient for OpenClaudeClient {
             user_prompt: Self::render_blocks(&req.blocks),
             disallowed_tools: ALWAYS_DISALLOWED.iter().map(|s| s.to_string()).collect(),
             allowed_tools: None,
-            // Per-invocation override (8.7) wins; else the client's configured default.
-            model: req.model.as_deref().or(self.model.as_deref()),
+            // Catalog path only — None on the gateway (the model went via OPENAI_MODEL above).
+            model: options_model.as_deref(),
             cwd: req.workdir.as_deref().and_then(|p| p.to_str()),
             mcp_servers: &req.mcp_servers,
         };
@@ -286,6 +323,29 @@ mod tests {
     use crate::state::{default_spec, ConsciousnessState};
     use std::sync::Mutex;
 
+    /// The model-routing split (8.7 + the gateway fix): on a gateway the resolved model must go to
+    /// the `OPENAI_MODEL` env (NOT `options.model`, which the SDK rejects); on the catalog, reverse.
+    #[test]
+    fn resolve_model_env_routes_by_engine() {
+        // Gateway: per-invocation override → OPENAI_MODEL; options.model stays None.
+        assert_eq!(
+            resolve_model_env(true, Some("xiaomi/mimo-v2.5-pro"), Some("nvidia/nemotron:free")),
+            (Some("xiaomi/mimo-v2.5-pro".into()), None)
+        );
+        // Gateway, no per-state override → the client default goes to OPENAI_MODEL.
+        assert_eq!(
+            resolve_model_env(true, None, Some("nvidia/nemotron:free")),
+            (Some("nvidia/nemotron:free".into()), None)
+        );
+        // Catalog (Anthropic): the model goes to options.model; OPENAI_MODEL untouched.
+        assert_eq!(
+            resolve_model_env(false, Some("claude-haiku-4-5"), None),
+            (None, Some("claude-haiku-4-5".into()))
+        );
+        // Nothing configured → nothing on either channel (the engine's own default stands).
+        assert_eq!(resolve_model_env(true, None, None), (None, None));
+    }
+
     /// A recording responder: captures every tool it was asked about, returns a fixed verdict.
     struct Recorder {
         asked: Mutex<Vec<String>>,
@@ -323,6 +383,7 @@ mod tests {
             cwd: None,
             env,
             model: None,
+            model_via_env: false,
             sandbox: Arc::new(HostSandbox),
             policy: IsolationPolicy::host_passthrough(),
             timeout: Duration::from_secs(30),

@@ -49,6 +49,7 @@ async fn main() -> anyhow::Result<()> {
         "openclaude-bridge",
         env,
         model,
+        std::env::var("CLAUDE_CODE_USE_OPENAI").is_ok(), // gateway → model via OPENAI_MODEL env
         std::time::Duration::from_secs(300),
     );
 

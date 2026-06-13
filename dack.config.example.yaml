@@ -106,19 +106,33 @@ soul_repo: "."                          # the actor bundle on the box (holds sti
 db_path: "dack.sqlite"                  # embedded SQLite queue (ephemeral; losing it loses only the queue)
 webhook_addr: "127.0.0.1:8787"          # localhost-only webhook listener (nothing public without a proxy)
 
-# Runtime bridge (Phase 4): the harness spawns `bun run bridge.ts` in this project per
-# invocation and drives it over stdio; the wall stays in the Rust responder. The bridge is a
-# small TS project that depends on `@gitlawb/openclaude` from npm (run `bun install` there).
-bridge_dir: "openclaude-bridge"
-# model: leave UNSET for an OpenAI-compatible gateway (opengateway/mimo, Ollama, …) — set the
-# model via OPENAI_MODEL in the env instead. `model:` here is only for SDK-catalog (Anthropic)
-# models; a gateway name passed as options.model is rejected by the SDK's model catalog.
-# model: "claude-haiku-4-5"
-# Env var NAMES forwarded into the bridge (values come from the harness env, never the YAML).
-# For opengateway: export CLAUDE_CODE_USE_OPENAI=1  OPENAI_API_KEY=ogw_live_…  OPENAI_BASE_URL=https://opengateway.gitlawb.com/v1  OPENAI_MODEL=mimo-v2.5-pro
-# CLAUDE_CODE_USE_OPENAI=1 is REQUIRED to use the gateway — without it the SDK falls back to
-# ambient Anthropic/Claude auth (verified Phase 6). A reasoning model (mimo) is slow (~30–60s/state).
-runtime_env: [OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL, CLAUDE_CODE_USE_OPENAI]
+# ── Runtime: the engine + connector extensibility point (Phase 4) ────────────────────────────────
+# Both `engine` and `connector` are tagged by `type`, with their own config inline:
+# `engine`    — which agent runtime drives the loop. WIRED: openclaude (spawns `bun run bridge.ts`,
+#               which depends on `@gitlawb/openclaude` from npm — run `bun install` in bridge_dir).
+#               STUB: claude-code (the Claude Code CLI/SDK directly, for corporate prod).
+# `connector` — how the engine reaches models. WIRED: opengateway (OpenAI-compatible → the per-state
+#               model is routed via the child's OPENAI_MODEL env; the SDK rejects a gateway name as
+#               options.model). The connector carries the endpoint + (optionally, in this gitignored
+#               config) the api_key — injected into the bridge env, NEVER the agent context. STUB:
+#               anthropic (native catalog → options.model). bedrock/vertex/… later.
+# `model`     — the DEFAULT model; tier_policy.<tier>.model overrides it per state (the model split).
+# `env`       — extra env var NAMES forwarded into the runtime (values from the harness env, never
+#               YAML); the connector's own creds are applied on top.
+runtime:
+  engine:
+    type: openclaude
+    bridge_dir: openclaude-bridge
+  connector:
+    type: opengateway
+    api_url: https://opengateway.gitlawb.com/v1     # → OPENAI_BASE_URL (omit to take it from env)
+    api_key: ogw_live_…                              # → OPENAI_API_KEY (gitignored config only; omit → env)
+  model: nvidia/nemotron-3-ultra-550b-a55b:free      # the cheap/default; overridden per state below
+  # env: [SOME_OTHER_VAR]                            # only extras; the connector provides OPENAI_* itself
+# The opengateway connector sets CLAUDE_CODE_USE_OPENAI=1 + OPENAI_BASE_URL/OPENAI_API_KEY itself, so
+# you need NOT export them. (Leave api_url/api_key out to fall back to the daemon env instead.) A
+# reasoning model is slow (~30–60s/state). To run native Anthropic, use connector: { type: anthropic,
+# api_key: … } + an SDK-catalog `model` (e.g. claude-haiku-4-5) — once that connector is wired.
 
 # ── Soul repo + identity (Phase 7: durable, signed, off-VPS) ──────────────────────────────
 # `gl` identity DIRECTORIES per role (each holds identity.pem + ucan.json). The Soul dir signs
@@ -139,6 +153,19 @@ gitlawb_node: "https://node.gitlawb.com"
 # Wall-clock budget (seconds) for one consciousness invocation incl. the wall round-trips. A hung
 # LLM/bridge elapses here → a logged Runtime error → dispatch continues (never a frozen loop).
 invoke_timeout_secs: 300
+
+# Dry-run (testing/debug): when enabled, the WALL denies any tool whose name starts with a `block`
+# prefix — the agent composes the action (recorded in the runlog) but it never executes. Tool-level,
+# uniform across every MCP (twitter, cove, …), so a no-real-trade run can still allow `simulate_swap`
+# and reads while holding `buy_token`. Default disabled (live). Example:
+# dry_run:
+#   enabled: true
+#   block: [mcp__twitter__post, mcp__twitter__reply, mcp__cove-trading__buy_token,
+#           mcp__cove-trading__sell_token, mcp__cove-trading__create_, mcp__cove-trading__cancel_,
+#           mcp__cove-trading__batch_order]
+dry_run:
+  enabled: false
+  block: []
 
 # ── MCP capability registry (PRD §6.3) ────────────────────────────────────────────────────
 # Operator authority — the agent can NEVER add a capability (that would be self-granting). Adding

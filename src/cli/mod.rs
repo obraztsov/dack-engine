@@ -242,6 +242,14 @@ async fn run(config_path: &str) -> Result<()> {
     let config = Arc::new(DackConfig::load(config_path)?);
     // Fail fast if the capability prefixes overlap (a settle tool must never classify as Post).
     config.validate_capabilities()?;
+    // Dry-run (testing): the WALL denies the configured tool prefixes so outward actions are
+    // composed-but-not-executed — uniformly across every MCP (twitter, cove, …). No per-server env.
+    if config.dry_run.enabled {
+        eprintln!(
+            "dack: DRY-RUN — the wall blocks these tool prefixes (composed, not executed): {}",
+            config.dry_run.block.join(", ")
+        );
+    }
     // Absolutize the soul repo so sensor exes (spawned with a changed cwd) and the signed-push
     // `GITLAWB_KEY` resolve regardless of where `dack` is launched from (relative config paths
     // otherwise break under subprocess cwd changes). Falls back to as-written if it doesn't exist.
@@ -284,12 +292,9 @@ async fn run(config_path: &str) -> Result<()> {
     // Shares the queue with ingestion (senses write, cognition reads). The runtime spawns
     // the bun bridge per invocation; if it's unreachable, dispatch errors are logged and the
     // loop stays up (logging-not-rollback). repo/identity are wired but inert until Phase 5/6.
-    let runtime: Arc<dyn RuntimeClient> = Arc::new(OpenClaudeClient::bun_bridge(
-        &config.bridge_dir,
-        bridge_env(&config),
-        config.model.clone(),
-        std::time::Duration::from_secs(config.invoke_timeout_secs),
-    ));
+    // The runtime extensibility point: only openclaude+opengateway is wired; any other engine or
+    // connector is a clear `NotImplemented` (the config slot exists, the adapter doesn't yet).
+    let runtime: Arc<dyn RuntimeClient> = build_runtime(&config)?;
     // Identity: resolve the configured `gl` role dirs. The Soul dir signs soul commits + the
     // `gitlawb://` push; its key never enters agent env (PRD §3.3, §7.2).
     let identity: Arc<dyn IdentityProvider> =
@@ -389,8 +394,37 @@ async fn run(config_path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Construct the runtime client from `config.runtime` (the engine + connector extensibility point).
+/// Only `openclaude`+`opengateway` is wired; any other engine/connector returns a clear
+/// `NotImplemented` (the config parses, the adapter just isn't built yet — see `RuntimeConfig`).
+fn build_runtime(config: &DackConfig) -> Result<Arc<dyn RuntimeClient>> {
+    use crate::config::{Connector, RuntimeEngine};
+    let rt = &config.runtime;
+    let RuntimeEngine::Openclaude { bridge_dir } = &rt.engine;
+    // (engine is exhaustive today — a future `ClaudeCode` arm lands with its own adapter here.)
+    if let Connector::Anthropic { .. } = rt.connector {
+        return Err(DackError::NotImplemented(
+            "runtime.connector: anthropic — not wired yet (only opengateway). \
+             The model channel (options.model) is supported; the env/auth wiring is the TODO.",
+        ));
+    }
+    // The bridge env = the forwarded names + the connector's own creds (base URL, key, flags),
+    // applied on top so the inline config wins. The provider key reaches the bridge, never the agent.
+    let mut env = bridge_env(config);
+    for (k, v) in rt.connector.env_overrides() {
+        env.insert(k, v);
+    }
+    Ok(Arc::new(OpenClaudeClient::bun_bridge(
+        bridge_dir,
+        env,
+        rt.model.clone(),
+        rt.connector.model_via_openai_env(),
+        std::time::Duration::from_secs(config.invoke_timeout_secs),
+    )))
+}
+
 /// Env forwarded into the runtime bridge: `PATH`/`HOME` + the provider/capability names the
-/// operator listed (`runtime_env` + `forwarded_env`). Values come from the harness env; the
+/// operator listed (`runtime.env` + `forwarded_env`). Values come from the harness env; the
 /// soul key is never among them (PRD §7.2).
 fn bridge_env(config: &DackConfig) -> HashMap<String, String> {
     let mut env = HashMap::new();
@@ -399,7 +433,7 @@ fn bridge_env(config: &DackConfig) -> HashMap<String, String> {
             env.insert(key.to_string(), v);
         }
     }
-    for name in config.runtime_env.iter().chain(config.forwarded_env.iter()) {
+    for name in config.runtime.env.iter().chain(config.forwarded_env.iter()) {
         if let Ok(v) = std::env::var(name) {
             env.insert(name.clone(), v);
         }

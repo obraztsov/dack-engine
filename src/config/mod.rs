@@ -267,6 +267,146 @@ pub struct McpServerConfig {
     pub trust: TrustTier,
 }
 
+/// Which agent runtime drives the consciousness loop — the [`crate::runtime::RuntimeClient`] impl
+/// and how it is spawned, with the engine's own config inline (tagged by `type`). The seam
+/// (PRD §3.4): v1 (Gitlawb/OpenClaude) vs a corp wiring differ only here + in construction.
+/// **Only `openclaude` is wired**; `claude-code` (the Claude Code CLI/SDK directly, for corporate
+/// prod) is the documented next variant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum RuntimeEngine {
+    /// The bun bridge to the OpenClaude SDK.
+    Openclaude {
+        /// The `openclaude-bridge/` project dir (`bun run bridge.ts`).
+        #[serde(default = "default_bridge_dir")]
+        bridge_dir: String,
+    },
+}
+
+impl Default for RuntimeEngine {
+    fn default() -> Self {
+        RuntimeEngine::Openclaude { bridge_dir: default_bridge_dir() }
+    }
+}
+
+impl RuntimeEngine {
+    /// The bridge project dir (openclaude). A no-op match today; the place a future engine slots in.
+    pub fn bridge_dir(&self) -> &str {
+        match self {
+            RuntimeEngine::Openclaude { bridge_dir } => bridge_dir,
+        }
+    }
+}
+
+/// How the engine reaches models — the **model channel**, the provider endpoint, and (optionally,
+/// inline in the gitignored config) the API key. Tagged by `type`. **Only `opengateway` is wired**;
+/// `anthropic` (native catalog) parses but is a stub until a corp deployment needs it. The model
+/// channel it selects is implemented by [`crate::runtime::openclaude::resolve_model_env`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum Connector {
+    /// OpenAI-compatible gateway (opengateway/gitlawb): the per-state model is routed via the
+    /// child's `OPENAI_MODEL` env (the SDK rejects a gateway name passed as `options.model`).
+    Opengateway {
+        /// OpenAI-compat base URL → `OPENAI_BASE_URL` (e.g. `https://opengateway.gitlawb.com/v1`).
+        /// `None` ⇒ taken from the forwarded env instead.
+        #[serde(default)]
+        api_url: Option<String>,
+        /// Provider API key → `OPENAI_API_KEY`. `None` ⇒ from the forwarded env. (Inline only in the
+        /// gitignored operator config; never in a committed file or the agent context.)
+        #[serde(default)]
+        api_key: Option<String>,
+    },
+    /// Native Anthropic catalog: the model is `options.model`. NOT YET WIRED (`cli::run` rejects it).
+    Anthropic {
+        #[serde(default)]
+        api_key: Option<String>,
+    },
+}
+
+impl Default for Connector {
+    fn default() -> Self {
+        Connector::Opengateway { api_url: None, api_key: None }
+    }
+}
+
+impl Connector {
+    /// Whether the per-invocation model is routed via the child's `OPENAI_MODEL` env (a gateway)
+    /// rather than `options.model` (the Anthropic catalog). Feeds `resolve_model_env`.
+    pub fn model_via_openai_env(&self) -> bool {
+        matches!(self, Connector::Opengateway { .. })
+    }
+
+    /// The provider env (name → value) this connector contributes to the bridge — the base URL, the
+    /// key, and any required flags. Applied OVER the forwarded env (so inline config wins). A `None`
+    /// cred falls through to whatever the forwarded env supplies. The key never reaches agent context.
+    pub fn env_overrides(&self) -> Vec<(String, String)> {
+        match self {
+            Connector::Opengateway { api_url, api_key } => {
+                // The OpenAI-compat path REQUIRES this flag; the connector owns it (no env reliance).
+                let mut env = vec![("CLAUDE_CODE_USE_OPENAI".to_string(), "1".to_string())];
+                if let Some(u) = api_url {
+                    env.push(("OPENAI_BASE_URL".to_string(), u.clone()));
+                }
+                if let Some(k) = api_key {
+                    env.push(("OPENAI_API_KEY".to_string(), k.clone()));
+                }
+                env
+            }
+            Connector::Anthropic { api_key } => api_key
+                .as_ref()
+                .map(|k| vec![("ANTHROPIC_API_KEY".to_string(), k.clone())])
+                .unwrap_or_default(),
+        }
+    }
+}
+
+/// The **runtime extensibility point** (the operator's choice of engine + connector + their config).
+/// A single block so swapping to a different runtime/provider is one config edit, not a code change.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RuntimeConfig {
+    /// Which agent runtime drives the loop (only `openclaude` wired), with its own config inline.
+    #[serde(default)]
+    pub engine: RuntimeEngine,
+    /// How it reaches models (only `opengateway` wired), with endpoint/key inline.
+    #[serde(default)]
+    pub connector: Connector,
+    /// The DEFAULT model id; per-state overrides live in `tier_policy[state].model`. On the
+    /// `opengateway` connector this seeds the per-invocation `OPENAI_MODEL`; on `anthropic` it is
+    /// the `options.model` catalog name. `None` ⇒ whatever the runtime env already provides.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Extra env var *names* forwarded into the runtime (values from the harness env, never the
+    /// YAML). The connector's own creds (above) are applied on top. **Soul key never listed.**
+    #[serde(default = "default_runtime_env")]
+    pub env: Vec<String>,
+}
+
+/// **Dry-run** (testing/debug): when `enabled`, the WALL denies any tool whose name starts with a
+/// `block` prefix — so the agent composes the action (visible in the runlog) but it never executes.
+/// Tool-level (not class-level) so a no-real-trade run can still allow `simulate_swap`/`get_*` while
+/// blocking `buy_token`. One mechanism for every MCP (twitter, cove, future) — no per-server env.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DryRunConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Tool-name PREFIXES the wall denies while `enabled` (e.g. `mcp__twitter__post`,
+    /// `mcp__cove-trading__buy_token`, `mcp__cove-trading__create_`). Empty ⇒ nothing blocked.
+    #[serde(default)]
+    pub block: Vec<String>,
+}
+
+impl DryRunConfig {
+    /// The block prefixes to enforce — the configured list when enabled, else empty (no blocking).
+    pub fn active_block(&self) -> Vec<String> {
+        if self.enabled {
+            self.block.clone()
+        } else {
+            Vec::new()
+        }
+    }
+}
+
 /// `dack.config.yaml` (PRD §8.2). Hot-reloadable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DackConfig {
@@ -333,22 +473,15 @@ pub struct DackConfig {
     /// Localhost bind for the webhook listener (PRD §2 — nothing public without a proxy).
     #[serde(default = "default_webhook_addr")]
     pub webhook_addr: String,
-    /// Path to the `openclaude-bridge/` project the runtime runs (`bun run bridge.ts`) —
-    /// the TS side of the runtime seam (depends on `@gitlawb/openclaude` from npm).
-    #[serde(default = "default_bridge_dir")]
-    pub bridge_dir: String,
-    /// Model id passed to the engine as `options.model` — only for models in the SDK's own
-    /// catalog (Anthropic tiers). **For an OpenAI-compatible gateway (opengateway/mimo,
-    /// Ollama, …) leave this `None` and set `OPENAI_MODEL` via `runtime_env`** — the SDK
-    /// resolves `options.model` against its catalog and rejects unknown gateway names
-    /// (live-verified, Phase 4).
+    /// The **runtime** extensibility point — engine (which agent runtime) + connector (how it
+    /// reaches models) + the engine wiring (bridge dir, default model, forwarded env). Folds the
+    /// former top-level `bridge_dir`/`model`/`runtime_env`. Only `openclaude`+`opengateway` wired.
     #[serde(default)]
-    pub model: Option<String>,
-    /// Env var *names* forwarded into the runtime bridge — the provider key, base URL, and
-    /// model name live here (values come from the harness env, never the YAML). **Soul key
-    /// never listed.**
-    #[serde(default = "default_runtime_env")]
-    pub runtime_env: Vec<String>,
+    pub runtime: RuntimeConfig,
+    /// **Dry-run** (testing/debug): a wall-level tool-block list — the agent composes outward
+    /// actions (visible in the runlog) but the wall denies their execution. Uniform across every MCP.
+    #[serde(default)]
+    pub dry_run: DryRunConfig,
     /// `gl` identity **directories** per role (each holds `identity.pem` + `ucan.json`). The
     /// Soul dir signs soul commits/pushes and **never enters agent env** (PRD §3.3, §7.2).
     #[serde(default)]
@@ -597,6 +730,49 @@ secrets:
         // Soul key is a reference, never forwarded.
         assert!(cfg.secrets.contains_key("soul_did_key"));
         assert!(!cfg.forwarded_env.contains(&"SOUL_DID_KEY".to_string()));
+    }
+
+    #[test]
+    fn runtime_defaults_to_openclaude_opengateway() {
+        // A config with no `runtime:` block gets the wired default + the connector's model channel.
+        let cfg = DackConfig::from_yaml(SAMPLE).unwrap();
+        assert!(matches!(cfg.runtime.engine, RuntimeEngine::Openclaude { .. }));
+        assert_eq!(cfg.runtime.engine.bridge_dir(), "openclaude-bridge");
+        assert!(matches!(cfg.runtime.connector, Connector::Opengateway { .. }));
+        assert!(cfg.runtime.model.is_none());
+        // opengateway routes the model via the OPENAI_MODEL env channel.
+        assert!(cfg.runtime.connector.model_via_openai_env());
+    }
+
+    #[test]
+    fn parses_nested_runtime_block_with_inline_creds() {
+        let cfg = DackConfig::from_yaml(
+            "operator_did: \"did:x\"\n\
+             runtime:\n\
+             \x20 engine: { type: openclaude, bridge_dir: my-bridge }\n\
+             \x20 connector: { type: opengateway, api_url: https://gw.example/v1, api_key: sk-test }\n\
+             \x20 model: nvidia/nemotron-3-ultra-550b-a55b:free\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.runtime.engine.bridge_dir(), "my-bridge");
+        assert_eq!(cfg.runtime.model.as_deref(), Some("nvidia/nemotron-3-ultra-550b-a55b:free"));
+        assert!(cfg.runtime.connector.model_via_openai_env());
+        // The inline creds become bridge env overrides (key reaches the bridge, never agent context).
+        let overrides = cfg.runtime.connector.env_overrides();
+        assert!(overrides.contains(&("OPENAI_BASE_URL".to_string(), "https://gw.example/v1".to_string())));
+        assert!(overrides.contains(&("OPENAI_API_KEY".to_string(), "sk-test".to_string())));
+        assert!(overrides.contains(&("CLAUDE_CODE_USE_OPENAI".to_string(), "1".to_string())));
+    }
+
+    #[test]
+    fn connector_channel_and_empty_creds_fall_through() {
+        // opengateway → OPENAI_MODEL env channel; anthropic → options.model.
+        assert!(Connector::Opengateway { api_url: None, api_key: None }.model_via_openai_env());
+        assert!(!Connector::Anthropic { api_key: None }.model_via_openai_env());
+        // With no inline creds, opengateway still sets the required flag but no base-URL/key (those
+        // fall through to the forwarded env).
+        let ov = Connector::Opengateway { api_url: None, api_key: None }.env_overrides();
+        assert_eq!(ov, vec![("CLAUDE_CODE_USE_OPENAI".to_string(), "1".to_string())]);
     }
 
     #[test]

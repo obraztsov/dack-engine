@@ -38,6 +38,7 @@ use crate::runlog::RunLogWriter;
 use crate::runtime::action_required::StatePolicyResponder;
 use crate::runtime::{
     ActionDecision, ActionRequest, ActionResponder, ContextBlock, InvocationRequest, RuntimeClient,
+    SessionId,
 };
 use crate::state::{
     allowed_transition, default_spec, within_ceiling, ConsciousnessState, StateSpec,
@@ -87,6 +88,11 @@ pub struct Harness {
     pub runlog: Arc<dyn RunLogWriter>,
     /// Materializes the act-phase secrets a route grants (Express skills read them).
     pub broker: Arc<SecretsBroker>,
+    /// **Sticky-session store** (resume-by-id): `session_key → (engine session_id, last_used unix)`.
+    /// A state-prompt with `session.sticky` reuses (and resumes) its session across items that share
+    /// the key `(prompt-id, taint, …dims)`; idle entries past `session_ttl_secs` are evicted lazily.
+    /// `Default` (empty) so the many test constructors need only `sessions: Default::default()`.
+    pub sessions: std::sync::Mutex<std::collections::HashMap<String, (String, i64)>>,
 }
 
 impl Harness {
@@ -367,19 +373,46 @@ impl Harness {
             .flatten()
             .or_else(|| policy.model.clone());
 
+        // STICKY SESSION (resume-by-id): a prompt with `session.sticky` reuses + resumes the engine
+        // session for its key `(prompt-id, taint, …dims)` across items, accumulating context. The
+        // FIREBREAK still holds — a different state-prompt is a different key (so Express never
+        // resumes Perceive's session), and only the digested Baton gist crosses. `None` = fresh.
+        let session_key = prompt
+            .session
+            .as_ref()
+            .filter(|s| s.sticky)
+            .map(|s| sticky_session_key(&prompt.id, cycle_trust, &s.key, stimulus));
+        let resume = match &session_key {
+            Some(key) => {
+                let r = self.sticky_resume(key);
+                eprintln!(
+                    "sticky[{key}]: {}",
+                    match &r {
+                        Some(id) => format!("RESUME session {id}"),
+                        None => "fresh session".into(),
+                    }
+                );
+                r
+            }
+            None => None,
+        };
+
         let req = InvocationRequest {
             system_prompt,
             spec: spec.clone(),
             blocks,
-            // FIREBREAK: every state ALWAYS gets a fresh session — never the one that ingested
-            // untrusted payload (PRD §6.4). Load-bearing across every hop of the walk.
-            session: None,
+            // Fresh session by default (the firebreak); a sticky prompt resumes its keyed session.
+            session: resume.map(SessionId),
             workdir: Some(self.soul_root()),
             secret_env,
             mcp_servers,
             model,
         };
-        let out = self.runtime.invoke(req, recorder.clone()).await?;
+        let (out, ran_session) = self.runtime.invoke(req, recorder.clone()).await?;
+        // Persist the engine session id for a sticky prompt, so the next item with the same key resumes it.
+        if let (Some(key), Some(sid)) = (&session_key, &ran_session) {
+            self.sticky_store(key, &sid.0);
+        }
         // Taint by ACTUAL access: the trust degradation from the tools this step really called.
         let tool_calls = recorder.take();
         let accessed = self.accessed_trust(&tool_calls);
@@ -492,6 +525,31 @@ impl Harness {
     /// daemon share the SQLite `cursor` table; `dack resume` clears it.
     async fn is_paused(&self) -> bool {
         matches!(self.queue.get_cursor("paused").await, Ok(Some(v)) if v == "1")
+    }
+
+    /// Resume the engine session for a sticky `key`, if one is live and within the idle TTL. A stale
+    /// entry is evicted (→ fresh session). Returns the `session_id` to resume, or `None` for fresh.
+    fn sticky_resume(&self, key: &str) -> Option<String> {
+        let now = chrono::Utc::now().timestamp();
+        let ttl = self.config.session_ttl_secs;
+        let mut map = self.sessions.lock().unwrap();
+        match map.get(key) {
+            Some((sid, last)) if ttl <= 0 || now - last < ttl => Some(sid.clone()),
+            Some(_) => {
+                map.remove(key); // stale → drop so the next run starts a fresh session
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Persist the engine `session_id` a sticky run produced under its `key`, stamped now.
+    fn sticky_store(&self, key: &str, session_id: &str) {
+        let now = chrono::Utc::now().timestamp();
+        self.sessions
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), (session_id.to_string(), now));
     }
 
     /// The scheduled Reflect ticker (PRD §4.2): when `reflect_schedule` is set, enqueue a harness-
@@ -894,6 +952,37 @@ enum StepInput {
 /// step (never instruction prose; SOUL.md owns the how-to-operate text). Variables the model can't
 /// read from a file: the working dir, the capabilities actually plugged here, and the cycle's
 /// trust → reachable ceiling. Keeps text in the soul repo and the harness to "fill in the blanks."
+/// Build a sticky-session key from `(prompt-id, cycle taint, …resolved dims)`. Each declared dim is
+/// resolved from the stimulus — `thread_id` → the stimulus `dedup_key` (the conversation/thread),
+/// `author_id` → the payload's `author_id`, `source` → the stimulus source. Unknown dims resolve to
+/// `_`. Extensible (any number of dims, not capped). Same key ⇒ the same resumable session; the taint
+/// being part of the key keeps sessions isolated per trust level.
+fn sticky_session_key(
+    prompt_id: &str,
+    taint: &TrustTier,
+    dims: &[String],
+    stimulus: &Stimulus,
+) -> String {
+    let resolved: Vec<String> = dims
+        .iter()
+        .map(|d| {
+            let val = match d.as_str() {
+                "thread_id" => stimulus.dedup_key.clone(),
+                "author_id" => stimulus
+                    .payload
+                    .get("author_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                "source" => Some(stimulus.source.clone()),
+                _ => None,
+            }
+            .unwrap_or_else(|| "_".to_string());
+            format!("{d}={val}")
+        })
+        .collect();
+    format!("{}|{}|{}", prompt_id, taint.name(), resolved.join(","))
+}
+
 fn orientation_block(
     prompt: &StatePrompt,
     soul_root: &std::path::Path,
@@ -1298,6 +1387,7 @@ mod tests {
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
             runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
         broker: Arc::new(SecretsBroker::new(vec![])),
+            sessions: Default::default(),
         };
 
         harness.dispatch(poisoned_stimulus()).await.unwrap();
@@ -1325,9 +1415,11 @@ mod tests {
             &self,
             req: InvocationRequest,
             _responder: Arc<dyn ActionResponder>,
-        ) -> Result<AgentOutput> {
+        ) -> Result<(AgentOutput, Option<SessionId>)> {
+            // Echo back a stable session id so sticky-resume tests can assert the same id recurs.
+            let sid = req.session.clone().or_else(|| Some(SessionId("sess-rec".into())));
             self.seen.lock().unwrap().push(req);
-            Ok(self.out.clone())
+            Ok((self.out.clone(), sid))
         }
     }
 
@@ -1362,6 +1454,7 @@ mod tests {
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
             runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
         broker: Arc::new(SecretsBroker::new(vec![])),
+            sessions: Default::default(),
         };
 
         harness.dispatch(poisoned_stimulus()).await.unwrap();
@@ -1417,6 +1510,7 @@ mod tests {
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
             runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
             broker: Arc::new(SecretsBroker::new(vec![])),
+            sessions: Default::default(),
         };
 
         harness.dispatch(poisoned_stimulus()).await.unwrap();
@@ -1468,6 +1562,7 @@ mod tests {
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
             runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
             broker: Arc::new(SecretsBroker::new(vec![])),
+            sessions: Default::default(),
         };
 
         harness.dispatch(poisoned_stimulus()).await.unwrap();
@@ -1532,6 +1627,7 @@ mod tests {
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
             runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
             broker: Arc::new(SecretsBroker::new(vec![])),
+            sessions: Default::default(),
         };
 
         harness.dispatch(poisoned_stimulus()).await.unwrap(); // payload_tier = Public
@@ -1579,6 +1675,7 @@ mod tests {
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
             runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
             broker: Arc::new(SecretsBroker::new(vec![])),
+            sessions: Default::default(),
         };
 
         let mut stim = poisoned_stimulus();
@@ -1634,6 +1731,7 @@ mod tests {
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
             runlog: Arc::new(FileRunLog::new(soul.join("runlogs"))),
             broker: Arc::new(SecretsBroker::new(vec![])),
+            sessions: Default::default(),
         };
 
         // Simulate this Express run's tool-driven writes straight to the working tree: an
@@ -1699,6 +1797,7 @@ mod tests {
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
             runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
             broker: Arc::new(SecretsBroker::new(vec![])),
+            sessions: Default::default(),
         });
 
         let (tx, rx) = tokio::sync::watch::channel(false);
@@ -1816,6 +1915,7 @@ mod tests {
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
             runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
             broker: Arc::new(SecretsBroker::new(vec![Arc::new(StaticEnvProvider::new("cove", vec!["DACK_COVE_TEST".into()]))])),
+            sessions: Default::default(),
         };
         let stim = poisoned_stimulus();
         let prompt = |state| StatePrompt {
@@ -1825,6 +1925,7 @@ mod tests {
             mcp: vec![McpRef::Import("cove-read".into()), McpRef::Import("cove-trading".into())],
             transitions: vec![],
             model: None,
+            session: None,
             body: String::new(),
         };
 
@@ -1886,6 +1987,7 @@ mod tests {
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
             runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
             broker: Arc::new(SecretsBroker::new(vec![])),
+            sessions: Default::default(),
         };
         // A CLEAN self-tier cycle (directive + payload self → seed self → ceiling Reflect).
         let mut stim = poisoned_stimulus();
@@ -1939,6 +2041,7 @@ mod tests {
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
             runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
             broker: Arc::new(SecretsBroker::new(vec![])),
+            sessions: Default::default(),
         };
         let stim = poisoned_stimulus();
         let inline = || McpRef::Inline { name: "rootai".into(), url: "https://mcp.rootai.xyz".into() };
@@ -1946,7 +2049,7 @@ mod tests {
         // OPEN perceive: the inline public MCP is admitted, read-tier, with its wall prefix.
         let open = StatePrompt {
             id: "p".into(), state: ConsciousnessState::Perceive,
-            mcp: vec![inline(), McpRef::Import("cove-read".into())], transitions: vec![], model: None, body: String::new(),
+            mcp: vec![inline(), McpRef::Import("cove-read".into())], transitions: vec![], model: None, session: None, body: String::new(),
         };
         let (servers, inline_read) = harness.assemble_mcp_servers(&open, &stim).await;
         assert!(servers.contains_key("rootai"), "inline admitted on an open tier");
@@ -1959,7 +2062,7 @@ mod tests {
         // LOCKED express (unconfigured → default locked): the same inline is rejected.
         let locked = StatePrompt {
             id: "e".into(), state: ConsciousnessState::Express,
-            mcp: vec![inline()], transitions: vec![], model: None, body: String::new(),
+            mcp: vec![inline()], transitions: vec![], model: None, session: None, body: String::new(),
         };
         let (servers, inline_read) = harness.assemble_mcp_servers(&locked, &stim).await;
         assert!(servers.is_empty() && inline_read.is_empty(), "no self-plug on a locked tier");
@@ -2001,6 +2104,7 @@ mod tests {
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
             runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
             broker: Arc::new(SecretsBroker::new(vec![])),
+            sessions: Default::default(),
         };
         let allow = |tool: &str| ToolCallRecord { tool: tool.into(), decision: "allow".into(), input: None };
 
@@ -2067,6 +2171,7 @@ mod tests {
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
             runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
             broker: Arc::new(SecretsBroker::new(vec![])),
+            sessions: Default::default(),
         };
 
         let mut stim = poisoned_stimulus();
@@ -2138,6 +2243,7 @@ mod tests {
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
             runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
             broker: Arc::new(SecretsBroker::new(vec![])),
+            sessions: Default::default(),
         };
         let stim = poisoned_stimulus();
         let prompt = |state, model: &str| StatePrompt {
@@ -2146,6 +2252,7 @@ mod tests {
             mcp: vec![],
             transitions: vec![],
             model: Some(model.into()),
+            session: None,
             body: "go".into(),
         };
 
@@ -2163,6 +2270,91 @@ mod tests {
         assert_eq!(seen[0].model.as_deref(), Some("frontier-x"), "override honored on an open tier");
         assert_eq!(seen[1].model.as_deref(), Some("ops-default"), "locked tier → operator default");
         assert_eq!(seen[2].model, None, "unconfigured tier → client default");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The sticky-session KEY: stable for the same `(prompt, taint, thread)`, and isolated across
+    /// threads and across taints (so a session is never reused at a different trust level).
+    #[test]
+    fn sticky_session_key_is_stable_and_isolated() {
+        let mut s = poisoned_stimulus();
+        s.dedup_key = Some("convA".into());
+        let dims = vec!["thread_id".to_string()];
+        let key = |taint: &TrustTier, st: &Stimulus| {
+            sticky_session_key("twitter/perceive_thread", taint, &dims, st)
+        };
+        let base = key(&TrustTier::public(), &s);
+        assert_eq!(base, key(&TrustTier::public(), &s), "same prompt+taint+thread → same key");
+        let mut s_b = s.clone();
+        s_b.dedup_key = Some("convB".into());
+        assert_ne!(base, key(&TrustTier::public(), &s_b), "different thread → different session");
+        assert_ne!(base, key(&TrustTier::self_(), &s), "different taint → different session");
+        // No dims → keyed per (prompt, taint) only.
+        assert_eq!(sticky_session_key("p", &TrustTier::self_(), &[], &s), "p|self|");
+    }
+
+    /// Sticky resume-by-id end-to-end at the harness: two items in the SAME thread reuse one engine
+    /// session (the 2nd run passes `resume`), while a different thread starts fresh. (The
+    /// `RecordingRuntime` echoes a stable id so we can assert the resume.)
+    #[tokio::test]
+    async fn sticky_session_resumes_within_a_thread() {
+        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::queue::InMemoryQueue;
+        use crate::repo::git::PlainGitRepo;
+        use crate::runlog::FileRunLog;
+        use crate::state_prompt::SessionConfig;
+        use std::collections::HashMap;
+
+        let tmp = std::env::temp_dir().join(format!("dack-sticky-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        seed_prompts(&tmp);
+        let config = Arc::new(DackConfig::from_yaml("operator_did: \"did:x\"").unwrap());
+        let queue: Arc<dyn Queue> = Arc::new(InMemoryQueue::new());
+        let runtime = Arc::new(RecordingRuntime {
+            seen: std::sync::Mutex::new(Vec::new()),
+            out: perceive_output(),
+        });
+        let harness = Harness {
+            config: config.clone(),
+            queue: queue.clone(),
+            bus: Arc::new(Bus::new(config.clone(), queue.clone())),
+            runtime: runtime.clone(),
+            repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
+            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
+            broker: Arc::new(SecretsBroker::new(vec![])),
+            sessions: Default::default(),
+        };
+        let sticky = StatePrompt {
+            id: "twitter/perceive_thread".into(),
+            state: ConsciousnessState::Perceive,
+            mcp: vec![],
+            transitions: vec![],
+            model: None,
+            session: Some(SessionConfig { sticky: true, key: vec!["thread_id".into()] }),
+            body: "go".into(),
+        };
+        // Two items in the SAME thread (same dedup_key) → one resumed session.
+        let mut item = poisoned_stimulus();
+        item.dedup_key = Some("conv-1".into());
+        let trust = TrustTier::public();
+        harness.run_step(&sticky, &StepInput::Entry, &item, &trust, ConsciousnessState::Express).await.unwrap();
+        harness.run_step(&sticky, &StepInput::Entry, &item, &trust, ConsciousnessState::Express).await.unwrap();
+        // A DIFFERENT thread → its own fresh session.
+        let mut other = poisoned_stimulus();
+        other.dedup_key = Some("conv-2".into());
+        harness.run_step(&sticky, &StepInput::Entry, &other, &trust, ConsciousnessState::Express).await.unwrap();
+
+        let seen = runtime.seen.lock().unwrap();
+        assert!(seen[0].session.is_none(), "first item in a thread starts fresh");
+        assert_eq!(
+            seen[1].session.as_ref().map(|s| s.0.as_str()),
+            Some("sess-rec"),
+            "second item in the same thread RESUMES the session"
+        );
+        assert!(seen[2].session.is_none(), "a different thread starts its own fresh session");
 
         std::fs::remove_dir_all(&tmp).ok();
     }

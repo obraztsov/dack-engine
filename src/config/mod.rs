@@ -109,6 +109,9 @@ fn default_reaches() -> ConsciousnessState {
 fn default_reflect_interval() -> i64 {
     86_400 // one day — a sane self-modification cadence; the operator may loosen or `0` to disable.
 }
+fn default_session_ttl() -> i64 {
+    3_600 // one hour idle before a sticky session is dropped.
+}
 
 /// The resolved trust lattice — built from `DackConfig.trust_tiers` (or the safe default). A total
 /// order by rank; the taint `meet` (greatest-lower-bound) is just the lower-ranked tier. An unknown
@@ -433,6 +436,11 @@ pub struct DackConfig {
     /// Default 1 day.
     #[serde(default = "default_reflect_interval")]
     pub reflect_min_interval_secs: i64,
+    /// **Sticky-session idle TTL** (seconds): a resumable session unused for this long is dropped
+    /// from the harness store (a fresh one starts next time). Bounds memory + stale thread context.
+    /// Default 1 hour. `0` = never evict (not recommended).
+    #[serde(default = "default_session_ttl")]
+    pub session_ttl_secs: i64,
     /// The state-prompt id harness-synthesized stimuli enter at (operator `dack say`, the
     /// boot back-online ping) — duties that carry no `entry:` of their own (MCP2-B). Defaults to
     /// the flat `perceive` prompt.

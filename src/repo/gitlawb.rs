@@ -83,12 +83,75 @@ impl RepoHost for GitlawbRepo {
     /// Signed `gitlawb://` push: the `git-remote-gitlawb` helper signs the ref-update with the
     /// Soul key at `GITLAWB_KEY` (never in agent env), pushing to `GITLAWB_NODE`. The Soul-DID
     /// commit *author* is attribution; THIS signature is the cryptographic provenance (PRD §3.3).
+    ///
+    /// **Bounded retry with exponential backoff.** The node is young and occasionally flaky (5xx,
+    /// mid-stream disconnects, timeouts); a TRANSIENT failure gets a few quick retries here before
+    /// the cycle's coarse fallback (`push_soul` keeps the commits local and re-pushes next cycle).
+    /// Permanent failures (auth, non-fast-forward) fail fast — retrying can't fix them.
     async fn push(&self) -> Result<()> {
         let key = self.identity_dir.join("identity.pem");
         let env = [
             ("GITLAWB_KEY", key.to_string_lossy().into_owned()),
             ("GITLAWB_NODE", self.node.clone()),
         ];
-        self.core.push(&self.remote, &env).await
+        // 4 attempts, backoff 0.5s → 1s → 2s (≈3.5s worst case). Tunable; the loop is single-flight.
+        const MAX_ATTEMPTS: u32 = 4;
+        let mut attempt = 1u32;
+        loop {
+            match self.core.push(&self.remote, &env).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if attempt >= MAX_ATTEMPTS || !is_transient_push_error(&e.to_string()) {
+                        return Err(e);
+                    }
+                    let backoff = std::time::Duration::from_millis(500u64 << (attempt - 1));
+                    eprintln!(
+                        "gitlawb push attempt {attempt}/{MAX_ATTEMPTS} failed (transient): {e} — retrying in {backoff:?}"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    attempt += 1;
+                }
+            }
+        }
+    }
+}
+
+/// Whether a push failure looks like a TRANSIENT node/network blip (worth a retry) rather than a
+/// permanent rejection (auth, conflict). The gitlawb node returns plain git/HTTP errors, so we
+/// classify on the message — conservative: only clear transient signatures retry; everything else
+/// (incl. `403`/`non-fast-forward`) fails fast so we don't loop on an unfixable error.
+fn is_transient_push_error(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    [
+        "500", "502", "503", "504",
+        "internal server error", "bad gateway", "service unavailable", "gateway timeout",
+        "unexpected disconnect", "hung up", "sideband", "early eof", "rpc failed",
+        "timed out", "timeout", "connection reset", "connection refused", "broken pipe",
+        "could not read from remote", "failed to connect", "temporarily unavailable",
+    ]
+    .iter()
+    .any(|p| m.contains(p))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_transient_push_error;
+
+    #[test]
+    fn classifies_transient_vs_permanent_push_errors() {
+        // The exact failure seen against the young node → retry.
+        assert!(is_transient_push_error(
+            "repo: git push gitlawb://…/dack-soul HEAD:refs/heads/main: Error: POST \
+             /git-receive-pack returned 500 Internal Server Error\nsend-pack: unexpected \
+             disconnect while reading sideband packet\nfatal: the remote end hung up unexpectedly"
+        ));
+        assert!(is_transient_push_error("fatal: unable to access: Connection reset by peer"));
+        assert!(is_transient_push_error("error: RPC failed; HTTP 503 Service Unavailable"));
+        // Permanent rejections → fail fast (retrying can't fix them).
+        assert!(!is_transient_push_error("remote: 403 Forbidden — not authorized to push"));
+        assert!(!is_transient_push_error(
+            "! [rejected] main -> main (non-fast-forward)\nUpdates were rejected"
+        ));
+        assert!(!is_transient_push_error("fatal: could not read Username: terminal prompts disabled"));
     }
 }

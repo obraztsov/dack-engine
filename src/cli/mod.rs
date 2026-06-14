@@ -340,6 +340,7 @@ async fn run(config_path: &str) -> Result<()> {
         identity,
         runlog,
         broker: broker.clone(),
+        sessions: Default::default(),
     });
     // Graceful shutdown: SIGTERM/SIGINT flips the watch; the consciousness loop finishes its
     // in-flight dispatch, then exits (no zombie `dispatched` row). systemd restarts on crash;

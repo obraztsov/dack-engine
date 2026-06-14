@@ -88,7 +88,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     println!("[live] invoking Perceive through bun bridge…");
-    let out = client.invoke(req, wall.clone()).await?;
+    let (out, _session) = client.invoke(req, wall.clone()).await?;
 
     println!("\n--- wall decisions ---");
     let seen = wall.seen.lock().unwrap();

@@ -122,12 +122,14 @@ pub trait ActionResponder: Send + Sync {
 }
 
 /// Invoke a consciousness state. The responder is consulted on every sensitive tool
-/// call mid-run (the `action_required` round-trip).
+/// call mid-run (the `action_required` round-trip). Returns the agent's structured output AND the
+/// engine `session_id` (when the engine reports one) — the harness persists it for sticky-session
+/// resume (`InvocationRequest.session`). `None` when the engine/adapter has no session concept.
 #[async_trait]
 pub trait RuntimeClient: Send + Sync {
     async fn invoke(
         &self,
         req: InvocationRequest,
         responder: std::sync::Arc<dyn ActionResponder>,
-    ) -> Result<AgentOutput>;
+    ) -> Result<(AgentOutput, Option<SessionId>)>;
 }

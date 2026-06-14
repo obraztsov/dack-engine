@@ -45,6 +45,22 @@ impl McpRef {
     }
 }
 
+/// Opt-in **sticky session** for a state-prompt (resume-by-id): the engine session is kept and
+/// resumed across items that share the same key, so the prompt accumulates context (e.g. all replies
+/// in one thread) instead of re-paying it per item. The session key is always `(prompt-id, cycle
+/// taint, …key dims)` — `key` adds the extra dimensions resolved from the stimulus (`thread_id` →
+/// the stimulus `dedup_key`/`conversation_id`). `sticky: false`/absent = a fresh session each run
+/// (the firebreak default). The firebreak still holds: a *different* state-prompt is a different key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionConfig {
+    #[serde(default)]
+    pub sticky: bool,
+    /// Extra key dimensions beyond `(prompt-id, taint)` — e.g. `[thread_id]`. Empty = sticky per
+    /// (prompt, taint). Not capped: any number of dims, each resolved from the stimulus.
+    #[serde(default)]
+    pub key: Vec<String>,
+}
+
 /// The YAML frontmatter of a `prompts/**/*.md` state-prompt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatePromptFrontmatter {
@@ -62,6 +78,9 @@ pub struct StatePromptFrontmatter {
     /// favour of the operator's per-state default, then the global `config.model` (I16 shape).
     #[serde(default)]
     pub model: Option<String>,
+    /// Optional sticky-session config (resume-by-id). `None`/`sticky:false` = a fresh session per run.
+    #[serde(default)]
+    pub session: Option<SessionConfig>,
 }
 
 /// A parsed state-prompt: its id (path), frontmatter, and the trusted directive body.
@@ -74,6 +93,8 @@ pub struct StatePrompt {
     pub transitions: Vec<String>,
     /// Soul-requested model override (operator-gated at assembly). `None` = the configured default.
     pub model: Option<String>,
+    /// Sticky-session opt-in (resume-by-id). `None` = a fresh session each run (firebreak default).
+    pub session: Option<SessionConfig>,
     /// The directive text (the body below the frontmatter fence). Trusted.
     pub body: String,
 }
@@ -92,6 +113,7 @@ impl StatePrompt {
             mcp: fm.mcp,
             transitions: fm.transitions,
             model: fm.model,
+            session: fm.session,
             body: body.trim().to_string(),
         })
     }

@@ -27,7 +27,9 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use super::{ActionDecision, ActionRequest, ActionResponder, InvocationRequest, RuntimeClient};
+use super::{
+    ActionDecision, ActionRequest, ActionResponder, InvocationRequest, RuntimeClient, SessionId,
+};
 use crate::error::{DackError, Result};
 use crate::model::proposal::AgentOutput;
 use crate::sandbox::{ExecKind, HostSandbox, IsolationPolicy, Mount, ProcessSpec, Sandbox};
@@ -49,6 +51,9 @@ enum ToBridge<'a> {
         model: Option<&'a str>,
         /// The agent's working dir (the soul repo) → the bridge's `options.cwd`.
         cwd: Option<&'a str>,
+        /// Sticky-session resume: an engine `session_id` to continue (`options.resume`). `None` =
+        /// a fresh session (the firebreak default; set only for sticky state-prompts).
+        resume: Option<&'a str>,
         /// Resolved MCP capability servers (SDK-shaped, tokens injected) → `options.mcpServers`.
         mcp_servers: &'a std::collections::BTreeMap<String, serde_json::Value>,
     },
@@ -70,8 +75,13 @@ enum FromBridge {
         #[serde(default)]
         input: serde_json::Value,
     },
-    /// The run finished; `output` is the agent's `submit`ted structured proposal.
-    Result { output: AgentOutput },
+    /// The run finished; `output` is the agent's `submit`ted structured proposal. `session_id` is
+    /// the engine session this run ran in (for sticky-session resume), when the bridge reports it.
+    Result {
+        output: AgentOutput,
+        #[serde(default)]
+        session_id: Option<String>,
+    },
     /// The run failed inside the engine/bridge.
     Error { message: String },
     /// Diagnostic passthrough (surfaced to the harness log).
@@ -172,7 +182,7 @@ impl RuntimeClient for OpenClaudeClient {
         &self,
         req: InvocationRequest,
         responder: Arc<dyn ActionResponder>,
-    ) -> Result<AgentOutput> {
+    ) -> Result<(AgentOutput, Option<SessionId>)> {
         // Spawn the bridge **through the sandbox seam** (HostSandbox by default). Under a
         // container backend the soul repo (workdir) is mounted writable; the harness env is
         // inherited (the SDK's auth context is ambient — Phase 4 learning), never cleared.
@@ -239,6 +249,8 @@ impl RuntimeClient for OpenClaudeClient {
             // Catalog path only — None on the gateway (the model went via OPENAI_MODEL above).
             model: options_model.as_deref(),
             cwd: req.workdir.as_deref().and_then(|p| p.to_str()),
+            // Sticky-session resume: the engine session id the harness wants to continue (if any).
+            resume: req.session.as_ref().map(|s| s.0.as_str()),
             mcp_servers: &req.mcp_servers,
         };
 
@@ -287,7 +299,9 @@ impl RuntimeClient for OpenClaudeClient {
                         )
                         .await?;
                     }
-                    FromBridge::Result { output } => return Ok(output),
+                    FromBridge::Result { output, session_id } => {
+                        return Ok((output, session_id.map(SessionId)))
+                    }
                     FromBridge::Error { message } => return Err(DackError::Runtime(message)),
                     FromBridge::Log { message } => eprintln!("[bridge] {message}"),
                 }
@@ -421,7 +435,7 @@ mod tests {
             asked: Mutex::new(vec![]),
             allow: false,
         });
-        let out = client.invoke(perceive_req(), rec.clone()).await.unwrap();
+        let (out, _) = client.invoke(perceive_req(), rec.clone()).await.unwrap();
 
         assert_eq!(out.thought, "done");
         assert!(out.transition.to_prompt.is_none());
@@ -440,7 +454,7 @@ mod tests {
             asked: Mutex::new(vec![]),
             allow: true,
         });
-        let out = client.invoke(perceive_req(), rec).await.unwrap();
+        let (out, _) = client.invoke(perceive_req(), rec).await.unwrap();
         assert_eq!(out.thought, "hi");
         assert_eq!(out.proposal.unwrap().gist, "g");
     }

@@ -108,12 +108,17 @@ async function runInvoke(inv: any) {
   }
   if (inv.model) options.model = inv.model
   if (inv.allowed_tools) options.allowedTools = inv.allowed_tools
+  // Sticky-session resume (the harness passes the session_id it wants to continue). Absent = fresh.
+  if (inv.resume) options.resume = inv.resume
   // The duck's act-phase capabilities, assembled by the harness for this state (tokens injected
   // into headers/env). The wall still gates EVERY call (canUseTool → Rust), tier-classified.
   if (inv.mcp_servers && typeof inv.mcp_servers === 'object') options.mcpServers = inv.mcp_servers
 
   let finalText = ''
+  let sessionId: string | null = null
   for await (const m of query({ prompt: inv.user_prompt, options }) as AsyncIterable<any>) {
+    // Capture the engine session id (carried on the SDK messages) → returned for sticky resume.
+    if (m?.session_id) sessionId = m.session_id
     // Concise capability connection status (NOT the tool list — keep it grep-safe): an operator
     // sees at a glance whether cove/twitter connected or failed.
     if (m?.type === 'system' && m?.subtype === 'init' && Array.isArray(m.mcp_servers) && m.mcp_servers.length) {
@@ -137,6 +142,6 @@ async function runInvoke(inv: any) {
     }
   }
 
-  emit({ kind: 'result', output: parseOutput(finalText) })
+  emit({ kind: 'result', output: parseOutput(finalText), session_id: sessionId })
   process.exit(0)
 }

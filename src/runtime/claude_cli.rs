@@ -46,7 +46,7 @@ impl RuntimeClient for ClaudeCliClient {
         &self,
         _req: InvocationRequest,
         _responder: Arc<dyn ActionResponder>,
-    ) -> Result<AgentOutput> {
+    ) -> Result<(AgentOutput, Option<super::SessionId>)> {
         todo!(
             "Phase 4+: spawn `claude -p <assembled-prompt>` with --append-system-prompt for \
              the SOUL/state prompt and --disallowedTools derived from the state scope; parse \

@@ -39,6 +39,25 @@ use crate::sandbox::{ExecKind, HostSandbox, IsolationPolicy, Mount, ProcessSpec,
 /// Raw shell bypasses path-gating, so it never belongs in a duck state.
 const ALWAYS_DISALLOWED: &[&str] = &["Bash", "PowerShell", "REPL", "KillShell"];
 
+/// The SDK-level `disallowedTools` for an invocation, derived from the running spec.
+///
+/// The duck NEVER gets raw shell/exec: `Shell` is in no consciousness state's `tool_scope`, and we
+/// disallow these at the SDK layer too (defense-in-depth on top of the wall). A **worker**, though,
+/// is a sandboxed build agent whose spec DOES admit `Shell` — it must keep `Bash`. Its shell is
+/// bounded by the wall (`worker_spec` + the temp-workspace relativize root) and the throwaway
+/// workspace, not by stripping the tool here. Stripping it was a real bug: with `Bash` absent from
+/// the engine's tool registry, (1) `injectAgents` threw on any agent referencing `Bash` (aborting
+/// sub-helper injection) and (2) the worker model, having no native `Bash`, emitted text-format
+/// `<function=Bash>` tool calls that executed nothing — so the worker built nothing.
+fn disallowed_for(spec: &crate::state::StateSpec) -> Vec<String> {
+    let worker_keeps_bash = spec.tool_scope.allows(crate::state::ToolClass::Shell);
+    ALWAYS_DISALLOWED
+        .iter()
+        .filter(|t| !(worker_keeps_bash && **t == "Bash"))
+        .map(|s| s.to_string())
+        .collect()
+}
+
 /// Rust → bridge.
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -56,6 +75,9 @@ enum ToBridge<'a> {
         resume: Option<&'a str>,
         /// Resolved MCP capability servers (SDK-shaped, tokens injected) → `options.mcpServers`.
         mcp_servers: &'a std::collections::BTreeMap<String, serde_json::Value>,
+        /// Sub-agent defs the engine may `Task`-spawn (Phase 10) → `options.agents`. Empty for the
+        /// duck's states; a worker registers its sub-helpers here.
+        agents: &'a std::collections::BTreeMap<String, serde_json::Value>,
     },
     Decision {
         tool_use_id: String,
@@ -201,6 +223,13 @@ impl RuntimeClient for OpenClaudeClient {
         if let Some(m) = &openai_model_env {
             env.insert("OPENAI_MODEL".to_string(), m.clone());
         }
+        // The bridge chdir's to this BEFORE loading the SDK (the SDK snapshots process.cwd() at
+        // module-init for all tool/file path resolution; options.cwd is ignored on the query() path).
+        // So a worker's relative writes land in its workspace, the duck's in the soul repo. Absent
+        // (pure-text runs) → the bridge keeps its own dir.
+        if let Some(w) = req.workdir.as_ref().and_then(|p| p.to_str()) {
+            env.insert("DACK_BRIDGE_CWD".to_string(), w.to_string());
+        }
         let spec = ProcessSpec {
             command: self.command.clone(),
             cwd: self.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
@@ -244,7 +273,7 @@ impl RuntimeClient for OpenClaudeClient {
         let invoke = ToBridge::Invoke {
             system_prompt: &req.system_prompt,
             user_prompt: Self::render_blocks(&req.blocks),
-            disallowed_tools: ALWAYS_DISALLOWED.iter().map(|s| s.to_string()).collect(),
+            disallowed_tools: disallowed_for(&req.spec),
             allowed_tools: None,
             // Catalog path only — None on the gateway (the model went via OPENAI_MODEL above).
             model: options_model.as_deref(),
@@ -252,6 +281,7 @@ impl RuntimeClient for OpenClaudeClient {
             // Sticky-session resume: the engine session id the harness wants to continue (if any).
             resume: req.session.as_ref().map(|s| s.0.as_str()),
             mcp_servers: &req.mcp_servers,
+            agents: &req.agents,
         };
 
         // The whole exchange (send → permission round-trips → result) runs under ONE wall-clock
@@ -334,8 +364,22 @@ async fn write_line<W: AsyncWriteExt + Unpin>(w: &mut W, msg: &ToBridge<'_>) -> 
 mod tests {
     use super::*;
     use crate::runtime::ContextBlock;
-    use crate::state::{default_spec, ConsciousnessState};
+    use crate::state::{default_spec, worker_spec, ConsciousnessState};
     use std::sync::Mutex;
+
+    /// The duck never gets raw shell (Bash stays disallowed at the SDK layer); a WORKER (whose spec
+    /// admits `Shell`) keeps Bash so its native tool calls actually execute. Other exec tools stay off.
+    #[test]
+    fn disallowed_tools_strips_bash_for_duck_keeps_it_for_worker() {
+        let duck = disallowed_for(&default_spec(ConsciousnessState::Express));
+        assert!(duck.contains(&"Bash".to_string()), "the duck must NOT get Bash");
+
+        let worker = disallowed_for(&worker_spec());
+        assert!(!worker.contains(&"Bash".to_string()), "a worker MUST keep Bash");
+        // The other exec tools remain disallowed even for a worker (it builds with Bash, not these).
+        assert!(worker.contains(&"PowerShell".to_string()));
+        assert!(worker.contains(&"KillShell".to_string()));
+    }
 
     /// The model-routing split (8.7 + the gateway fix): on a gateway the resolved model must go to
     /// the `OPENAI_MODEL` env (NOT `options.model`, which the SDK rejects); on the catalog, reverse.
@@ -418,6 +462,7 @@ mod tests {
             secret_env: Default::default(),
             mcp_servers: Default::default(),
             model: None,
+            agents: Default::default(),
         }
     }
 

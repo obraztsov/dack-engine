@@ -89,6 +89,11 @@ pub struct InvocationRequest {
     /// prompt (operator `tier_policy` default, or a soul `model:` where override is allowed). `None`
     /// ⇒ the runtime client's configured `config.model`. The bridge maps it to `options.model`.
     pub model: Option<String>,
+    /// **Sub-agent definitions** (Phase 10) the engine may spawn via the `Task` tool, keyed by name
+    /// → an SDK `options.agents` value ([`crate::agent_def::AgentDef::to_options_value`]). EMPTY for
+    /// the duck's consciousness states (no `Task` target); a **worker** invocation registers its
+    /// sub-helpers here so it can delegate plan/research/QA in-session. The bridge sets `options.agents`.
+    pub agents: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// The permission event surfaced by OpenClaude, as it *actually* arrives (grounded

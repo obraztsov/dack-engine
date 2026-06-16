@@ -35,6 +35,7 @@
 pub mod bus;
 pub mod cli;
 pub mod config;
+pub mod agent_def;
 pub mod error;
 pub mod harness;
 pub mod identity;

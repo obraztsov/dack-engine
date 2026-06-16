@@ -22,10 +22,26 @@
  */
 
 import * as readline from 'node:readline'
-import { query } from '@gitlawb/openclaude/sdk'
 
-// Protect the stdout protocol channel: any stray console.log (incl. the SDK's) → stderr.
+// The SDK snapshots process.cwd() at MODULE-INIT and uses it for ALL tool/file path resolution
+// (getCwd → pwd → STATE.cwd; options.cwd is NOT honored on the programmatic query() path). So a
+// worker's relative writes (e.g. `solution.py`) would leak into the bridge's own dir instead of its
+// /workspace. We chdir to the agent's workdir (handed by the harness as DACK_BRIDGE_CWD — a worker's
+// workspace, or the duck's soul repo) BEFORE loading the SDK, then import it DYNAMICALLY so it
+// snapshots the right cwd. The bridge is spawned fresh per invoke, so this is safe.
+if (process.env.DACK_BRIDGE_CWD) {
+  try {
+    process.chdir(process.env.DACK_BRIDGE_CWD)
+  } catch (e) {
+    console.error(`bridge: chdir(${process.env.DACK_BRIDGE_CWD}) failed: ${e}`)
+  }
+}
+
+// Protect the stdout protocol channel: any stray console.log (incl. the SDK's) → stderr. Set this
+// BEFORE the (dynamic) SDK import so even the SDK's init-time logs are redirected off the channel.
 console.log = (...a: unknown[]) => console.error('[bridge:log]', ...a)
+
+const { query } = await import('@gitlawb/openclaude/sdk')
 
 const emit = (obj: unknown) => process.stdout.write(JSON.stringify(obj) + '\n')
 
@@ -40,9 +56,12 @@ const OUTPUT_INSTRUCTION =
   'MUST be ONLY a single JSON object (no prose, no markdown fence) with exactly this shape: ' +
   '{"thought": string, "memory_append": string|null, ' +
   '"proposal": {"intent": "reply"|"post"|"research"|"ignore"|"noop", "gist": string}|null, ' +
+  '"spawn": {"agent": string, "brief": string}|null, ' +
   '"transition": {"to_prompt": string|null, "reason": string}}. ' +
   'Set "to_prompt" to EXACTLY ONE of the state-prompt ids listed in your allowed-transitions ' +
-  'context block to continue to that next step, or null to stop here. Output nothing after the JSON.'
+  'context block to continue to that next step, or null to stop here. Set "spawn" to delegate a job ' +
+  'to a worker (only if your orientation lists it as available; the worker runs detached and returns ' +
+  'later), else null. Output nothing after the JSON.'
 
 /** Ensure the parsed/fallback output satisfies the Rust AgentOutput contract. */
 function normalize(o: any, fallbackText: string): unknown {
@@ -113,6 +132,8 @@ async function runInvoke(inv: any) {
   // The duck's act-phase capabilities, assembled by the harness for this state (tokens injected
   // into headers/env). The wall still gates EVERY call (canUseTool → Rust), tier-classified.
   if (inv.mcp_servers && typeof inv.mcp_servers === 'object') options.mcpServers = inv.mcp_servers
+  // Sub-agent defs the worker may Task-spawn (Phase 10). Empty for the duck's states.
+  if (inv.agents && typeof inv.agents === 'object' && Object.keys(inv.agents).length) options.agents = inv.agents
 
   let finalText = ''
   let sessionId: string | null = null

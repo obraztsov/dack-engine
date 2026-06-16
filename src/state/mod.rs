@@ -143,8 +143,30 @@ pub fn default_spec(state: ConsciousnessState) -> StateSpec {
             tool_scope: ToolScope {
                 allowed: vec![Read, FileWrite],
             },
-            writable_dirs: vec!["skills/", "stimuli/", "prompts/", "SOUL.md", "memory/"],
+            writable_dirs: vec!["skills/", "stimuli/", "prompts/", "SOUL.md", "memory/", "agents/"],
         },
+    }
+}
+
+/// The capability spec for a **worker** (Phase 10) — keyless sandboxed compute the duck wields, NOT
+/// a consciousness state. Reuses [`StateSpec`] (the responder's shape); `state` is cosmetic here (a
+/// worker carries no Post/Settle MCP tools — `mcp_servers={}` — so the scope never emits a
+/// state-named deny). The harness runs it in its own `/workspace` and sets the responder's
+/// relativize root to that workspace, so the worker may Read/Write/Edit/Bash there and spawn SYNC
+/// sub-helpers (`Other` = the SDK `Task` tool) — but has **no Post/SettleTx** (no outward authority)
+/// and **cannot write the soul repo** (soul paths don't relativize into the workspace → denied; the
+/// soul-integrity tripwire is the backstop for any Bash write).
+pub fn worker_spec() -> StateSpec {
+    use ToolClass::*;
+    StateSpec {
+        state: ConsciousnessState::Express, // cosmetic; a worker is not a consciousness state (see doc)
+        prompt_path: "",
+        model: ModelTier::Mixed,
+        tool_scope: ToolScope {
+            allowed: vec![Read, FileWrite, Shell, Other],
+        },
+        // "" = anything under the workspace (the responder's relativize root); the soul stays out.
+        writable_dirs: vec![""],
     }
 }
 

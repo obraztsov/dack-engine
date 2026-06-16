@@ -148,6 +148,21 @@ impl ActionResponder for StatePolicyResponder {
 
         // (1) Per-state class scoping — the first and primary gate.
         if !self.spec.tool_scope.allows(class) {
+            // The duck has a strong coding-agent prior: it tries to DELEGATE by calling an
+            // `Agent`/`Task` tool. For the duck no such tool exists (only a worker, whose `Other`
+            // scope admits `Task`, ever reaches this allowed). Catch that exact confusion and teach
+            // the real mechanism — the `spawn` OUTPUT FIELD — instead of a bare "not in scope".
+            if is_delegation_tool(&req.tool) {
+                return ActionDecision::Deny(format!(
+                    "there is no `{}` tool for you — you do NOT spawn a worker by calling a tool. \
+                     Delegation is a structured OUTPUT: in your Express step, return a `spawn` field \
+                     in your result JSON — `spawn: {{ \"agent\": \"coder\", \"brief\": \"<the job>\" }}` \
+                     — and stop. The harness then launches the keyless sandboxed worker for you, and \
+                     its summary returns later as a new wake you judge. Do NOT try to build it \
+                     yourself and do NOT keep searching for a tool; just return `spawn`.",
+                    req.tool
+                ));
+            }
             return ActionDecision::Deny(format!(
                 "tool `{}` (class {:?}) not in {:?} scope",
                 req.tool, class, self.spec.state
@@ -210,6 +225,14 @@ impl ActionResponder for StatePolicyResponder {
 
         ActionDecision::Allow
     }
+}
+
+/// Is this an agent/subagent-spawning tool (the SDK `Task`, or the harness `Agent`)? Used only to
+/// give a teaching deny when the DUCK reaches for one — a worker's `Other` scope admits these, so it
+/// never hits the deny. Matches the bare tool name (any `mcp__…__` prefix stripped), case-insensitive.
+fn is_delegation_tool(tool: &str) -> bool {
+    let bare = tool.rsplit("__").next().unwrap_or(tool);
+    bare.eq_ignore_ascii_case("Agent") || bare.eq_ignore_ascii_case("Task")
 }
 
 /// Lexically resolve `.`/`..` segments **without touching the filesystem** (a write target
@@ -323,6 +346,56 @@ mod tests {
         let w = req("Write", json!({"file_path": "memory/log.md", "contents": "x"}));
         assert!(matches!(r.decide(&w).await, ActionDecision::Allow));
         assert!(matches!(r.decide(&w).await, ActionDecision::Allow));
+    }
+
+    /// The WORKER sandbox (Phase 10): a worker may Bash + spawn sub-helpers (`Agent`/`Task`) + write
+    /// its `/workspace`, but has NO outward authority (Post/Settle) and CANNOT write the soul repo.
+    #[tokio::test]
+    async fn worker_spec_sandbox_allows_workspace_denies_soul_and_outward() {
+        let ws = "/tmp/dack-ws-test";
+        // Configure the post/settle prefixes so they CLASSIFY — then the worker scope (which omits
+        // Post/SettleTx) is what denies them (a real worker also has mcp_servers={}, a second guard).
+        let (post, settle) = caps();
+        let r = StatePolicyResponder::with_capabilities(crate::state::worker_spec(), post, settle)
+            .with_repo_root(ws);
+        // Bash + sub-helper spawn (Agent/Task = Other) are IN a worker's scope.
+        assert!(matches!(r.decide(&req("Bash", json!({"command": "cargo build"}))).await, ActionDecision::Allow));
+        assert!(matches!(r.decide(&req("Agent", json!({"description": "research X"}))).await, ActionDecision::Allow));
+        // It writes its workspace...
+        assert!(matches!(
+            r.decide(&req("Write", json!({"file_path": "/tmp/dack-ws-test/src/main.rs", "contents": "fn main(){}"}))).await,
+            ActionDecision::Allow
+        ));
+        // ...but NOT the soul repo (outside the workspace → denied)...
+        assert!(matches!(
+            r.decide(&req("Write", json!({"file_path": "/tmp/dack-soul/SOUL.md", "contents": "x"}))).await,
+            ActionDecision::Deny(_)
+        ));
+        // ...and has NO outward authority (no Post/Settle in scope).
+        assert!(matches!(r.decide(&req("mcp__twitter__post", json!({"text": "as the duck"}))).await, ActionDecision::Deny(_)));
+        assert!(matches!(r.decide(&req("mcp__cove-trading__buy_token", json!({}))).await, ActionDecision::Deny(_)));
+    }
+
+    /// When the DUCK (here Express) reaches for an `Agent`/`Task` tool to delegate — the strong
+    /// coding-agent prior — the deny doesn't just say "not in scope"; it teaches the real mechanism:
+    /// return the `spawn` output field. (A worker, by contrast, is ALLOWED these — tested above.)
+    #[tokio::test]
+    async fn duck_agent_call_is_denied_with_spawn_field_guidance() {
+        let r = responder(ConsciousnessState::Express);
+        for tool in ["Agent", "Task", "mcp__whatever__Task"] {
+            match r.decide(&req(tool, json!({"description": "build solution.py"}))).await {
+                ActionDecision::Deny(m) => {
+                    assert!(m.contains("spawn"), "{tool}: deny should teach the spawn field: {m}");
+                    assert!(!m.contains("class Other"), "{tool}: should be the teaching deny, not the bare one: {m}");
+                }
+                other => panic!("{tool}: expected a teaching Deny, got {other:?}"),
+            }
+        }
+        // A genuinely-unrelated out-of-scope tool still gets the plain scope deny (no spawn noise).
+        match r.decide(&req("SomeRandomTool", json!({}))).await {
+            ActionDecision::Deny(m) => assert!(!m.contains("spawn"), "unrelated tool: {m}"),
+            other => panic!("expected a Deny, got {other:?}"),
+        }
     }
 
     /// Dry-run (testing): the wall denies the configured tool PREFIXES (composed, not executed) but

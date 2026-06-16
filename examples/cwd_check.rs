@@ -50,10 +50,12 @@ async fn main() -> anyhow::Result<()> {
             .into(),
         blocks: vec![ContextBlock {
             label: "directive".into(),
-            body: "Use the Write tool to create a file named exactly `solution.py` — a RELATIVE \
-                path in your current working directory, NOT an absolute path — with this content:\n\
-                def reverse(s):\n    return s[::-1]\n\n\
-                Then submit: thought = 'done'; transition.to_state = null."
+            body: "Use the BASH tool to create a file named exactly `solution.py` — a RELATIVE \
+                path in your current working directory, NOT an absolute path — by running:\n\
+                printf 'def reverse(s):\\n    return s[::-1]\\n' > solution.py\n\
+                Then run `python3 solution.py` (it should exit 0). This exercises BOTH the worker's \
+                cwd and its shell. Then submit: thought = a short note on whether bash worked; \
+                transition.to_state = null."
                 .into(),
             trusted: true,
         }],

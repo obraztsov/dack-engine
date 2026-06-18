@@ -8,6 +8,7 @@
     "start": "bun run bridge.ts"
   },
   "dependencies": {
-    "@gitlawb/openclaude": "0.18.0"
+    "@gitlawb/openclaude": "0.18.0",
+    "grammy": "^1.44.0"
   }
 }

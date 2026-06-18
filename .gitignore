@@ -33,3 +33,6 @@ Cargo.lock        # binary crate, but harness is deployed as a built artifact; k
 # editor
 /.idea/
 .DS_Store
+
+# Telegram ingress adapter config (operator rails — chat/user routing)
+openclaude-bridge/telegram-ingress.config.json

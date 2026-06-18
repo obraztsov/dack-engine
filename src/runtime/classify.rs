@@ -119,6 +119,34 @@ mod tests {
     }
 
     #[test]
+    fn twitter_read_and_write_prefixes_dont_collide() {
+        // `twitter` (post) and `twitter-read` (read) share a stem but are DISTINCT prefixes — the
+        // `-`/`__` boundary keeps them apart. Security-critical: a read tool must NEVER classify as
+        // Post (it would let read-only Perceive "post"), and a post tool must never classify as Read
+        // (it would escape Express). Holds regardless of prefix-check order.
+        let post = open(&["mcp__twitter__"]);
+        let read = open(&["mcp__twitter-read__", "mcp__cove-read__"]);
+        let s = settle();
+        assert_eq!(
+            classify_tool("mcp__twitter-read__get_user", &json!({}), &s, &post, &read).0,
+            ToolClass::Read,
+        );
+        assert_eq!(
+            classify_tool("mcp__twitter__post", &json!({"text": "hi"}), &s, &post, &read).0,
+            ToolClass::Post,
+        );
+        // the read tool is NOT a post; the post tool is NOT a read.
+        assert_ne!(
+            classify_tool("mcp__twitter-read__get_thread", &json!({}), &s, &post, &read).0,
+            ToolClass::Post,
+        );
+        assert_ne!(
+            classify_tool("mcp__twitter__reply", &json!({}), &s, &post, &read).0,
+            ToolClass::Read,
+        );
+    }
+
+    #[test]
     fn server_tool_allowlist_is_fail_closed() {
         // cove-read serves a full surface (incl. buy_token) on the read-only token; the operator's
         // `tools` allowlist holds it to read tools. A whitelisted read tool → Read; a non-listed

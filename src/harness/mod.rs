@@ -350,7 +350,7 @@ impl Harness {
     ) -> Result<(AgentOutput, String, Option<TrustTier>)> {
         let spec = default_spec(prompt.state);
         // The capabilities this state-prompt plugs (the two-sided handshake, MCP2-B).
-        let (mcp_servers, inline_read) = self.assemble_mcp_servers(prompt, stimulus).await;
+        let (mcp_servers, inline_read) = self.assemble_mcp_servers(prompt, stimulus, cycle_trust).await;
         let recorder = self.wall_for(spec.clone(), inline_read);
         let system_prompt = self.system_prompt_for_prompt(prompt).await;
         // Offer ONLY the transitions the current trust ceiling permits — the agent never sees a hop
@@ -743,10 +743,12 @@ impl Harness {
     async fn assemble_mcp_servers(
         &self,
         prompt: &StatePrompt,
-        _stimulus: &Stimulus,
+        stimulus: &Stimulus,
+        cycle_trust: &TrustTier,
     ) -> (BTreeMap<String, serde_json::Value>, Vec<CapabilityPrefix>) {
         let state = prompt.state;
         let policy = self.config.tier_policy_for(state);
+        let lattice = self.config.lattice();
         let mut out = BTreeMap::new();
         let mut inline_read = Vec::new();
         for req in &prompt.mcp {
@@ -768,6 +770,20 @@ impl Harness {
                     if !tier_fits_state(server.tier, state) {
                         continue; // e.g. a settle-tier trading tool is never exposed outside Settle.
                     }
+                    // AUTHORIZATION (Phase 12): a `min_trust` server is plugged only if the cycle's
+                    // CURRENT (post-taint) trust clears it. Because it gates on the live cycle trust, a
+                    // high-trust cycle that has touched lower-trust data has already DEGRADED and loses
+                    // the privileged tool mid-walk — the firebreak, for free. `None` = no trust gate.
+                    if let Some(min) = &server.min_trust {
+                        if !lattice.permits(cycle_trust, min) {
+                            eprintln!(
+                                "mcp `{name}` needs min_trust `{}` > cycle trust `{}` — skipped",
+                                min.name(),
+                                cycle_trust.name()
+                            );
+                            continue;
+                        }
+                    }
                     let token = match &server.auth {
                         Some(auth) => match self.broker.env_for(&[auth.secret.clone()]).await {
                             Ok(env) => auth
@@ -782,7 +798,17 @@ impl Harness {
                         },
                         None => None,
                     };
-                    out.insert(name.to_string(), build_mcp_config(server, token.as_deref()));
+                    // Payload-scoped env (Phase 12): resolve each `scope_env` field from the waking
+                    // stimulus's payload and inject it into THIS server's env — so the capability is
+                    // locked to per-cycle data the model can't supply (e.g. telegram's source chat).
+                    let mut extra_env = std::collections::BTreeMap::new();
+                    for (var, field) in &server.scope_env {
+                        if let Some(v) = stimulus.payload.get(field) {
+                            let s = v.as_str().map(String::from).unwrap_or_else(|| v.to_string());
+                            extra_env.insert(var.clone(), s);
+                        }
+                    }
+                    out.insert(name.to_string(), build_mcp_config(server, token.as_deref(), &extra_env));
                 }
                 McpRef::Inline { name, url } => {
                     if policy.mcp_whitelist {
@@ -800,8 +826,11 @@ impl Harness {
                         // Inline = 3rd-party; it taints `public` at access time (it isn't in the
                         // registry, so `accessed_trust` falls through to public regardless).
                         trust: TrustTier::public(),
+                        // Inline servers are open-tier public reads — no authorization gate.
+                        min_trust: None,
+                        scope_env: std::collections::BTreeMap::new(),
                     };
-                    out.insert(name.clone(), build_mcp_config(&server, None));
+                    out.insert(name.clone(), build_mcp_config(&server, None, &std::collections::BTreeMap::new()));
                     inline_read.push(CapabilityPrefix::open(format!("mcp__{name}__")));
                 }
             }
@@ -1210,7 +1239,11 @@ fn tier_fits_state(tier: CapabilityTier, state: ConsciousnessState) -> bool {
 /// Resolve a registry [`McpServerConfig`] + its materialized `token` into an SDK-shaped MCP config
 /// (an `options.mcpServers` value) with the token injected into the http header / stdio env — so
 /// the token reaches the server but never the agent's context.
-fn build_mcp_config(server: &McpServerConfig, token: Option<&str>) -> serde_json::Value {
+fn build_mcp_config(
+    server: &McpServerConfig,
+    token: Option<&str>,
+    extra_env: &std::collections::BTreeMap<String, String>,
+) -> serde_json::Value {
     use serde_json::json;
     match &server.transport {
         McpTransport::Http { url } => {
@@ -1239,6 +1272,11 @@ fn build_mcp_config(server: &McpServerConfig, token: Option<&str>) -> serde_json
                 if let Some(envk) = &auth.env {
                     env.insert(envk.clone(), json!(tok));
                 }
+            }
+            // Payload-scoped env (Phase 12): per-cycle data the harness locks the server to (e.g.
+            // telegram's source chat) — the model never supplies it.
+            for (k, v) in extra_env {
+                env.insert(k.clone(), json!(v));
             }
             json!({ "type": "stdio", "command": command, "args": args, "env": env })
         }
@@ -1340,6 +1378,17 @@ pub fn build_baton(
     }
     if let Some(author) = stimulus.payload.get("author_username").and_then(|v| v.as_str()) {
         refs.insert("source_author".into(), author.to_string());
+    }
+    // Telegram (Phase 12): the chat that woke this cycle — context the duck SEES (who it's talking
+    // to). The reply DESTINATION is locked separately, into the telegram MCP's env (scope_env), so
+    // the model can't redirect it. chat_id may be a JSON number or string.
+    if let Some(c) = stimulus.payload.get("chat_id") {
+        if let Some(s) = c.as_str().map(String::from).or_else(|| c.as_i64().map(|n| n.to_string())) {
+            refs.insert("source_chat_id".into(), s);
+        }
+    }
+    if let Some(u) = stimulus.payload.get("from_username").and_then(|v| v.as_str()) {
+        refs.insert("source_from".into(), u.to_string());
     }
     Baton {
         gist,
@@ -1460,6 +1509,22 @@ mod tests {
         // The firebreak still holds: the raw mention text is NOT laundered into the baton.
         let serialized = serde_json::to_string(&baton).unwrap();
         assert!(!serialized.contains("gm duck"), "raw payload text must not ride the baton");
+    }
+
+    /// Phase 12.3 — a Telegram stimulus surfaces the source chat + sender as harness-derived refs
+    /// (the duck's reply CONTEXT). `chat_id` may be a JSON number; the reply DESTINATION itself is
+    /// locked separately into the MCP env (scope_env), not exposed as a model argument.
+    #[test]
+    fn build_baton_surfaces_telegram_source_refs() {
+        let mut stim = poisoned_stimulus();
+        stim.payload = serde_json::json!({
+            "chat_id": 80375347, "message_id": 42, "text": "gm duck",
+            "from_username": "mcfrog_xbt", "chat_type": "private"
+        });
+        let baton = build_baton(&perceive_output(), &stim, "runlogs/r#run".into(), TrustTier::from("org"));
+        assert_eq!(baton.refs.get("source_chat_id").map(String::as_str), Some("80375347"), "chat_id (a number) crosses as a ref");
+        assert_eq!(baton.refs.get("source_from").map(String::as_str), Some("mcfrog_xbt"));
+        assert!(!serde_json::to_string(&baton).unwrap().contains("gm duck"), "raw text must not ride the baton");
     }
 
     /// The dispatch wiring (Phase 4), offline against a mock bridge: a stimulus runs
@@ -1976,8 +2041,10 @@ mod tests {
             tier: CapabilityTier::Read,
             tools: vec![],
             trust: TrustTier::self_(),
+            min_trust: None,
+            scope_env: std::collections::BTreeMap::new(),
         };
-        let cfg = build_mcp_config(&server, Some("tok123"));
+        let cfg = build_mcp_config(&server, Some("tok123"), &std::collections::BTreeMap::new());
         assert_eq!(cfg["type"], "http");
         assert_eq!(cfg["url"], "https://cove/api/mcp");
         assert_eq!(cfg["headers"]["Authorization"], "Bearer tok123");
@@ -1996,10 +2063,15 @@ mod tests {
             tier: CapabilityTier::Post,
             tools: vec![],
             trust: TrustTier::public(),
+            min_trust: None,
+            scope_env: std::collections::BTreeMap::from([("TELEGRAM_REPLY_CHAT".into(), "chat_id".into())]),
         };
-        let cfg = build_mcp_config(&server, Some("bearer42"));
+        let extra = std::collections::BTreeMap::from([("TELEGRAM_REPLY_CHAT".to_string(), "80375347".to_string())]);
+        let cfg = build_mcp_config(&server, Some("bearer42"), &extra);
         assert_eq!(cfg["type"], "stdio");
         assert_eq!(cfg["env"]["X_BEARER_TOKEN"], "bearer42");
+        // Payload-scoped env is merged into the server's env (the destination-lock mechanism).
+        assert_eq!(cfg["env"]["TELEGRAM_REPLY_CHAT"], "80375347");
         assert_eq!(cfg["args"][1], "nonexistent-xyz.ts", "non-path arg left as-is");
     }
 
@@ -2067,16 +2139,16 @@ mod tests {
         };
 
         // Perceive: only read-tier cove-read; trading (settle) is NOT exposed.
-        let (p, _) = harness.assemble_mcp_servers(&prompt(ConsciousnessState::Perceive), &stim).await;
+        let (p, _) = harness.assemble_mcp_servers(&prompt(ConsciousnessState::Perceive), &stim, &TrustTier::self_()).await;
         assert!(p.contains_key("cove-read") && !p.contains_key("cove-trading"));
         assert_eq!(p["cove-read"]["headers"]["Authorization"], "Bearer cove-tok", "token injected, not in agent ctx");
 
         // Express: read but NEVER trading.
-        let (e, _) = harness.assemble_mcp_servers(&prompt(ConsciousnessState::Express), &stim).await;
+        let (e, _) = harness.assemble_mcp_servers(&prompt(ConsciousnessState::Express), &stim, &TrustTier::self_()).await;
         assert!(e.contains_key("cove-read") && !e.contains_key("cove-trading"), "trading never in Express");
 
         // Settle: trading IS exposed (the only state that reaches it).
-        let (s, _) = harness.assemble_mcp_servers(&prompt(ConsciousnessState::Settle), &stim).await;
+        let (s, _) = harness.assemble_mcp_servers(&prompt(ConsciousnessState::Settle), &stim, &TrustTier::self_()).await;
         assert!(s.contains_key("cove-trading") && s.contains_key("cove-read"));
 
         std::env::remove_var("DACK_COVE_TEST");
@@ -2189,7 +2261,7 @@ mod tests {
             id: "p".into(), state: ConsciousnessState::Perceive,
             mcp: vec![inline(), McpRef::Import("cove-read".into())], transitions: vec![], model: None, session: None, body: String::new(),
         };
-        let (servers, inline_read) = harness.assemble_mcp_servers(&open, &stim).await;
+        let (servers, inline_read) = harness.assemble_mcp_servers(&open, &stim, &TrustTier::self_()).await;
         assert!(servers.contains_key("rootai"), "inline admitted on an open tier");
         assert_eq!(servers["rootai"]["type"], "http");
         assert!(servers["rootai"]["headers"].as_object().unwrap().is_empty(), "inline carries NO secret");
@@ -2202,8 +2274,65 @@ mod tests {
             id: "e".into(), state: ConsciousnessState::Express,
             mcp: vec![inline()], transitions: vec![], model: None, session: None, body: String::new(),
         };
-        let (servers, inline_read) = harness.assemble_mcp_servers(&locked, &stim).await;
+        let (servers, inline_read) = harness.assemble_mcp_servers(&locked, &stim, &TrustTier::self_()).await;
         assert!(servers.is_empty() && inline_read.is_empty(), "no self-plug on a locked tier");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Phase 12 / the AUTHORIZATION axis — a `min_trust` server is assembled ONLY for a cycle whose
+    /// CURRENT trust clears it. Same state (Express), same tier_policy: a `min_trust: org` capability
+    /// is denied to a `public` cycle, admitted to `org`, and admitted to any HIGHER tier (`self`) —
+    /// gated purely by the cycle's live (post-taint) trust, orthogonal to the state.
+    #[tokio::test]
+    async fn min_trust_gates_assembly_by_cycle_trust() {
+        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::queue::InMemoryQueue;
+        use crate::repo::git::PlainGitRepo;
+        use crate::runlog::FileRunLog;
+        use std::collections::HashMap;
+
+        // org sits between public and self in the lattice; telegram is a post-tier server gated org.
+        let config = Arc::new(
+            DackConfig::from_yaml(
+                "operator_did: \"did:x\"\n\
+                 trust_tiers:\n  - { name: public, reaches: express }\n  - { name: org, reaches: settle }\n  \
+                   - { name: self, reaches: reflect }\n  - { name: operator_signed, reaches: reflect }\n\
+                 tier_policy:\n  express: { mcp_whitelist: true, import: [telegram] }\n\
+                 mcp_servers:\n  \
+                   - name: telegram\n    transport: { type: stdio, command: bun, args: [run, t.ts] }\n    tier: post\n    min_trust: org\n",
+            )
+            .unwrap(),
+        );
+        let queue: Arc<dyn Queue> = Arc::new(InMemoryQueue::new());
+        let tmp = std::env::temp_dir().join(format!("dack-mintrust-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).ok();
+        let harness = Harness {
+            config: config.clone(),
+            queue: queue.clone(),
+            bus: Arc::new(Bus::new(config.clone(), queue.clone())),
+            runtime: Arc::new(RecordingRuntime { seen: std::sync::Mutex::new(Vec::new()), out: perceive_output() }),
+            repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
+            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
+            broker: Arc::new(SecretsBroker::new(vec![])),
+            sessions: Default::default(),
+        };
+        let stim = poisoned_stimulus();
+        let express = StatePrompt {
+            id: "e".into(), state: ConsciousnessState::Express,
+            mcp: vec![McpRef::Import("telegram".into())], transitions: vec![], model: None, session: None, body: String::new(),
+        };
+
+        // public cycle (rank 0) < org (rank 1) → telegram WITHHELD.
+        let (servers, _) = harness.assemble_mcp_servers(&express, &stim, &TrustTier::public()).await;
+        assert!(!servers.contains_key("telegram"), "min_trust:org is denied to a public cycle");
+        // org cycle (rank 1) == org → admitted.
+        let (servers, _) = harness.assemble_mcp_servers(&express, &stim, &TrustTier("org".into())).await;
+        assert!(servers.contains_key("telegram"), "min_trust:org is admitted to an org cycle");
+        // self cycle (rank 2) > org → a higher-trust cycle also clears it.
+        let (servers, _) = harness.assemble_mcp_servers(&express, &stim, &TrustTier::self_()).await;
+        assert!(servers.contains_key("telegram"), "a higher-trust (self) cycle clears min_trust:org");
 
         std::fs::remove_dir_all(&tmp).ok();
     }

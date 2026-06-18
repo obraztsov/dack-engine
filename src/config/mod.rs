@@ -142,6 +142,12 @@ impl TrustLattice {
             b.clone()
         }
     }
+    /// The AUTHORIZATION check (Phase 12): does a cycle at trust `cycle` clear a capability's
+    /// `min_trust`? True iff `cycle` ranks `>=` `min`. Unknown names rank 0 (fail-safe — an unknown
+    /// cycle tier clears only rank-0 `min`; an unknown `min` is rank 0 so it gates nothing extra).
+    pub fn permits(&self, cycle: &TrustTier, min: &TrustTier) -> bool {
+        self.rank(cycle) >= self.rank(min)
+    }
     pub fn contains(&self, name: &str) -> bool {
         self.tiers.iter().any(|d| d.name == name)
     }
@@ -268,6 +274,24 @@ pub struct McpServerConfig {
     /// so it taints **public** at access time (a soul can never self-grant trust).
     #[serde(default = "default_self_trust")]
     pub trust: TrustTier,
+    /// **Minimum caller trust** to use this server — the AUTHORIZATION axis (Phase 12), distinct from
+    /// `tier` (which STATE/class) and `trust` (the taint label of its DATA). The server is assembled
+    /// for a cycle ONLY if the cycle's CURRENT (post-taint) trust ranks `>=` this tier in the lattice.
+    /// `None` (default) = no trust gate (any cycle clearing the tier/state checks). Gating on the
+    /// CURRENT trust means a high-trust cycle that touches `public` data **degrades and loses a
+    /// `min_trust`-gated tool mid-cycle** (the firebreak, for free). e.g. a `telegram` send tool with
+    /// `min_trust: org` is unreachable from a public tweet cycle, but reachable from a Telegram-org
+    /// operator cycle — *unless* that cycle then reads a public link and degrades below `org`.
+    #[serde(default)]
+    pub min_trust: Option<TrustTier>,
+    /// **Payload-scoped env** (Phase 12) — `{ ENV_VAR: payload_field }`. At assembly the harness reads
+    /// each `payload_field` from the waking stimulus and injects it into THIS server's env (next to the
+    /// token), so the capability is locked to per-cycle data the MODEL never supplies. e.g. telegram
+    /// `reply` is scoped `{ TELEGRAM_REPLY_CHAT: chat_id, TELEGRAM_REPLY_TO: message_id }` → it can only
+    /// reply to the chat that woke this cycle; a prompt-injection can't redirect it to another chat
+    /// (there is no `chat_id` argument). Absent payload field → that env var is simply not set.
+    #[serde(default)]
+    pub scope_env: std::collections::BTreeMap<String, String>,
 }
 
 /// Which agent runtime drives the consciousness loop — the [`crate::runtime::RuntimeClient`] impl
@@ -812,6 +836,12 @@ secrets:
         assert_eq!(l.reaches(&TrustTier::public()), ConsciousnessState::Express);
         assert_eq!(l.reaches(&TrustTier::from("org")), ConsciousnessState::Settle);
         assert_eq!(l.reaches(&TrustTier::self_()), ConsciousnessState::Reflect);
+        // AUTHORIZATION (Phase 12 `min_trust`): a cycle clears a requirement iff it ranks >= it.
+        assert!(l.permits(&TrustTier::from("org"), &TrustTier::from("org")), "org clears min_trust:org");
+        assert!(l.permits(&TrustTier::self_(), &TrustTier::from("org")), "a higher tier clears min_trust:org");
+        assert!(!l.permits(&TrustTier::public(), &TrustTier::from("org")), "a lower tier does NOT clear min_trust:org");
+        assert!(l.permits(&TrustTier::public(), &TrustTier::public()), "any cycle clears a public-min requirement");
+        assert!(!l.permits(&TrustTier::from("bogus"), &TrustTier::from("org")), "an unknown cycle tier (rank 0) fails safe");
         // An unknown tier fails SAFE: rank 0 (lowest), reaches Express (never raises a ceiling).
         assert_eq!(l.rank(&TrustTier::from("bogus")), 0);
         assert_eq!(l.reaches(&TrustTier::from("bogus")), ConsciousnessState::Express);

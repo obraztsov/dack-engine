@@ -80,15 +80,27 @@ impl Ingestor {
                     .run(&exe, &fired.payload, &env, SENSOR_TIMEOUT)
                     .await?
             }
-            // Pure-cron self-prompt (the duck's alarm clock, PRD §10.3): no sensor, so
-            // synthesize one candidate carrying the duty's own emits type. The *content* is
-            // the trusted directive body, attached by the bus; the payload is empty.
-            None => vec![SensorCandidate {
-                type_: def.frontmatter.emits.type_.clone(),
-                payload: serde_json::json!({}),
-                dedup_key: None,
-                payload_tier: None,
-            }],
+            // No sensor: a pure-cron self-prompt (empty payload — the trusted directive body IS the
+            // content, attached by the bus) OR a webhook whose POSTED BODY is the payload directly
+            // (the channel adapter already normalized it; the body is DATA, never a script — PRD
+            // §5.3). The tier is the source's (webhook → `webhook_trust(path)`, set in `payload_seed`).
+            None => {
+                let payload = match &def.frontmatter.trigger {
+                    crate::stimuli::Trigger::Webhook { .. } => {
+                        serde_json::from_slice(&fired.payload).unwrap_or_else(|_| serde_json::json!({}))
+                    }
+                    crate::stimuli::Trigger::Cron { .. } => serde_json::json!({}),
+                };
+                // The adapter may include a `dedup_key` (e.g. the telegram message_id) so the same
+                // message isn't processed twice.
+                let dedup_key = payload.get("dedup_key").and_then(|v| v.as_str()).map(String::from);
+                vec![SensorCandidate {
+                    type_: def.frontmatter.emits.type_.clone(),
+                    payload,
+                    dedup_key,
+                    payload_tier: None,
+                }]
+            }
         };
 
         // Advance the watermark to the newest discovered item, at DISCOVERY time (so a later

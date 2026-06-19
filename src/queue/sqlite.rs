@@ -34,6 +34,8 @@ CREATE TABLE IF NOT EXISTS stimulus (
     status         TEXT NOT NULL,
     directive_body TEXT NOT NULL,
     entry          TEXT NOT NULL,
+    -- Debounce gate (coalescing): earliest epoch-sec this row may be popped. NULL ⇒ immediate.
+    pop_after      INTEGER,
     -- When `next()` leased this row (epoch secs). Queue-internal metadata (NOT on `Stimulus`):
     -- a boot sweep requeues `dispatched` rows; `started_at` dates the lease for future
     -- stale-lease detection. NULL until first dispatched.
@@ -51,7 +53,7 @@ CREATE TABLE IF NOT EXISTS cursor (
 
 /// The column list, in a fixed order shared by every SELECT and [`read_raw`].
 const COLS: &str =
-    "id,source,type,directive_tier,payload_tier,payload,provenance,received_at,dedup_key,priority,status,directive_body,entry";
+    "id,source,type,directive_tier,payload_tier,payload,provenance,received_at,dedup_key,priority,status,directive_body,entry,pop_after";
 
 pub struct SqliteQueue {
     conn: Mutex<Connection>,
@@ -78,6 +80,9 @@ impl SqliteQueue {
         )
         .map_err(db)?;
         conn.execute_batch(SCHEMA).map_err(db)?;
+        // Migration for a pre-existing DB created before `pop_after` (the debounce gate): add the
+        // column if absent. A duplicate-column error means it's already there — ignore it.
+        let _ = conn.execute("ALTER TABLE stimulus ADD COLUMN pop_after INTEGER", []);
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -117,6 +122,7 @@ struct RawRow {
     status: String,
     directive_body: String,
     entry: String,
+    pop_after: Option<i64>,
 }
 
 fn read_raw(row: &rusqlite::Row) -> rusqlite::Result<RawRow> {
@@ -134,6 +140,7 @@ fn read_raw(row: &rusqlite::Row) -> rusqlite::Result<RawRow> {
         status: row.get(10)?,
         directive_body: row.get(11)?,
         entry: row.get(12)?,
+        pop_after: row.get(13)?,
     })
 }
 
@@ -148,6 +155,7 @@ fn raw_to_stimulus(r: RawRow) -> Result<Stimulus> {
         provenance: r.provenance,
         received_at: r.received_at,
         dedup_key: r.dedup_key,
+        pop_after: r.pop_after,
         priority: enum_from_db(&r.priority)?,
         status: enum_from_db(&r.status)?,
         directive_body: r.directive_body,
@@ -162,8 +170,8 @@ impl Queue for SqliteQueue {
         // OR IGNORE: re-enqueuing the same id (e.g. a retried fire) is a no-op, never a dup.
         conn.execute(
             "INSERT OR IGNORE INTO stimulus
-             (id,source,type,directive_tier,payload_tier,payload,provenance,received_at,dedup_key,priority,priority_rank,status,directive_body,entry)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+             (id,source,type,directive_tier,payload_tier,payload,provenance,received_at,dedup_key,priority,priority_rank,status,directive_body,entry,pop_after)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
             params![
                 s.id.0,
                 s.source,
@@ -179,6 +187,7 @@ impl Queue for SqliteQueue {
                 enum_to_db(&s.status)?,
                 s.directive_body,
                 s.entry,
+                s.pop_after,
             ],
         )
         .map_err(db)?;
@@ -186,15 +195,19 @@ impl Queue for SqliteQueue {
     }
 
     async fn next(&self) -> Result<Option<Stimulus>> {
+        let now = chrono::Utc::now().timestamp();
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(db)?;
+        // Debounce gate: skip a row still within its coalesce window (`pop_after > now`) so a chat's
+        // messages keep folding into it; an immediate row (`pop_after IS NULL`) is always eligible.
         let raw = tx
             .query_row(
                 &format!(
                     "SELECT {COLS} FROM stimulus WHERE status='pending'
+                       AND (pop_after IS NULL OR pop_after <= ?1)
                      ORDER BY priority_rank ASC, received_at ASC LIMIT 1"
                 ),
-                [],
+                params![now],
                 read_raw,
             )
             .optional()
@@ -205,7 +218,7 @@ impl Queue for SqliteQueue {
         };
         tx.execute(
             "UPDATE stimulus SET status='dispatched', started_at=?2 WHERE id=?1",
-            params![raw.id, chrono::Utc::now().timestamp()],
+            params![raw.id, now],
         )
         .map_err(db)?;
         tx.commit().map_err(db)?;
@@ -315,6 +328,7 @@ mod tests {
             provenance: None,
             received_at,
             dedup_key: dedup.map(|s| s.into()),
+            pop_after: None,
             priority: prio,
             status: StimulusStatus::Pending,
             directive_body: "duty".into(),
@@ -336,6 +350,27 @@ mod tests {
         assert_eq!(q.next().await.unwrap().unwrap().id.0, "normal-old");
         assert_eq!(q.next().await.unwrap().unwrap().id.0, "normal-new");
         assert_eq!(q.next().await.unwrap().unwrap().id.0, "low");
+        assert!(q.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn pop_after_gates_a_debounced_row_until_its_window_passes() {
+        let q = SqliteQueue::open_in_memory().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        // A row whose debounce window is still open (pop_after in the future) is NOT yet poppable…
+        let mut future = mk("debounced", Priority::Normal, now, "telegram_message", Some("chat1"));
+        future.pop_after = Some(now + 3600);
+        q.enqueue(future).await.unwrap();
+        // …though it counts as pending (it's queued, just held).
+        assert_eq!(q.depth().await.unwrap(), 1);
+        assert!(q.next().await.unwrap().is_none(), "row held until its window passes");
+
+        // A row whose window already elapsed (pop_after in the past) IS poppable.
+        let mut past = mk("ready", Priority::Normal, now - 10, "telegram_message", Some("chat2"));
+        past.pop_after = Some(now - 1);
+        q.enqueue(past).await.unwrap();
+        assert_eq!(q.next().await.unwrap().unwrap().id.0, "ready");
+        // The still-debounced row remains held.
         assert!(q.next().await.unwrap().is_none());
     }
 

@@ -105,6 +105,18 @@ impl Bus {
                 continue;
             }
 
+            // Debounce gate: a `batch` duty with a positive `window_sec` holds this NEW accumulator
+            // row unpoppable until `received_at + window_sec`, so the chat's later messages fold into
+            // it (above) before it fires as one wake. Folds keep the accumulator's `received_at`, so
+            // the window is measured from the FIRST message (a fixed cadence, not a sliding one). A
+            // `window_sec` of 0/absent (or `latest`/`none`) ⇒ `None` = immediately poppable.
+            let pop_after = match &fm.coalesce {
+                Some(p) if matches!(p.mode, CoalesceMode::Batch) => {
+                    p.window_sec.filter(|w| *w > 0).map(|w| received_at + w as i64)
+                }
+                _ => None,
+            };
+
             let id = StimulusId(format!("{}-{}-{}", fm.id, received_at, i));
             self.queue
                 .enqueue(Stimulus {
@@ -117,6 +129,7 @@ impl Bus {
                     provenance: None,
                     received_at,
                     dedup_key,
+                    pop_after,
                     priority,
                     status: StimulusStatus::Pending,
                     directive_body: def.directive_body.clone(),
@@ -149,20 +162,44 @@ impl Bus {
 
 }
 
-/// Fold a new payload into a batch accumulator. Shape: `{"_coalesced": true, "items":[…]}`.
-/// The first fold wraps the existing single payload; subsequent folds push onto `items`.
-/// Context assembly (Phase 5) renders a coalesced row as "N things since last wake".
+/// Fold a new payload into a batch accumulator. Shape: `{<latest msg's fields…>, "_coalesced": true,
+/// "items":[…]}`. The first fold wraps the existing single payload; subsequent folds push onto `items`.
+/// Context assembly (Phase 5) renders a coalesced row from `items` ("N things since last wake").
+///
+/// **The latest message's top-level fields are hoisted onto the accumulator** (the new payload's
+/// scalars overlay the row, while `items` keeps the full history). Same-chat folds share their
+/// thread-invariant fields (`chat_id`), and per-message fields (`message_id`, `from_username`) track
+/// the latest — so a payload-field consumer that runs on the *row* (the `scope_env` reply
+/// destination-lock → the chat + the newest message; the baton's `source_*` refs) still resolves,
+/// pointing at the most recent message. Without this, batching would bury `chat_id` inside `items`
+/// and a coalesced wake could not be replied to.
 fn merge_batch(existing: serde_json::Value, new: &serde_json::Value) -> serde_json::Value {
     use serde_json::Value;
-    match existing {
-        Value::Object(mut m) if m.get("_coalesced") == Some(&Value::Bool(true)) => {
-            if let Some(Value::Array(items)) = m.get_mut("items") {
-                items.push(new.clone());
-            }
-            Value::Object(m)
+    // Start from the latest message's fields (so top-level tracks the newest), then attach the
+    // accumulated `items` + the `_coalesced` marker.
+    let mut out = match new {
+        Value::Object(m) => m.clone(),
+        other => {
+            let mut m = serde_json::Map::new();
+            m.insert("value".into(), other.clone());
+            m
         }
-        other => serde_json::json!({ "_coalesced": true, "items": [other, new] }),
-    }
+    };
+    let items = match existing {
+        Value::Object(mut m) if m.get("_coalesced") == Some(&Value::Bool(true)) => {
+            match m.remove("items") {
+                Some(Value::Array(mut items)) => {
+                    items.push(new.clone());
+                    items
+                }
+                _ => vec![new.clone()],
+            }
+        }
+        other => vec![other, new.clone()],
+    };
+    out.insert("_coalesced".into(), Value::Bool(true));
+    out.insert("items".into(), Value::Array(items));
+    Value::Object(out)
 }
 
 #[cfg(test)]
@@ -194,6 +231,54 @@ mod tests {
             dedup_key: Some(key.into()),
             payload_tier: None,
         }
+    }
+
+    /// A chat-shaped candidate (telegram): a per-chat thread key + chat_id/message_id fields.
+    fn chat_cand(chat: i64, msg: i64, text: &str) -> SensorCandidate {
+        SensorCandidate {
+            type_: StimulusType::from("telegram_message"),
+            payload: json!({ "chat_id": chat, "message_id": msg, "text": text }),
+            dedup_key: Some(chat.to_string()), // the THREAD key (per-chat), not per-message
+            payload_tier: None,
+        }
+    }
+
+    /// The telegram group case: a chat's messages fold into ONE debounced wake, and the coalesced
+    /// row keeps the LATEST message's `chat_id`/`message_id` at top-level (so the reply
+    /// destination-lock + baton still resolve) while `items` holds the whole batch.
+    #[tokio::test]
+    async fn batch_hoists_latest_fields_and_sets_pop_after() {
+        let b = bus();
+        let def = StimulusDef::parse(
+            "---\nid: tg\ntrigger: { type: webhook, path: /telegram/pub }\n\
+             directive_tier: self\nemits:\n  type: telegram_message\n\
+             coalesce: { mode: batch, window_sec: 90 }\nentry: telegram/perceive\n---\nGroup.\n",
+            "stimuli/tg/STIMULUS.md",
+        )
+        .unwrap();
+        // Three messages in the same chat (thread key = chat_id) at received_at=1000.
+        b.ingest(
+            &def,
+            vec![chat_cand(7, 1, "gm"), chat_cand(7, 2, "wen"), chat_cand(7, 3, "ser")],
+            1000,
+            TrustTier::public(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(b.queue.depth().await.unwrap(), 1, "the chat folds into one wake");
+        // The debounced row is held until its window passes (pop_after = 1000 + 90, far in the past
+        // vs the wall clock here, so it IS poppable in this test).
+        let row = b.queue.next().await.unwrap().unwrap();
+        assert_eq!(row.pop_after, Some(1090), "debounce gate = received_at + window_sec");
+        assert_eq!(row.payload.get("chat_id").and_then(|v| v.as_i64()), Some(7), "chat hoisted");
+        assert_eq!(
+            row.payload.get("message_id").and_then(|v| v.as_i64()),
+            Some(3),
+            "the LATEST message_id is hoisted (reply targets the newest)"
+        );
+        let items = row.payload.get("items").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(items.len(), 3, "every message kept in items for context");
+        assert!(row.payload.get("_coalesced").unwrap().as_bool().unwrap());
     }
 
     #[tokio::test]

@@ -292,6 +292,13 @@ pub struct McpServerConfig {
     /// (there is no `chat_id` argument). Absent payload field → that env var is simply not set.
     #[serde(default)]
     pub scope_env: std::collections::BTreeMap<String, String>,
+    /// **Static env** injected into the server (stdio) — operator config the server needs that is
+    /// neither a secret (`auth`) nor per-cycle (`scope_env`): e.g. the privileged `telegram-send`
+    /// server's named-destination map (`{ TELEGRAM_DESTINATIONS: '{"operator":123,"trenchers":-100…}' }`).
+    /// Keeping it here (the gitignored config) — not in the soul — means the duck can only reach
+    /// operator-registered destinations, never an arbitrary/hallucinated chat_id.
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
 }
 
 /// Which agent runtime drives the consciousness loop — the [`crate::runtime::RuntimeClient`] impl

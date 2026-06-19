@@ -68,6 +68,7 @@ pub fn reflect_stimulus(now: i64) -> Stimulus {
         provenance: Some("harness reflect schedule".into()),
         received_at: now,
         dedup_key: Some("reflect".into()),
+        pop_after: None,
         priority: Priority::Low,
         status: StimulusStatus::Pending,
         directive_body: "It's time to reflect. Review your recent runlogs and memory, and consider \
@@ -172,6 +173,7 @@ impl Harness {
             provenance: Some("harness restart".into()),
             received_at: now,
             dedup_key: None,
+            pop_after: None,
             priority: Priority::Low,
             status: StimulusStatus::Pending,
             directive_body: "You just came back online after being down. Take stock; if it suits \
@@ -830,6 +832,7 @@ impl Harness {
                         // Inline servers are open-tier public reads — no authorization gate.
                         min_trust: None,
                         scope_env: std::collections::BTreeMap::new(),
+                        env: std::collections::BTreeMap::new(),
                     };
                     out.insert(name.clone(), build_mcp_config(&server, None, &std::collections::BTreeMap::new()));
                     inline_read.push(CapabilityPrefix::open(format!("mcp__{name}__")));
@@ -1100,6 +1103,7 @@ async fn enqueue_worker_completion(queue: &Arc<dyn Queue>, spawn: &SpawnRequest,
         provenance: Some(format!("worker {}", spawn.agent)),
         received_at: now,
         dedup_key: None,
+        pop_after: None,
         priority: Priority::Low,
         status: StimulusStatus::Pending,
         directive_body: format!(
@@ -1274,6 +1278,11 @@ fn build_mcp_config(
                     env.insert(envk.clone(), json!(tok));
                 }
             }
+            // Static operator config env (neither secret nor per-cycle): e.g. telegram-send's named
+            // destinations. Injected before scope_env so a per-cycle value always wins on conflict.
+            for (k, v) in &server.env {
+                env.insert(k.clone(), json!(v));
+            }
             // Payload-scoped env (Phase 12): per-cycle data the harness locks the server to (e.g.
             // telegram's source chat) — the model never supplies it.
             for (k, v) in extra_env {
@@ -1428,6 +1437,7 @@ mod tests {
             provenance: None,
             received_at: 0,
             dedup_key: None,
+            pop_after: None,
             priority: Priority::Low,
             status: StimulusStatus::Pending,
             directive_body: "Standing directive: engage with mentions.".into(),
@@ -2044,6 +2054,7 @@ mod tests {
             trust: TrustTier::self_(),
             min_trust: None,
             scope_env: std::collections::BTreeMap::new(),
+            env: std::collections::BTreeMap::new(),
         };
         let cfg = build_mcp_config(&server, Some("tok123"), &std::collections::BTreeMap::new());
         assert_eq!(cfg["type"], "http");
@@ -2066,11 +2077,15 @@ mod tests {
             trust: TrustTier::public(),
             min_trust: None,
             scope_env: std::collections::BTreeMap::from([("TELEGRAM_REPLY_CHAT".into(), "chat_id".into())]),
+            // Static operator config env (e.g. telegram-send destinations) — injected alongside.
+            env: std::collections::BTreeMap::from([("TELEGRAM_DESTINATIONS".into(), "{\"op\":1}".into())]),
         };
         let extra = std::collections::BTreeMap::from([("TELEGRAM_REPLY_CHAT".to_string(), "80375347".to_string())]);
         let cfg = build_mcp_config(&server, Some("bearer42"), &extra);
         assert_eq!(cfg["type"], "stdio");
         assert_eq!(cfg["env"]["X_BEARER_TOKEN"], "bearer42");
+        // Static env is injected (operator config the server needs).
+        assert_eq!(cfg["env"]["TELEGRAM_DESTINATIONS"], "{\"op\":1}");
         // Payload-scoped env is merged into the server's env (the destination-lock mechanism).
         assert_eq!(cfg["env"]["TELEGRAM_REPLY_CHAT"], "80375347");
         assert_eq!(cfg["args"][1], "nonexistent-xyz.ts", "non-path arg left as-is");

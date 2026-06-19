@@ -133,6 +133,12 @@ pub struct Stimulus {
     pub received_at: i64,
     /// Coalescing key (indexed in SQLite).
     pub dedup_key: Option<String>,
+    /// **Debounce gate** (coalescing): the earliest unix second this row may be popped. A
+    /// `batch`-coalescing duty sets it to `received_at + window_sec` so a chat's messages accumulate
+    /// (fold) for the window, then fire as ONE wake — the loop skips the row until `now >= pop_after`.
+    /// `None` ⇒ immediately poppable (the default for every non-debounced stimulus).
+    #[serde(default)]
+    pub pop_after: Option<i64>,
     pub priority: Priority,
     pub status: StimulusStatus,
     /// The trusted directive text (the `.md` body) carried alongside the untrusted

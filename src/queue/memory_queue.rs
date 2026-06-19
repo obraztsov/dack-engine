@@ -30,12 +30,15 @@ impl Queue for InMemoryQueue {
     }
 
     async fn next(&self) -> Result<Option<Stimulus>> {
+        let now = chrono::Utc::now().timestamp();
         let mut rows = self.rows.lock().unwrap();
-        // Highest priority = lowest numeric, then oldest received_at.
+        // Highest priority = lowest numeric, then oldest received_at. A still-debounced row
+        // (`pop_after > now`) is skipped so its coalesce window keeps accumulating.
         let idx = rows
             .iter()
             .enumerate()
             .filter(|(_, s)| s.status == StimulusStatus::Pending)
+            .filter(|(_, s)| s.pop_after.map_or(true, |t| t <= now))
             .min_by_key(|(_, s)| (s.priority.numeric(), s.received_at))
             .map(|(i, _)| i);
         match idx {

@@ -146,6 +146,7 @@ async fn say(config_path: &str, instruction: String) -> Result<()> {
         provenance: Some(format!("operator_sig:{sig_b64}")),
         received_at: now,
         dedup_key: None,
+        pop_after: None,
         // The operator's word is the highest-trust stimulus — let it jump the queue.
         priority: Priority::Urgent,
         status: StimulusStatus::Pending,

@@ -545,6 +545,44 @@ pub struct DackConfig {
     /// a new tool (cove.trade, …) is an entry here + a token — never a harness/bridge code change.
     #[serde(default)]
     pub mcp_servers: Vec<McpServerConfig>,
+    /// **Long-running side processes the harness owns** (the "modules" supervisor). Each is a
+    /// persistent companion — e.g. the Telegram ingress adapter — that the harness spawns at boot,
+    /// injects declared `secrets:` into, supervises (restart-on-exit with backoff), and tears down on
+    /// shutdown. This is the contract for the future hosted-ducks orchestrator: a duck's full runtime
+    /// (consciousness loop + its channels) is declared in ONE config and started by ONE process. A
+    /// module is operator-trusted plumbing — NOT a consciousness seam (it touches no trust lattice);
+    /// it only carries normalized events TO the harness webhook, where the trust contract applies.
+    #[serde(default)]
+    pub modules: Vec<ModuleConfig>,
+}
+
+/// One harness-supervised long-running side process (PRD: the "modules" supervisor). Declarative:
+/// the harness spawns `command` in the repo root with `env` + the materialized `secrets:` env, and
+/// keeps it alive (restart-on-exit, exponential backoff) until shutdown. Adding a channel/companion
+/// is a config entry + its script — never a harness change.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModuleConfig {
+    /// Stable id for logs/diagnostics (e.g. `telegram-ingress`).
+    pub name: String,
+    /// argv — `command[0]` is the program (e.g. `["bun", "run", "openclaude-bridge/telegram-ingress.ts"]`).
+    pub command: Vec<String>,
+    /// Secrets-provider names whose materialized env is injected (e.g. `telegram_bot` →
+    /// `TELEGRAM_BOT_TOKEN`). Resolved via the harness `SecretsBroker` at each (re)start, so a
+    /// rotated token is picked up on the next restart — the module never holds a stale secret.
+    #[serde(default)]
+    pub secrets: Vec<String>,
+    /// Static env injected into the module (non-secret config — paths, ids, flags).
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// Working directory the module runs in. `None` ⇒ the harness process's cwd (where `dack run`
+    /// was launched — the engine working tree that holds `openclaude-bridge/`, `secrets/`, the
+    /// adapter's own config). Set it to pin a module to a different tree.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Whether the supervisor starts this module. `false` ⇒ declared but dormant (kept in config
+    /// for documentation / one-flag enable). Defaults to `true`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
 }
 
 /// One capability tool prefix the wall classifies by, plus its optional per-server tool allowlist.

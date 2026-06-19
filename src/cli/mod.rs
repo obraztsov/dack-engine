@@ -17,7 +17,9 @@ use crate::bus::Bus;
 use crate::config::DackConfig;
 use crate::error::{DackError, Result};
 use crate::harness::ingest::{spawn_stimuli_watcher, Ingestor};
+use crate::harness::modules::ModuleSupervisor;
 use crate::harness::Harness;
+use crate::sandbox::{HostSandbox, Sandbox};
 use crate::identity::gitlawb::GitlawbIdentity;
 use crate::identity::{IdentityProvider, IdentityRole};
 use crate::model::stimulus::{Priority, Stimulus, StimulusId, StimulusStatus, StimulusType, TrustTier};
@@ -373,6 +375,22 @@ async fn run(config_path: &str) -> Result<()> {
         let sd = shutdown_rx.clone();
         async move { h.reflect_scheduler(sd).await }
     });
+
+    // Modules supervisor (the harness's ownership of long-running channels): spawn + restart-supervise
+    // each enabled `modules:` entry (e.g. the Telegram ingress) through the Sandbox seam, injecting
+    // its declared secrets. ONE `dack run` now starts the duck's whole runtime — mind + channels —
+    // which is the hosted-ducks contract. No-op when `modules:` is empty.
+    if !config.modules.is_empty() {
+        let sandbox: Arc<dyn Sandbox> = Arc::new(HostSandbox);
+        // Default module cwd = the harness process's cwd (the engine working tree that holds
+        // `openclaude-bridge/`, `secrets/`, and the adapter configs the module commands reference).
+        // A module may override per-entry via `cwd:`.
+        let module_cwd = std::env::current_dir().unwrap_or_else(|_| repo_root.clone());
+        let supervisor =
+            ModuleSupervisor::new(config.modules.clone(), broker.clone(), sandbox, module_cwd);
+        let sd = shutdown_rx.clone();
+        tokio::spawn(async move { supervisor.run(sd).await });
+    }
 
     let ingestor = Arc::new(Ingestor {
         repo_root,

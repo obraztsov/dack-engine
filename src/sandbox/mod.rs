@@ -36,6 +36,10 @@ pub enum ExecKind {
     Agent,
     /// A delegated worker (Phase 10) — isolated `/workspace`, never the soul.
     Worker,
+    /// A harness-owned long-running side process (the "modules" supervisor) — a channel adapter or
+    /// companion (e.g. Telegram ingress). Operator-trusted plumbing; inherits the harness env so it
+    /// finds the toolchain (`bun`, PATH) and overlays its declared module env/secrets.
+    Module,
 }
 
 /// A host↔guest bind mount (only meaningful under a real isolation backend).

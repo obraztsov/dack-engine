@@ -47,6 +47,7 @@ use crate::state::{
 use crate::state_prompt::{McpRef, StatePrompt};
 
 pub mod ingest;
+pub mod modules;
 
 /// The Reflect entry state-prompt id (`prompts/reflect.md`). Reflect is harness-entered (PRD §4.2):
 /// no soul duty produces it — the nightly schedule and `dack reflect-now` enqueue it directly.

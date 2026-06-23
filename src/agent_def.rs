@@ -30,9 +30,26 @@ pub struct AgentFrontmatter {
     pub model: Option<String>,
     #[serde(default, rename = "maxTurns")]
     pub max_turns: Option<u32>,
-    /// Harness-only: `worktree` runs the worker in a git worktree (NOT sent to the SDK).
+    /// Harness-only (NOT sent to the SDK): the isolation backend for an ASYNC worker run of this def.
+    /// `docker` ⇒ run the bridge in a container (Phase 14, needs `runtime.worker_sandbox.enabled`);
+    /// `host` (or absent) ⇒ run on the host. (`worktree` is reserved/legacy.)
     #[serde(default)]
     pub isolation: Option<String>,
+    /// Harness-only (NOT sent to the SDK): extra **read-only** volumes mounted into a containerized
+    /// worker — curated soul subdirs the agent may READ (e.g. `memory`) but never write. The
+    /// `/workspace` is the only writable mount; everything here is forced read-only.
+    #[serde(default)]
+    pub volumes: Vec<VolumeSpec>,
+}
+
+/// One read-only volume an agent def attaches to its containerized worker (Phase 14). `source` is a
+/// path RELATIVE TO THE SOUL ROOT (resolved + containment-checked by the harness); `target` is the
+/// in-container mount path (default `/mnt/<basename>`). Always mounted read-only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VolumeSpec {
+    pub source: String,
+    #[serde(default)]
+    pub target: Option<String>,
 }
 
 /// A parsed agent definition: its id (path under `agents/`, no extension) + frontmatter + the prompt.
@@ -101,6 +118,23 @@ mod tests {
         assert_eq!(v["maxTurns"], serde_json::json!(40));
         // `inherit` model + harness-only isolation are NOT sent to the SDK.
         assert!(v.get("model").is_none());
+        assert!(v.get("isolation").is_none());
+    }
+
+    #[test]
+    fn parses_isolation_and_readonly_volumes_kept_harness_only() {
+        let text = "---\ndescription: a researcher\ntools: [Read]\nisolation: docker\n\
+                    volumes:\n  - { source: memory }\n  - { source: knowledge, target: /kb }\n\
+                    ---\nResearch to the brief.\n";
+        let a = AgentDef::parse("researcher", text).unwrap();
+        assert_eq!(a.fm.isolation.as_deref(), Some("docker"));
+        assert_eq!(a.fm.volumes.len(), 2);
+        assert_eq!(a.fm.volumes[0].source, "memory");
+        assert_eq!(a.fm.volumes[0].target, None);
+        assert_eq!(a.fm.volumes[1].target.as_deref(), Some("/kb"));
+        // Harness-only — never leak into the SDK agent options.
+        let v = a.to_options_value();
+        assert!(v.get("volumes").is_none());
         assert!(v.get("isolation").is_none());
     }
 }

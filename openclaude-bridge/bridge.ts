@@ -112,7 +112,19 @@ async function runInvoke(inv: any) {
     // falls back to the bridge's cwd for pure-text runs.
     cwd: inv.cwd ?? process.cwd(),
     systemPrompt: { type: 'custom', content: `${inv.system_prompt}\n\n${OUTPUT_INSTRUCTION}` },
-    disallowedTools: inv.disallowed_tools ?? [],
+    // No sub-agent defs (`inv.agents`) ⇒ disallow the sub-agent tool (`Task`/`Agent`). The SDK
+    // Docker-sandboxes each sub-agent; inside a DOCKER-isolated worker there is no docker daemon
+    // (no docker-in-docker, by design), so a sub-agent spawn dies with "failed to connect to the
+    // docker API" and takes the bridge with it. A docker worker is a SINGLE isolated agent; the duck
+    // (also no agents) never uses Task either. A HOST worker passes agents → these stay allowed.
+    disallowedTools: [
+      ...(inv.disallowed_tools ?? []),
+      // The SDK's Docker-sandboxed bash variant: it connects to the docker daemon, which doesn't exist
+      // inside a DACK-isolated worker container (no docker-in-docker) — disallow it so the model uses
+      // plain `Bash` (the harness container + the wall ARE the sandbox).
+      'SandboxedBash',
+      ...(inv.agents && Object.keys(inv.agents).length ? [] : ['Task', 'Agent']),
+    ],
     // The wall: relay every tool to Rust and block on its decision.
     canUseTool: async (name: string, input: unknown, opts?: { toolUseID?: string }) => {
       const tool_use_id = opts?.toolUseID ?? globalThis.crypto.randomUUID()
@@ -120,9 +132,17 @@ async function runInvoke(inv: any) {
       const decision = await new Promise<{ allow: boolean; message?: string }>((resolve) =>
         pending.set(tool_use_id, resolve),
       )
-      return decision.allow
-        ? { behavior: 'allow', updatedInput: input as any }
-        : { behavior: 'deny', message: decision.message ?? 'denied by DACK wall' }
+      if (!decision.allow) {
+        return { behavior: 'deny', message: decision.message ?? 'denied by DACK wall' }
+      }
+      // Disable the SDK's OWN bash sandbox (which Docker-sandboxes some commands) — it dies inside a
+      // DACK-isolated worker container (no docker-in-docker). The wall already gated this call, and
+      // the harness container IS the sandbox, so the SDK's redundant one is both unwanted and broken.
+      const updatedInput =
+        name === 'Bash' || name === 'SandboxedBash'
+          ? { ...(input as any), dangerouslyDisableSandbox: true }
+          : (input as any)
+      return { behavior: 'allow', updatedInput }
     },
   }
   if (inv.model) options.model = inv.model

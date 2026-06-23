@@ -414,6 +414,43 @@ pub struct RuntimeConfig {
     /// YAML). The connector's own creds (above) are applied on top. **Soul key never listed.**
     #[serde(default = "default_runtime_env")]
     pub env: Vec<String>,
+    /// **OS isolation for delegated workers** (Phase 14). When enabled, an async worker
+    /// ([`crate::harness`] `run_worker_detached`) runs its bridge inside a Docker container — the
+    /// workspace bind-mounted rw, declared agent `volumes:` ro, everything else out of reach — so a
+    /// worker's Bash/tools cannot touch the host. The duck itself is **never** containerized.
+    #[serde(default)]
+    pub worker_sandbox: WorkerSandboxConfig,
+}
+
+/// Docker isolation policy for delegated workers (Phase 14). Plain operator config; the CLI turns it
+/// into an [`crate::sandbox::IsolationPolicy`] + [`crate::sandbox::DockerSandbox`]. The worker's
+/// network is always **Full** (its bridge must egress to the model gateway — an egress-allowlist proxy
+/// is future hardening, so `network` is not an operator knob that could fail-closed by mistake).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WorkerSandboxConfig {
+    /// Run workers in Docker. `false` (default) ⇒ HostSandbox — today's behavior (the wall + tripwire
+    /// still bound a worker logically, but Bash is not OS-confined).
+    #[serde(default)]
+    pub enabled: bool,
+    /// The pre-built worker image (bun + the bridge + LINUX `node_modules`). Built at deploy time
+    /// (`docker build -f Dockerfile.worker`), never by the harness at runtime.
+    #[serde(default)]
+    pub image: String,
+    /// Container memory cap (e.g. `"512m"`). `None` ⇒ unbounded.
+    #[serde(default)]
+    pub memory: Option<String>,
+    /// Container PID cap. `None` ⇒ unbounded.
+    #[serde(default = "default_worker_pids")]
+    pub pids_limit: Option<u32>,
+    /// When Docker or the image is unavailable: `true` (default when enabled) ⇒ a `docker`-isolation
+    /// worker HARD-FAILS (reports an error completion, never silently runs on the host — the safety
+    /// claim holds). `false` ⇒ dev mode: warn + fall back to the host sandbox.
+    #[serde(default = "default_true")]
+    pub require: bool,
+}
+
+fn default_worker_pids() -> Option<u32> {
+    Some(256)
 }
 
 /// **Dry-run** (testing/debug): when `enabled`, the WALL denies any tool whose name starts with a

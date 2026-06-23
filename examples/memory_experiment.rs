@@ -61,6 +61,9 @@ async fn run_state(
         mcp_servers: Default::default(),
         model: None,
         agents: Default::default(),
+        isolate: false,
+        mounts: Vec::new(),
+        allowed_tools: None,
     };
     let wall = Arc::new(Recording {
         inner: StatePolicyResponder::new(default_spec(state)).with_repo_root(soul.to_path_buf()),

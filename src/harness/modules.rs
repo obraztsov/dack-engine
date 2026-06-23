@@ -153,6 +153,7 @@ impl SupervisedModule {
             kind: ExecKind::Module,
             mounts: vec![],
             policy: IsolationPolicy::host_passthrough(),
+            name: None,
         };
         let mut cmd = match self.sandbox.command(&spec) {
             Ok(c) => c,

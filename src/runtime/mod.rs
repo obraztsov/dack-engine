@@ -94,6 +94,20 @@ pub struct InvocationRequest {
     /// the duck's consciousness states (no `Task` target); a **worker** invocation registers its
     /// sub-helpers here so it can delegate plan/research/QA in-session. The bridge sets `options.agents`.
     pub agents: std::collections::BTreeMap<String, serde_json::Value>,
+    /// **OS-isolate this invocation** (Phase 14): run the bridge in the runtime's worker sandbox
+    /// (Docker) instead of on the host. Set ONLY for delegated workers; the duck's states leave it
+    /// `false` (the duck is never containerized). No-op if the runtime has no worker backend
+    /// configured (falls back to host) — see `runtime.worker_sandbox`.
+    pub isolate: bool,
+    /// **Extra read-only mounts** for an isolated worker (Phase 14): the agent def's resolved
+    /// `volumes:` (host soul-subdir → guest path), all read-only. The writable `/workspace` is NOT
+    /// here — it's derived from `workdir`. Empty for the duck.
+    pub mounts: Vec<crate::sandbox::Mount>,
+    /// **Explicit tool allow-list** for the engine (`options.allowedTools`). `Some` pins the engine to
+    /// exactly these tools — a WORKER sets it to its agent def's `tools:` so the SDK does NOT offer its
+    /// full default toolset (some of which Docker-sandbox sub-work and die inside a container with no
+    /// docker daemon). `None` (the duck) ⇒ the engine default; the wall gates every call regardless.
+    pub allowed_tools: Option<Vec<String>>,
 }
 
 /// The permission event surfaced by OpenClaude, as it *actually* arrives (grounded
@@ -137,4 +151,13 @@ pub trait RuntimeClient: Send + Sync {
         req: InvocationRequest,
         responder: std::sync::Arc<dyn ActionResponder>,
     ) -> Result<(AgentOutput, Option<SessionId>)>;
+
+    /// The guest working dir a containerized worker runs at (e.g. `/workspace`), or `None` if this
+    /// runtime has no worker isolation backend (Phase 14). The harness calls this to decide whether a
+    /// `docker`-isolation worker will ACTUALLY be containerized — so it can root the worker's wall at
+    /// the matching path (the guest `/workspace` when isolated, the host workspace when falling back).
+    /// Default `None` (mocks / host-only runtimes).
+    fn worker_guest_cwd(&self) -> Option<PathBuf> {
+        None
+    }
 }

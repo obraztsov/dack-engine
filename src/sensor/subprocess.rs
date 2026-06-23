@@ -66,6 +66,7 @@ impl SensorRunner for SubprocessSensor {
             kind: ExecKind::Sensor,
             mounts: Vec::new(), // a container backend mounts the duty's scripts (ro); host ignores
             policy: self.policy.clone(),
+            name: None,
         };
         let mut child = self
             .sandbox

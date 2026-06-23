@@ -65,6 +65,9 @@ async fn main() -> anyhow::Result<()> {
         mcp_servers: Default::default(),
         model: None,
         agents: Default::default(),
+        isolate: false,
+        mounts: Vec::new(),
+        allowed_tools: None,
     };
 
     // The real worker wall: worker_spec, relativize root = the workspace.

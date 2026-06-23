@@ -127,6 +127,10 @@ pub struct ProcessSpec {
     pub kind: ExecKind,
     pub mounts: Vec<Mount>,
     pub policy: IsolationPolicy,
+    /// Container name (DockerSandbox → `--name`). Set for a worker so the harness can reap the
+    /// container by name on timeout/completion (`kill_on_drop` only kills the local `docker` CLI, not
+    /// the container). `None` ⇒ no `--name` (Docker auto-names); ignored by HostSandbox.
+    pub name: Option<String>,
 }
 
 /// Transforms a [`ProcessSpec`] into the (possibly wrapped) [`Command`] that runs it. The
@@ -178,7 +182,12 @@ impl Sandbox for DockerSandbox {
             return Err(DackError::Config("DockerSandbox needs policy.image".into()));
         }
         let mut cmd = Command::new(&self.docker_bin);
-        cmd.args(["run", "--rm", "-i"]);
+        // `--init` = a real PID1 (tini) for signal/zombie hygiene; `--name` lets the harness reap the
+        // container by name (a parent kill only reaps the local `docker` client, not the container).
+        cmd.args(["run", "--rm", "-i", "--init"]);
+        if let Some(name) = &spec.name {
+            cmd.args(["--name", name]);
+        }
 
         match &spec.policy.network {
             NetworkPolicy::None => cmd.args(["--network", "none"]),
@@ -252,6 +261,7 @@ mod tests {
                 writable: false,
             }],
             policy,
+            name: None,
         }
     }
 
@@ -300,8 +310,42 @@ mod tests {
                 writable: true,
             }],
             policy: IsolationPolicy::locked_down("dack/agent:latest"),
+            name: None,
         };
         let a = argv(&DockerSandbox::default().command(&spec).unwrap()).join(" ");
         assert!(a.contains("-v /soul:/soul:rw"));
+    }
+
+    #[test]
+    fn docker_worker_spec_maps_init_name_mounts_and_full_network() {
+        // A Phase-14 worker: Full network (gateway egress), a reap `--name`, the workspace rw at the
+        // guest cwd, an agent volume ro, and `--init`.
+        let mut policy = IsolationPolicy::locked_down("dack/worker:latest");
+        policy.network = NetworkPolicy::Full;
+        policy.user = None;
+        let spec = ProcessSpec {
+            command: vec!["bun".into(), "run".into(), "/app/openclaude-bridge/bridge.ts".into()],
+            cwd: PathBuf::from("/workspace"),
+            env: BTreeMap::from([("OPENAI_API_KEY".into(), "SECRETVAL".into())]),
+            clear_env: false,
+            kind: ExecKind::Worker,
+            mounts: vec![
+                Mount { host: PathBuf::from("/soul/workspaces/run1"), guest: PathBuf::from("/workspace"), writable: true },
+                Mount { host: PathBuf::from("/soul/memory"), guest: PathBuf::from("/mnt/memory"), writable: false },
+            ],
+            policy,
+            name: Some("dack-worker-coder-1-0".into()),
+        };
+        let a = argv(&DockerSandbox::default().command(&spec).unwrap()).join(" ");
+        assert!(a.starts_with("docker run --rm -i --init"));
+        assert!(a.contains("--name dack-worker-coder-1-0"));
+        assert!(a.contains("--network bridge")); // Full → egress to the gateway
+        assert!(a.contains("--cap-drop ALL") && a.contains("--security-opt no-new-privileges"));
+        assert!(!a.contains("--user")); // user: None for the worker (macOS mount friction)
+        assert!(a.contains("-v /soul/workspaces/run1:/workspace:rw"));
+        assert!(a.contains("-v /soul/memory:/mnt/memory:ro"));
+        assert!(a.contains("-w /workspace"));
+        assert!(a.contains("-e OPENAI_API_KEY") && !a.contains("SECRETVAL")); // value inherited, off the cmdline
+        assert!(a.ends_with("dack/worker:latest bun run /app/openclaude-bridge/bridge.ts"));
     }
 }

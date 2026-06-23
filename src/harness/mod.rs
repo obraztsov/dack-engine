@@ -17,7 +17,7 @@
 //!   6. Express acts via skills, writes memory, returns; harness logs the outcome
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -266,7 +266,8 @@ impl Harness {
             if let Some(spawn) = out.spawn.clone() {
                 if current.state == ConsciousnessState::Express {
                     let (rt, q, rp) = (self.runtime.clone(), self.queue.clone(), self.repo.clone());
-                    tokio::spawn(async move { run_worker_detached(rt, q, rp, spawn).await });
+                    let soul_root = self.soul_root();
+                    tokio::spawn(async move { run_worker_detached(rt, q, rp, soul_root, spawn).await });
                 } else {
                     eprintln!(
                         "dispatch: `spawn` from {:?} ignored — workers launch only from Express ({})",
@@ -430,6 +431,10 @@ impl Harness {
             // The duck's consciousness states register no sub-agents (no `Task` target — sync
             // sub-helpers exist only inside a worker, Phase 10). Workers set this in `run_worker_detached`.
             agents: BTreeMap::new(),
+            // The duck is NEVER containerized — only delegated workers OS-isolate (Phase 14).
+            isolate: false,
+            mounts: Vec::new(),
+            allowed_tools: None, // the duck uses the engine default; the wall gates every call.
         };
         let (out, ran_session) = self.runtime.invoke(req, recorder.clone()).await?;
         // Persist the engine session id for a sticky prompt, so the next item with the same key resumes it.
@@ -1010,10 +1015,14 @@ enum StepInput {
 /// (UNTRUSTED) summary as a `worker_completion` stimulus (the return-firebreak). A free fn over the
 /// cloned seams so it outlives the spawning dispatch cycle. Best-effort: any failure still fires a
 /// completion stimulus, so the duck always learns the outcome.
+/// Process-wide counter so two same-second workers get distinct workspace dirs + container names.
+static WORKER_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 async fn run_worker_detached(
     runtime: Arc<dyn RuntimeClient>,
     queue: Arc<dyn Queue>,
     repo: Arc<dyn RepoHost>,
+    soul_root: PathBuf,
     spawn: SpawnRequest,
 ) {
     let now = chrono::Utc::now().timestamp();
@@ -1029,18 +1038,65 @@ async fn run_worker_detached(
             return enqueue_worker_completion(&queue, &spawn, &format!("ERROR: no agent `{}` in agents/", spawn.agent), now).await;
         }
     };
-    // A fresh workspace OUTSIDE the soul repo. (Left on disk for inspection; GC is a backlog item.)
-    let workspace = std::env::temp_dir().join(format!("dack-worker-{}-{now}", spawn.agent.replace('/', "_")));
+
+    // Isolation (Phase 14): the agent opts in via `isolation: docker`, and the runtime must actually
+    // carry a worker backend (`worker_guest_cwd()`). If it wants Docker but none is configured, we
+    // fall back to the host run — and CRUCIALLY root the wall at whichever path the bridge will really
+    // use, so the SDK's emitted paths relativize: the GUEST `/workspace` when containerized, else the
+    // host workspace. (The CLI's startup preflight already hard-failed the boot if `require`-d Docker
+    // was unavailable, so a configured-but-absent backend here means the operator chose host fallback.)
+    let wants_docker = def.fm.isolation.as_deref() == Some("docker");
+    let guest = runtime.worker_guest_cwd();
+    let isolated = wants_docker && guest.is_some();
+
+    // A fresh workspace under the (gitignored) soul `workspaces/` dir, unique per run. Inspectable in
+    // the soul bundle; swept by the boot GC. The run-id doubles as the container `--name` for reaping.
+    let run_id = format!(
+        "dack-worker-{}-{now}-{}",
+        spawn.agent.replace('/', "_"),
+        WORKER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let workspace = soul_root.join("workspaces").join(&run_id);
     if let Err(e) = tokio::fs::create_dir_all(&workspace).await {
         return enqueue_worker_completion(&queue, &spawn, &format!("ERROR: workspace: {e}"), now).await;
     }
+    // Turn OFF the SDK's own bash-sandbox for a containerized worker: the SDK reads project-local
+    // settings from `<cwd>/.claude/settings.json` (cwd = the guest `/workspace`, i.e. this dir), and
+    // its sandbox runs commands in a nested Docker container — impossible inside our worker container.
+    // DACK's locked-down container + the wall ARE the sandbox; disable the SDK's redundant one (and ask
+    // for the weaker, non-Docker nested mode as a belt-and-suspenders). Best-effort.
+    if isolated {
+        let cfg = workspace.join(".claude");
+        if tokio::fs::create_dir_all(&cfg).await.is_ok() {
+            let _ = tokio::fs::write(
+                cfg.join("settings.json"),
+                r#"{"sandbox":{"enabled":false,"enableWeakerNestedSandbox":true}}"#,
+            )
+            .await;
+        }
+    }
+
+    // The wall's relativize root MUST match where the bridge runs (else every write is denied).
+    let wall_root = if isolated { guest.clone().unwrap() } else { workspace.clone() };
+    // Read-only `volumes:` (containerized only): soul-relative → host abs (containment-checked),
+    // guest target (default `/mnt/<basename>`), FORCED read-only. Ignored on the host run.
+    let mounts =
+        if isolated { resolve_worker_volumes(&soul_root, &def.fm.volumes) } else { Vec::new() };
+
     // Sub-helper defs the worker may `Task`-spawn (all agents EXCEPT the lead → no lead recursion).
-    let agents = worker_sub_helper_defs(&repo, &spawn.agent).await;
-    // The worker wall: the worker spec with the relativize root = the workspace, so the worker can
-    // write the workspace but NOT the soul repo (soul paths don't resolve in → denied). No MCP caps.
+    // A DOCKER-isolated worker gets NONE: the SDK Docker-sandboxes each sub-agent, which is impossible
+    // inside the container (no docker-in-docker). The container IS the isolation — a docker worker is a
+    // single agent. (A host worker keeps its sub-helpers — Phase 10.) The bridge disallows the `Task`
+    // tool whenever `agents` is empty, so the model can't even attempt a sub-agent here.
+    let agents = if isolated {
+        BTreeMap::new()
+    } else {
+        worker_sub_helper_defs(&repo, &spawn.agent).await
+    };
+    // The worker wall: worker spec (Read/FileWrite/Shell/Other, no Post/Settle, no MCP caps).
     let spec = crate::state::worker_spec();
     let recorder =
-        RecordingResponder::wrap(StatePolicyResponder::new(spec.clone()).with_repo_root(workspace.clone()));
+        RecordingResponder::wrap(StatePolicyResponder::new(spec.clone()).with_repo_root(wall_root));
     let model = def.fm.model.as_deref().filter(|m| *m != "inherit").map(String::from);
     let req = InvocationRequest {
         system_prompt: format!("{}\n\n--- TASK BRIEF (from DACK) ---\n{}", def.prompt, spawn.brief),
@@ -1052,8 +1108,18 @@ async fn run_worker_detached(
         mcp_servers: BTreeMap::new(),
         model,
         agents,
+        isolate: isolated,
+        mounts,
+        // Pin the engine to the agent def's declared tools — so the SDK does NOT offer its full
+        // default toolset (parts of which Docker-sandbox sub-work and die inside the worker container).
+        allowed_tools: def.fm.tools.clone(),
     };
-    eprintln!("worker `{}` launched in {}", spawn.agent, workspace.display());
+    eprintln!(
+        "worker `{}` launched in {} ({})",
+        spawn.agent,
+        workspace.display(),
+        if isolated { "docker" } else { "host" }
+    );
     let summary = match runtime.invoke(req, recorder).await {
         Ok((out, _)) => out
             .proposal
@@ -1062,7 +1128,53 @@ async fn run_worker_detached(
             .unwrap_or(out.thought),
         Err(e) => format!("ERROR: worker run failed: {e}"),
     };
+    // Reap the container by name (best-effort): a normal `--rm` exit already removed it (rm errors,
+    // ignored); a timeout/kill left an orphan (the local `docker` client died, not the container) →
+    // `rm -f` stops it before it burns more gateway credit.
+    if isolated {
+        reap_worker_container(&run_id).await;
+    }
     enqueue_worker_completion(&queue, &spawn, &summary, chrono::Utc::now().timestamp()).await;
+    // The workspace is LEFT on disk (inspectable; the boot GC sweeps stale ones) — gitignored, uncommitted.
+}
+
+/// Resolve an agent def's `volumes:` into READ-ONLY [`Mount`]s for a containerized worker. Each
+/// `source` is soul-relative; it must resolve INSIDE the soul root (no `../` escape) and exist, or
+/// it's skipped with a warning. `target` defaults to `/mnt/<basename>`. Always `writable:false`.
+fn resolve_worker_volumes(
+    soul_root: &Path,
+    volumes: &[crate::agent_def::VolumeSpec],
+) -> Vec<crate::sandbox::Mount> {
+    let soul_canon = soul_root.canonicalize().unwrap_or_else(|_| soul_root.to_path_buf());
+    let mut out = Vec::new();
+    for v in volumes {
+        let host = match soul_canon.join(&v.source).canonicalize() {
+            Ok(p) if p.starts_with(&soul_canon) => p,
+            _ => {
+                eprintln!("worker volume `{}` rejected (outside soul, or missing) — skipped", v.source);
+                continue;
+            }
+        };
+        let guest = v.target.clone().map(PathBuf::from).unwrap_or_else(|| {
+            let base = Path::new(&v.source)
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "vol".into());
+            PathBuf::from(format!("/mnt/{base}"))
+        });
+        out.push(crate::sandbox::Mount { host, guest, writable: false });
+    }
+    out
+}
+
+/// Force-remove a worker container by name (best-effort; ignores "no such container" on clean exit).
+async fn reap_worker_container(name: &str) {
+    let _ = tokio::process::Command::new("docker")
+        .args(["rm", "-f", name])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await;
 }
 
 /// The sub-helper defs a worker registers as `options.agents` — every `agents/**/*.md` EXCEPT the
@@ -1591,6 +1703,7 @@ mod tests {
                 model_via_env: false,
                 sandbox: Arc::new(crate::sandbox::HostSandbox),
                 policy: crate::sandbox::IsolationPolicy::host_passthrough(),
+                worker: None,
                 timeout: std::time::Duration::from_secs(30),
             }),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
@@ -2684,6 +2797,7 @@ mod tests {
             rt,
             queue.clone(),
             repo,
+            tmp.clone(),
             SpawnRequest { agent: "coder".into(), brief: "build a parser".into() },
         )
         .await;
@@ -2709,5 +2823,24 @@ mod tests {
         assert_eq!(stim.payload_tier, TrustTier::public());
 
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Phase 14: agent `volumes:` resolve to READ-ONLY mounts (`/mnt/<base>` default), and a missing
+    /// or soul-escaping `source` is rejected — only the workspace is ever writable.
+    #[test]
+    fn resolve_volumes_forces_readonly_and_rejects_escape() {
+        let soul = std::env::temp_dir().join(format!("dack-vol-{}", std::process::id()));
+        std::fs::create_dir_all(soul.join("memory")).unwrap();
+        let vols = vec![
+            crate::agent_def::VolumeSpec { source: "memory".into(), target: None },
+            crate::agent_def::VolumeSpec { source: "knowledge".into(), target: Some("/kb".into()) }, // missing → skipped
+            crate::agent_def::VolumeSpec { source: "../etc".into(), target: None }, // escapes soul → rejected
+        ];
+        let mounts = resolve_worker_volumes(&soul, &vols);
+        assert_eq!(mounts.len(), 1, "only the existing, soul-contained volume resolves");
+        assert!(mounts[0].host.ends_with("memory"));
+        assert_eq!(mounts[0].guest, PathBuf::from("/mnt/memory"));
+        assert!(!mounts[0].writable, "extra volumes are forced read-only");
+        std::fs::remove_dir_all(&soul).ok();
     }
 }

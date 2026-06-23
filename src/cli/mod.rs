@@ -19,7 +19,7 @@ use crate::error::{DackError, Result};
 use crate::harness::ingest::{spawn_stimuli_watcher, Ingestor};
 use crate::harness::modules::ModuleSupervisor;
 use crate::harness::Harness;
-use crate::sandbox::{HostSandbox, Sandbox};
+use crate::sandbox::{DockerSandbox, HostSandbox, IsolationPolicy, NetworkPolicy, Sandbox};
 use crate::identity::gitlawb::GitlawbIdentity;
 use crate::identity::{IdentityProvider, IdentityRole};
 use crate::model::stimulus::{Priority, Stimulus, StimulusId, StimulusStatus, StimulusType, TrustTier};
@@ -28,7 +28,7 @@ use crate::repo::git::PlainGitRepo;
 use crate::repo::gitlawb::GitlawbRepo;
 use crate::repo::{CommitMeta, RepoHost, RepoPath};
 use crate::runlog::{DailyFileRunLog, RunLogWriter};
-use crate::runtime::openclaude::OpenClaudeClient;
+use crate::runtime::openclaude::{OpenClaudeClient, WorkerBackend};
 use crate::runtime::RuntimeClient;
 use crate::sensor::{SensorRunner, SubprocessSensor};
 use crate::sources::{CronScheduler, CronWheel};
@@ -258,6 +258,8 @@ async fn run(config_path: &str) -> Result<()> {
     // otherwise break under subprocess cwd changes). Falls back to as-written if it doesn't exist.
     let repo_root = std::fs::canonicalize(&config.soul_repo)
         .unwrap_or_else(|_| PathBuf::from(&config.soul_repo));
+    // Boot GC: reclaim stale worker workspaces (Phase 14) left by crashes / old runs.
+    sweep_stale_workspaces(&repo_root);
 
     let queue: Arc<dyn Queue> = Arc::new(SqliteQueue::open(&config.db_path)?);
     let bus = Arc::new(Bus::new(config.clone(), queue.clone()));
@@ -434,13 +436,103 @@ fn build_runtime(config: &DackConfig) -> Result<Arc<dyn RuntimeClient>> {
     for (k, v) in rt.connector.env_overrides() {
         env.insert(k, v);
     }
-    Ok(Arc::new(OpenClaudeClient::bun_bridge(
+    let client = OpenClaudeClient::bun_bridge(
         bridge_dir,
         env,
         rt.model.clone(),
         rt.connector.model_via_openai_env(),
         std::time::Duration::from_secs(config.invoke_timeout_secs),
-    )))
+    );
+    // Phase 14: a Docker backend for delegated workers (OS isolation) when `worker_sandbox.enabled`.
+    let worker = build_worker_backend(config)?;
+    Ok(Arc::new(client.with_worker(worker)))
+}
+
+/// Build the worker isolation backend from `runtime.worker_sandbox`, with a STARTUP PREFLIGHT. Returns
+/// `None` (workers run on host) when disabled, or — when enabled but Docker/the image is unavailable —
+/// either errors (`require:true`, refuse to boot so the safety claim holds) or warns + falls back to
+/// host (`require:false`). A configured worker policy is locked-down (ro rootfs, caps dropped) EXCEPT
+/// `network: Full` (the bridge must egress to the model gateway) and `user: None` (macOS mount friction).
+fn build_worker_backend(config: &DackConfig) -> Result<Option<WorkerBackend>> {
+    let ws = &config.runtime.worker_sandbox;
+    if !ws.enabled {
+        return Ok(None);
+    }
+    if ws.image.trim().is_empty() {
+        return Err(DackError::Config(
+            "runtime.worker_sandbox.enabled but `image` is empty (build it: docker build -f Dockerfile.worker)".into(),
+        ));
+    }
+    // Precondition: `workspaces/` MUST be gitignored in the soul, or the integrity tripwire reverts
+    // (deletes) every worker's output each cycle. Hard-fail rather than silently lose work.
+    let gitignore = std::path::Path::new(&config.soul_repo).join(".gitignore");
+    let workspaces_ignored = std::fs::read_to_string(&gitignore)
+        .map(|s| s.lines().any(|l| l.trim().trim_end_matches('/') == "workspaces"))
+        .unwrap_or(false);
+    if !workspaces_ignored {
+        return Err(DackError::Config(format!(
+            "worker_sandbox needs `workspaces/` in {} — else the soul-integrity tripwire reverts worker output",
+            gitignore.display()
+        )));
+    }
+    // Preflight Docker + the image (sync; runs once at boot).
+    let null = || (std::process::Stdio::null(), std::process::Stdio::null());
+    let probe = |args: &[&str]| {
+        let (o, e) = null();
+        std::process::Command::new("docker").args(args).stdout(o).stderr(e).status().map(|s| s.success()).unwrap_or(false)
+    };
+    let image_ok = probe(&["version"]) && probe(&["image", "inspect", &ws.image]);
+    if !image_ok {
+        if ws.require {
+            return Err(DackError::Config(format!(
+                "worker_sandbox.require: Docker or image `{}` unavailable — refusing to boot (set require:false to fall back to host)",
+                ws.image
+            )));
+        }
+        eprintln!(
+            "dack: worker_sandbox enabled but Docker/image `{}` unavailable — workers FALL BACK TO HOST (require:false).",
+            ws.image
+        );
+        return Ok(None);
+    }
+    let mut policy = IsolationPolicy::locked_down(ws.image.clone());
+    policy.network = NetworkPolicy::Full; // the worker bridge must reach the model gateway
+    policy.user = None; // avoid macOS Docker-Desktop uid-mapping write friction on shared mounts
+    // A worker runs a FULL agent loop (bun + the SDK + multi-turn context, possibly a `Task`
+    // sub-agent in the same process) — the `locked_down` 256m sensor default OOM-kills it ("bridge
+    // closed before result"). Default generously; the operator can tighten via `worker_sandbox.memory`.
+    policy.memory = ws.memory.clone().or_else(|| Some("2g".to_string()));
+    policy.pids_limit = ws.pids_limit;
+    eprintln!("dack: worker_sandbox up — workers OS-isolated in docker image `{}`.", ws.image);
+    Ok(Some(WorkerBackend {
+        sandbox: Arc::new(DockerSandbox::default()),
+        policy,
+        command: vec!["bun".into(), "run".into(), "/app/openclaude-bridge/bridge.ts".into()],
+        cwd: std::path::PathBuf::from("/workspace"),
+    }))
+}
+
+/// Boot GC: remove `<soul>/workspaces/*` worker dirs older than ~6h (crash leftovers). Best-effort —
+/// the dirs are gitignored + never committed, so this only reclaims disk; recent ones stay inspectable.
+fn sweep_stale_workspaces(soul_root: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(soul_root.join("workspaces")) else { return };
+    let cutoff = std::time::SystemTime::now().checked_sub(std::time::Duration::from_secs(6 * 3600));
+    let mut swept = 0;
+    for e in entries.flatten() {
+        let stale = e
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .zip(cutoff)
+            .map(|(m, c)| m < c)
+            .unwrap_or(false);
+        if stale && e.path().is_dir() && std::fs::remove_dir_all(e.path()).is_ok() {
+            swept += 1;
+        }
+    }
+    if swept > 0 {
+        eprintln!("dack: swept {swept} stale worker workspace(s).");
+    }
 }
 
 /// Env forwarded into the runtime bridge: `PATH`/`HOME` + the provider/capability names the

@@ -1,218 +1,145 @@
-# dack.config.yaml — operator control plane (PRD §8.2).
-# The non-LLM authority surface. Operator owns it; the harness reads it (hot-reloadable);
-# the agent may READ select fields but can NEVER write it.
+# dack.config.yaml — the operator control plane.
 #
-# Copy to dack.config.yaml and fill in real DIDs. Secret *values* never live here —
-# only references (file://...) resolved by the secret store.
+# Copy to dack.config.yaml (keep it GITIGNORED) and fill in your operator DID + model endpoint.
+# Secret VALUES never live here — only references and provider definitions. The agent may read
+# selected fields but can never write this file. Most changes hot-reload on the next dispatch.
+#
+# This is a commented, runnable example. The exhaustive field reference is docs/configuration.md.
 
-# The trusted operator DID — provenance check for the `operator_signed` tier (PRD §5.7).
+# ── Required ──────────────────────────────────────────────────────────────────────────────────
+# The trusted operator DID. `dack say` signs an instruction with the operator key; the harness
+# verifies it against this DID — that is what makes a stimulus `operator_signed` (the top trust tier).
 operator_did: "did:key:z6MkOperatorReplaceMe"
 
-# ── Trust lattice (the taint/IFC model, TIER-1..4) ────────────────────────────────────────────
-# The `(payload_tier, type)` routing table is GONE. A cycle's reachability ceiling is now DERIVED
-# from the trust of what it touches: it starts at a source-seeded tier (TIER-3) and ratchets DOWN
-# as it calls lower-trust capabilities (TIER-2); the accumulated tier's `reaches` is the highest
-# consciousness state it may walk to. Ranked low→high; an omitted `reaches` defaults to express; an
-# unknown tier name fails SAFE (lowest rank, reaches express — a mislabel can never RAISE a ceiling).
-# Omit this whole block to use the safe default (public→express < self→reflect < operator_signed→reflect).
-# The three well-known names (public/self/operator_signed) MUST exist in any custom lattice.
-trust_tiers:
-  - { name: public, reaches: express }             # tweets, 3rd-party MCPs — reversible only
-  - { name: self,   reaches: reflect }             # the duck's own clean cycles may even self-edit
-  # - { name: org, reaches: settle }               # example custom tier: a trusted peer/org → may trade
-  - { name: operator_signed, reaches: reflect }
+# Where the agent's durable bundle (SOUL.md, prompts/, stimuli/, memory/) lives. Copy soul-template/.
+soul_repo: "my-soul"
 
-# Reflect rate-limit (TIER-4): minimum seconds between self-modification (Reflect) runs — enforced
-# by the harness clock for BOTH the scheduled Reflect and any transition-reached one (persisted via a
-# `reflect:last` queue cursor). The cadence half of the I6 guarantee; the taint ceiling is the other
-# half. `0` disables. Default 1 day.
-reflect_min_interval_secs: 86400
-
-# Operator-signed sensor scripts (the taint SEED, TIER-3): sha256(source-hex) -> trust tier. This is
-# operator code-review-as-signing — the agent authors a sensor, the operator reviews the EXACT bytes
-# and signs the hash. A sensor whose source hashes to a listed entry seeds its cycle at that tier; an
-# unsigned (or since-edited) script seeds `public`. Provenance seeds trust, NEVER agent frontmatter (I18).
-# signed_scripts:
-#   "<sha256 of fetch_mentions.py>": public        # a public-world poller, reviewed + pinned by hash
-
-# Per-webhook trust (TIER-3): a registered webhook path -> the tier its payload is trusted at. An
-# unlisted path seeds `public`.
-# webhooks:
-#   "/telegram/op": self                           # an operator-only Telegram channel → self-trusted
-
-# Entry state-prompt for harness-synthesized stimuli (back-online ping, `dack say`).
-default_entry: perceive
-
-# ── MCP tier policy (MCP2-B, invariant I16): the operator's half of the capability handshake. ──
-# A state-prompt's `mcp:` request is admitted only here. `import` = operator `mcp_servers` a
-# state-prompt at this tier may import by name (token injected server-side, never agent context).
-# `mcp_whitelist: false` = an OPEN tier: the soul may ALSO inline any public, secret-less MCP
-# (forced read-tier — it can never self-grant post/settle). An unconfigured tier is locked + empty.
-#
-# MODEL handshake (8.7), same operator-boundary / soul-self-select shape:
-#   `model:` here = the operator's default model for this tier (unset → the global `model:` below).
-#   `allow_model_override: true` = a state-prompt at this tier MAY name its own `model:` (e.g. let
-#   Reflect pick a stronger model); default false = the operator's choice is fixed for the tier.
-tier_policy:
-  perceive: { mcp_whitelist: false, import: [cove-read] }   # open: self-plug public reads + cove-read
-  express:  { import: [twitter] }                           # locked: only the X post/reply server
-  settle:   { import: [cove-trading, cove-read] }           # locked: the irreversible trade server
-  reflect:  { import: [], allow_model_override: true }      # locked caps; may self-select its model
-
-# Names injected into the agent + sensor env. RECOVERABLE values only (PRD §7.2):
-# leak == rotate. The Soul DID key is deliberately absent — it lives in `secrets:`.
-forwarded_env: [BANKR_API_KEY, BUILDER_DID_KEY, DACK_HANDLE, RATE_LIMIT]
-
-# Secrets providers — trusted, harness-owned scripts that materialize a short-lived token env
-# on demand (fetch + validity-check + rotate-only-when-needed). A duty references one by name
-# in its `secrets:` list; the harness runs the script and injects its JSON output into ONLY
-# that duty's sensor. Adding a new secret (cove.trade, …) is a new entry here + a script —
-# never a harness change. The provider holds the ROOT creds; the sensor only sees the bearer.
-# `trust:` is the taint label of the DATA the secret puts in play (TIER-3): a sensor using it seeds
-# its cycle at (at most) this tier. Default `self`. CRITICAL: a secret that touches the PUBLIC world
-# (the X bearer) MUST be `trust: public` — else a tweet cycle would wrongly be allowed to trade/self-edit.
-secrets_providers:
-  - name: x                                    # twitter duties declare `secrets: [x]`
-    command: ["python3", "secrets-providers/x_oauth2.py"]
-    env:                                       # config (paths/refs), NOT secret values
-      X_CREDS_FILE: "agentdack.rw.x.txt"       # gitignored OAuth2 bootstrap creds (RW)
-      X_TOKEN_STORE: "agentdack.rw.x.txt.tokens.json"   # rotated tokens (gitignored, 0600)
-    keys: [X_BEARER_TOKEN]
-    trust: public                              # the X bearer fetches/posts the PUBLIC world → caps at Express
-  - name: cove                                 # cove.trade key (static bearer from a gitignored file)
-    command: ["python3", "secrets-providers/file_token.py"]
-    env: { TOKEN_KEY: COVE_TOKEN, TOKEN_FILE: "secrets/cove.token" }
-    keys: [COVE_TOKEN]
-    trust: self                                # the operator's OWN wallet — no contamination
-
-# References only — values live in a separate store the YAML never inlines, so config
-# is inspectable without exposing keys. The Soul DID key is harness-only (never forwarded).
-secrets:
-  soul_did_key: "file:///run/secrets/soul_did_key"
-
-# `allow_settle` + `control_plane` removed (2026-06-10): the runtime carries NO settle predicate.
-# Irreversibility is bounded by the taint ceiling (a contaminated cycle can't reach Settle) + the
-# custodial/wallet limits (cove daily caps / no-withdraw; on-chain the wallet's native allowances) +
-# Coasean peer error-correction. (See trust_tiers above.)
-
-# Cron for the scheduled Reflect run (PRD §4.2) — wired by a harness-owned ticker that enqueues a
-# Reflect at each fire (gated by `reflect_min_interval_secs`). Reflect is ALSO reachable via a
-# transition — but only from an UNCONTAMINATED cycle whose trust tier `reaches: reflect`, and
-# rate-limited by `reflect_min_interval_secs` above (TIER-4). Omit for manual `dack reflect-now` only.
-reflect_schedule: "0 4 * * *"           # nightly 04:00 — "sleep-with-dreams"
-
-# Where the harness runs (Phase 3). All optional — these are the defaults.
-soul_repo: "."                          # the actor bundle on the box (holds stimuli/, SOUL.md, …)
-db_path: "dack.sqlite"                  # embedded SQLite queue (ephemeral; losing it loses only the queue)
-webhook_addr: "127.0.0.1:8787"          # localhost-only webhook listener (nothing public without a proxy)
-
-# ── Runtime: the engine + connector extensibility point (Phase 4) ────────────────────────────────
-# Both `engine` and `connector` are tagged by `type`, with their own config inline:
-# `engine`    — which agent runtime drives the loop. WIRED: openclaude (spawns `bun run bridge.ts`,
-#               which depends on `@gitlawb/openclaude` from npm — run `bun install` in bridge_dir).
-#               STUB: claude-code (the Claude Code CLI/SDK directly, for corporate prod).
-# `connector` — how the engine reaches models. WIRED: opengateway (OpenAI-compatible → the per-state
-#               model is routed via the child's OPENAI_MODEL env; the SDK rejects a gateway name as
-#               options.model). The connector carries the endpoint + (optionally, in this gitignored
-#               config) the api_key — injected into the bridge env, NEVER the agent context. STUB:
-#               anthropic (native catalog → options.model). bedrock/vertex/… later.
-# `model`     — the DEFAULT model; tier_policy.<tier>.model overrides it per state (the model split).
-# `env`       — extra env var NAMES forwarded into the runtime (values from the harness env, never
-#               YAML); the connector's own creds are applied on top.
+# ── Runtime: how the agent reaches a model ──────────────────────────────────────────────────────
+# `engine` = the agent runtime (only `openclaude` is wired — spawns `bun run bridge.ts`).
+# `connector` = how it reaches models. `opengateway` is any OpenAI-compatible endpoint; it routes the
+#   per-state model via the child's OPENAI_MODEL env and sets CLAUDE_CODE_USE_OPENAI itself.
+# `model` = the default model id; tier_policy.<state>.model overrides it per state.
 runtime:
-  engine:
-    type: openclaude
-    bridge_dir: openclaude-bridge
+  engine: { type: openclaude, bridge_dir: openclaude-bridge }
   connector:
     type: opengateway
-    api_url: https://opengateway.gitlawb.com/v1     # → OPENAI_BASE_URL (omit to take it from env)
-    api_key: ogw_live_…                              # → OPENAI_API_KEY (gitignored config only; omit → env)
-  model: nvidia/nemotron-3-ultra-550b-a55b:free      # the cheap/default; overridden per state below
-  # env: [SOME_OTHER_VAR]                            # only extras; the connector provides OPENAI_* itself
-# The opengateway connector sets CLAUDE_CODE_USE_OPENAI=1 + OPENAI_BASE_URL/OPENAI_API_KEY itself, so
-# you need NOT export them. (Leave api_url/api_key out to fall back to the daemon env instead.) A
-# reasoning model is slow (~30–60s/state). To run native Anthropic, use connector: { type: anthropic,
-# api_key: … } + an SDK-catalog `model` (e.g. claude-haiku-4-5) — once that connector is wired.
+    api_url: "https://your-gateway/v1"      # → OPENAI_BASE_URL (omit to take from the daemon env)
+    api_key: "…"                            # → OPENAI_API_KEY (gitignored config only; omit → env)
+  model: "your-default-model-id"
 
-# ── Soul repo + identity (Phase 7: durable, signed, off-VPS) ──────────────────────────────
-# `gl` identity DIRECTORIES per role (each holds identity.pem + ucan.json). The Soul dir signs
-# every soul commit + the `gitlawb://` push, and its key NEVER enters agent env (PRD §3.3, §7.2).
-# Create with `gl identity new --dir identities/<role>`; gitignore `/identities/`.
-identities:
-  soul: "identities/soul"
-  operator: "identities/operator"
-  builder: "identities/builder"
+# Everything below is OPTIONAL — shown with sensible values. Delete what you don't need.
 
-# The soul's signed push remote. When set (with identities.soul), the harness uses the Gitlawb
-# repo-host: each per-run commit-sweep + runlog is committed as the Soul DID and pushed as a
-# signed `gitlawb://` ref-update. Omit for plain-git, local-only (degraded mode, PRD §3.5).
-# soul_repo above should point at the soul working tree (its own git repo), e.g. "soul-template".
-soul_remote: "gitlawb://did:key:z6MkYourSoulDidReplaceMe/dack-soul"
-gitlawb_node: "https://node.gitlawb.com"
+# ── Trust lattice (the taint model) ─────────────────────────────────────────────────────────────
+# Ordered low→high; each tier's `reaches` is the highest consciousness state a cycle at that tier may
+# walk to. A cycle starts at a provenance-seeded tier and only ratchets DOWN as it touches data, so a
+# cycle that reads public data can never reach an irreversible/self-editing state. The default is the
+# block below; add custom tiers (e.g. `org`) between the well-known ones. See docs/concepts.md.
+trust_tiers:
+  - { name: public, reaches: express }            # untrusted world (tweets, 3rd-party data)
+  # - { name: org,  reaches: settle }             # example: a vetted peer/channel — may trade
+  - { name: self,   reaches: reflect }            # the agent's own clean data — may even self-edit
+  - { name: operator_signed, reaches: reflect }   # a DID-signed operator instruction
 
-# Wall-clock budget (seconds) for one consciousness invocation incl. the wall round-trips. A hung
-# LLM/bridge elapses here → a logged Runtime error → dispatch continues (never a frozen loop).
-invoke_timeout_secs: 300
+# Per-webhook trust anchor: a webhook path → the tier a stimulus on it is seeded at. The listener is
+# localhost-only, so only a local channel adapter can post; the tier is the operator's call.
+# webhooks:
+#   "/telegram/op":  org
+#   "/telegram/pub": public
 
-# Dry-run (testing/debug): when enabled, the WALL denies any tool whose name starts with a `block`
-# prefix — the agent composes the action (recorded in the runlog) but it never executes. Tool-level,
-# uniform across every MCP (twitter, cove, …), so a no-real-trade run can still allow `simulate_swap`
-# and reads while holding `buy_token`. Default disabled (live). Example:
-# dry_run:
-#   enabled: true
-#   block: [mcp__twitter__post, mcp__twitter__reply, mcp__cove-trading__buy_token,
-#           mcp__cove-trading__sell_token, mcp__cove-trading__create_, mcp__cove-trading__cancel_,
-#           mcp__cove-trading__batch_order]
-dry_run:
-  enabled: false
-  block: []
-
-# ── MCP capability registry (PRD §6.3) ────────────────────────────────────────────────────
-# Operator authority — the agent can NEVER add a capability (that would be self-granting). Adding
-# a tool (cove.trade, the next MCP) is an entry here + a token file behind a secrets provider —
-# NEVER a harness/bridge code change. `tier` is the single source of truth the wall classifies
-# from, and gates which state may reach it:
-#   read   → ToolClass::Read   → safe in every state (monitoring: balances, prices)
-#   post   → ToolClass::Post   → Express only (reversible: tweet/reply)
-#   settle → ToolClass::SettleTx → SETTLE only + allow_settle (irreversible: trade/transfer/vote)
-# `transport` is `{type: stdio, command, args}` (our own daemon) or `{type: http, url}` (remote).
-# `auth.secret` names a secrets provider; the token is injected into the http header / stdio env
-# so it reaches the server but NEVER the agent's context. A state-prompt REQUESTS a server in its
-# `mcp:` frontmatter; the `tier_policy` above ADMITS it (the two-sided handshake, MCP2-B / I16).
-# `tools:` (optional) is a per-server tool ALLOWLIST (bare names). When set, ONLY those tools are
-# permitted — the wall denies any other tool under `mcp__<name>__` FAIL-CLOSED. This is essential
-# for an endpoint that serves its full surface to every token: cove returns all 37 tools (incl.
-# buy_token) on the read-only token, so `cove-read` MUST whitelist only the read tools, with the
-# trade tools living on the `cove-trading` (settle) sibling. Empty/omitted = expose everything.
-# `trust:` is the taint label (TIER-2) — distinct from the capability `tier`: CALLING a tool from
-# this server degrades the cycle to (at most) this tier, capping how far the chain may then walk.
-# CRITICAL: anything touching the PUBLIC world (twitter, rootai, x) MUST be `trust: public`, or a
-# tweet cycle would wrongly keep enough trust to trade or self-edit. cove → `self` (the operator's
-# own wallet, no contamination). A soul-INLINED MCP isn't in this registry, so it taints `public`.
+# ── Capabilities (MCP servers) ──────────────────────────────────────────────────────────────────
+# The agent's tools. `tier` = what kind of action (read=any state · post=Express · settle=Settle).
+# `trust` = the taint label of the data it puts in play (public-world tools MUST be trust:public).
+# `min_trust` = authorization floor. `tools` = a fail-closed allowlist. `scope_env` = per-cycle data
+# locked into the server's env. `auth.secret` names a secrets_providers entry. See docs/capabilities.md.
 mcp_servers:
   - name: twitter
     transport: { type: stdio, command: bun, args: [run, openclaude-bridge/twitter-mcp.ts] }
     auth: { secret: x, env: X_BEARER_TOKEN }
     tier: post
-    trust: public           # touches the public timeline → floors the cycle to an Express ceiling
-  - name: rootai            # example: a 3rd-party market-signals read MCP (public data)
-    transport: { type: http, url: "https://rootai.example/api/mcp" }
-    tier: read
-    trust: public           # 3rd-party signals are untrusted → Express ceiling
-  - name: cove-read         # remote http MCP — monitoring (read-only token)
-    transport: { type: http, url: "https://staging.cove.trade/api/mcp" }   # cove enabled MCP on staging
-    auth: { secret: cove_read }     # → Authorization: Bearer <token>; header/scheme overridable
-    tier: read
-    trust: self             # the operator's OWN wallet data → no degradation (could still reach Reflect)
-    tools: [get_balance, get_positions, search_tokens, get_token_info, get_token_stats,
-            get_price_history, get_token_security_report, scan_trending_tokens, simulate_swap]  # read subset
-  - name: cove-trading      # remote http MCP — IRREVERSIBLE trading (read-write token); Settle only
-    transport: { type: http, url: "https://staging.cove.trade/api/mcp" }
-    auth: { secret: cove_trade }
-    tier: settle
-    trust: self             # the operator's own wallet — a clean trade cycle
-    tools: [simulate_swap, buy_token, sell_token, create_limit_buy, cancel_limit_order]  # trade subset
-  # - name: dac-cloud       # example: a trusted peer/org MCP, labelled at a custom `org` trust tier
-  #   transport: { type: http, url: "https://dac-cloud.example/api/mcp" }
+    trust: public
+  # - name: telegram                              # destination-locked reply (open to any tier)
+  #   transport: { type: stdio, command: bun, args: [run, openclaude-bridge/telegram-mcp.ts] }
+  #   auth: { secret: telegram_bot, env: TELEGRAM_BOT_TOKEN }
+  #   tier: post
+  #   scope_env: { TELEGRAM_REPLY_CHAT: chat_id, TELEGRAM_REPLY_TO: message_id }
+  # - name: cove-read                             # read subset of a wallet API (own data → trust:self)
+  #   transport: { type: http, url: "https://your-wallet/api/mcp" }
+  #   auth: { secret: cove_read }
   #   tier: read
-  #   trust: org            # needs a matching `org` entry in `trust_tiers:` above (reaches: settle)
+  #   trust: self
+  #   tools: [get_balance, get_positions, simulate_swap]
+
+# The operator half of the capability handshake: a state-prompt requests a server in its `mcp:`
+# frontmatter; it's admitted only if listed here. mcp_whitelist:false = an OPEN tier (the soul may also
+# inline a public, secret-less READ MCP). model:/allow_model_override: the per-state model split.
+tier_policy:
+  perceive: { mcp_whitelist: false, import: [] }   # open: may self-plug public reads
+  express:  { import: [twitter] }
+  settle:   { import: [] }
+  reflect:  { import: [], allow_model_override: true }
+
+# ── Secrets ─────────────────────────────────────────────────────────────────────────────────────
+# A provider is a harness-owned script that fetches/rotates a short-lived token and prints a JSON env
+# map. A duty's `secrets:` or a capability's `auth.secret` references it by name; the token is injected
+# into that consumer ONLY, never the agent's model context. `trust:` = the taint label of its data.
+secrets_providers:
+  - name: x
+    command: ["python3", "secrets-providers/x_oauth2.py"]
+    env: { X_CREDS_FILE: "agentdack.rw.x.txt", X_TOKEN_STORE: "agentdack.rw.x.txt.tokens.json" }
+    keys: [X_BEARER_TOKEN]
+    trust: public                                  # the X bearer touches the public world
+  # - name: telegram_bot
+  #   command: ["python3", "secrets-providers/file_token.py"]
+  #   env: { TOKEN_KEY: TELEGRAM_BOT_TOKEN, TOKEN_FILE: "secrets/telegram.token" }
+  #   keys: [TELEGRAM_BOT_TOKEN]
+  #   trust: org
+
+# Env-var NAMES forwarded into the agent + sensors (values from the daemon env, never YAML). Recoverable
+# values only — a leak means rotate. The Soul DID key is NEVER here (it's a harness-only reference).
+forwarded_env: [DACK_HANDLE, RATE_LIMIT]
+
+# File references (the harness resolves them; values never inline here). The Soul DID key is harness-only.
+secrets:
+  soul_did_key: "file:///run/secrets/soul_did_key"
+
+# ── Channels (long-running adapters the harness supervises) ──────────────────────────────────────
+# A module is spawned at boot with its declared secrets injected, restart-supervised, torn down on
+# shutdown. It normalizes a channel protocol into a webhook POST. See docs/channels.md.
+# modules:
+#   - name: telegram-ingress
+#     command: [bun, run, openclaude-bridge/telegram-ingress.ts]
+#     secrets: [telegram_bot]
+#     env: { TELEGRAM_INGRESS_CONFIG: telegram-ingress.config.json }
+
+# ── Delegated workers (Docker isolation) ─────────────────────────────────────────────────────────
+# When enabled, an agent def with `isolation: docker` runs its worker's bridge in a container. Build
+# the image first: `docker build -f Dockerfile.worker -t dack/worker:latest .`. See docs/workers.md.
+# runtime.worker_sandbox:               # (nest under `runtime:` above)
+#   enabled: false
+#   image: dack/worker:latest
+
+# ── Soul repo signing + identities ───────────────────────────────────────────────────────────────
+# Set soul_remote + identities.soul to commit/push the agent's history signed as its own DID. Omit
+# soul_remote for plain-git, local-only. GITIGNORE /identities/ — these are private keys. See
+# docs/operations.md.
+# soul_remote: "gitlawb://did:key:z6MkYourSoulDidReplaceMe/my-soul"
+# gitlawb_node: "https://node.gitlawb.com"
+identities:
+  soul: "identities/soul"
+  operator: "identities/operator"
+
+# ── Behavior knobs (all optional; defaults shown) ────────────────────────────────────────────────
+default_entry: perceive                  # state-prompt that `dack say` / the boot ping enter at
+reflect_schedule: "0 4 * * *"            # cron for the nightly self-modification run (omit for manual)
+reflect_min_interval_secs: 86400         # min seconds between Reflect runs (self-edit cadence); 0 = off
+session_ttl_secs: 3600                   # idle seconds before a sticky engine session is dropped
+db_path: "dack.sqlite"                   # embedded queue (ephemeral; losing it loses only the queue)
+webhook_addr: "127.0.0.1:8787"           # localhost-only webhook listener
+invoke_timeout_secs: 300                 # budget for one consciousness invocation
+
+# Dry-run (testing): the wall denies any tool whose name starts with a `block` prefix — the agent
+# composes the action (visible in the runlog) but it never executes. Tool-level + uniform across MCPs.
+dry_run:
+  enabled: false
+  block: []
+  # block: [mcp__twitter__post, mcp__twitter__reply]

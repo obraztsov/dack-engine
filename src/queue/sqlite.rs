@@ -16,7 +16,7 @@ use serde::{de::DeserializeOwned, Serialize};
 
 use super::Queue;
 use crate::error::{DackError, Result};
-use crate::model::stimulus::{Stimulus, StimulusId, StimulusStatus, StimulusType};
+use crate::model::stimulus::{Priority, Stimulus, StimulusId, StimulusStatus, StimulusType};
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS stimulus (
@@ -309,6 +309,36 @@ impl Queue for SqliteQueue {
         .map_err(db)?;
         Ok(())
     }
+
+    async fn shed(&self, max_depth: usize) -> Result<Vec<StimulusId>> {
+        let conn = self.conn.lock().unwrap();
+        let pending: i64 = conn
+            .query_row("SELECT COUNT(*) FROM stimulus WHERE status='pending'", [], |r| r.get(0))
+            .map_err(db)?;
+        if pending as usize <= max_depth {
+            return Ok(Vec::new());
+        }
+        let excess = pending as usize - max_depth;
+        // Oldest LOW-priority pending rows first (the stalest, least-urgent work). `priority_rank`
+        // is the numeric urgency (Low = highest number); Normal+ is never selected.
+        let low_rank = Priority::Low.numeric();
+        let ids: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id FROM stimulus WHERE status='pending' AND priority_rank >= ?1 \
+                     ORDER BY received_at ASC, id ASC LIMIT ?2",
+                )
+                .map_err(db)?;
+            let rows = stmt
+                .query_map(params![low_rank, excess as i64], |r| r.get::<_, String>(0))
+                .map_err(db)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db)?
+        };
+        for id in &ids {
+            conn.execute("DELETE FROM stimulus WHERE id=?1", params![id]).map_err(db)?;
+        }
+        Ok(ids.into_iter().map(StimulusId).collect())
+    }
 }
 
 #[cfg(test)]
@@ -351,6 +381,33 @@ mod tests {
         assert_eq!(q.next().await.unwrap().unwrap().id.0, "normal-new");
         assert_eq!(q.next().await.unwrap().unwrap().id.0, "low");
         assert!(q.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn shed_evicts_oldest_low_priority_and_protects_normal_plus() {
+        let q = SqliteQueue::open_in_memory().unwrap();
+        // 3 Low (varying age) + 1 Normal + 1 Urgent = 5 pending.
+        q.enqueue(mk("low-old", Priority::Low, 10, "mention", None)).await.unwrap();
+        q.enqueue(mk("low-mid", Priority::Low, 20, "mention", None)).await.unwrap();
+        q.enqueue(mk("low-new", Priority::Low, 30, "mention", None)).await.unwrap();
+        q.enqueue(mk("normal", Priority::Normal, 15, "mention", None)).await.unwrap();
+        q.enqueue(mk("urgent", Priority::Urgent, 25, "mention", None)).await.unwrap();
+
+        // Cap at 3 → shed the 2 OLDEST Low rows; Normal + Urgent are the protected floor.
+        let shed: Vec<_> = q.shed(3).await.unwrap().iter().map(|s| s.0.clone()).collect();
+        assert_eq!(shed.len(), 2);
+        assert!(shed.contains(&"low-old".to_string()) && shed.contains(&"low-mid".to_string()), "{shed:?}");
+        assert_eq!(q.depth().await.unwrap(), 3, "down to the cap; low-new + normal + urgent remain");
+
+        // Under cap → no-op.
+        assert!(q.shed(3).await.unwrap().is_empty());
+
+        // A queue of only Normal+ over cap sheds NOTHING — protected floor = backpressure, not a drop.
+        let q2 = SqliteQueue::open_in_memory().unwrap();
+        q2.enqueue(mk("n1", Priority::Normal, 1, "mention", None)).await.unwrap();
+        q2.enqueue(mk("n2", Priority::Normal, 2, "mention", None)).await.unwrap();
+        assert!(q2.shed(1).await.unwrap().is_empty(), "Normal+ is never shed");
+        assert_eq!(q2.depth().await.unwrap(), 2);
     }
 
     #[tokio::test]

@@ -41,9 +41,15 @@ duty, decide what (if anything) to do, and either transition to `express` to act
 
 Return a structured result:
 - thought: your reasoning (logged, never published)
-- proposal: { intent, gist, refs }   # the gist is your own digest — the firebreak
-- transition: { to_prompt }           # one of your allowed transitions, or null
+- batons: [ { to_prompt, gist, priority? } ]   # your fan-out: 0, 1, or several branches
+- spawn: { agent, brief } | null               # optional: delegate a job to a worker
 ```
+
+`batons` is the fan-out: **one** element takes a single next step (the common case), **several** do
+several things at once — each its own digested gist + destination, each gated independently by the
+cycle's trust ceiling — and `[]` stops. A branch marked `priority: low` is **deferred** to the queue so
+a higher-priority stimulus can be handled first; everything else runs immediately. (The legacy single
+`transition: { to_prompt }` + `proposal: { gist }` is still accepted and folds to one branch.)
 
 Frontmatter fields:
 
@@ -87,7 +93,8 @@ Standing directive (trusted): the durable instruction for this duty — what the
 | `emits` | `{ type }` — the stimulus type produced. |
 | `entry` | The state-prompt id a cycle opens at. |
 | `directive_tier` | The trust of this duty's *standing directive* (the trusted `.md` body). The *payload's* trust is seeded separately from the source (signed-script / webhook-path / `self` for pure-cron). |
-| `priority` | `urgent` / `high` / `normal` / `low` — queue ordering. |
+| `priority` | `urgent` / `high` / `normal` / `low` — queue ordering (urgent first; low is sheddable under load). |
+| `dispatch_window` | Optional `"HH:MM-HH:MM"` (UTC, may cross midnight). A stimulus arriving outside the window waits until it next opens — e.g. handle a noisy public group only at night. |
 | `coalesce` | Optional folding (below). |
 | `cursor` | Optional `{ field, env }` cross-poll watermark, so a poller never re-surfaces a handled item. |
 

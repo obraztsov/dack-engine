@@ -229,6 +229,8 @@ commit author; you authenticate the push with an SSH deploy key (no `auth` neede
 | `reflect_schedule` | cron | none | Cron for the scheduled Reflect run (e.g. `"0 4 * * *"`). Omit for manual `dack reflect-now` only. |
 | `reflect_min_interval_secs` | int | `86400` | Minimum seconds between Reflect (self-modification) runs — enforced for both the scheduled and any transition-reached Reflect. `0` disables. |
 | `session_ttl_secs` | int | `3600` | Idle seconds before a sticky engine session is dropped. `0` = never evict. |
+| `queue_max_depth` | int \| null | `10000` | Load-shedding cap: max pending queue depth before the **oldest `Low`-priority** items are evicted (Normal+ is the protected floor, never shed; each eviction is logged). `null` = unbounded. Protects against a runaway low-priority fan-out backlog. |
+| `baton_ttl_secs` | int \| null | `null` | A deferred baton continuation older than this many seconds is **expired** (dropped + logged) at dispatch instead of acting on a stale context. `null` = never expire by age. |
 | `db_path` | string | `dack.sqlite` | The embedded SQLite queue path (ephemeral — losing it loses only the queue). |
 | `webhook_addr` | string | `127.0.0.1:8787` | The localhost bind for the webhook listener. Nothing is public without a proxy. |
 | `invoke_timeout_secs` | int | `300` | Wall-clock budget for one consciousness invocation incl. the wall round-trips. A hung LLM/bridge elapses here → a logged error → the loop continues. |

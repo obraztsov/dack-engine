@@ -110,11 +110,24 @@ impl Bus {
             // it (above) before it fires as one wake. Folds keep the accumulator's `received_at`, so
             // the window is measured from the FIRST message (a fixed cadence, not a sliding one). A
             // `window_sec` of 0/absent (or `latest`/`none`) ⇒ `None` = immediately poppable.
-            let pop_after = match &fm.coalesce {
+            // Both the coalesce debounce AND the dispatch window (Phase 3) express themselves as a
+            // `pop_after` (earliest-poppable) second; the effective gate is the LATER of the two —
+            // a windowed group message still folds for its debounce, then waits for the window.
+            let coalesce_pop_after = match &fm.coalesce {
                 Some(p) if matches!(p.mode, CoalesceMode::Batch) => {
                     p.window_sec.filter(|w| *w > 0).map(|w| received_at + w as i64)
                 }
                 _ => None,
+            };
+            let window_pop_after = fm
+                .dispatch_window
+                .as_deref()
+                .and_then(crate::stimuli::DispatchWindow::parse)
+                .map(|w| w.next_open(received_at))
+                .filter(|t| *t > received_at);
+            let pop_after = match (coalesce_pop_after, window_pop_after) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
             };
 
             let id = StimulusId(format!("{}-{}-{}", fm.id, received_at, i));
@@ -246,6 +259,32 @@ mod tests {
     /// The telegram group case: a chat's messages fold into ONE debounced wake, and the coalesced
     /// row keeps the LATEST message's `chat_id`/`message_id` at top-level (so the reply
     /// destination-lock + baton still resolve) while `items` holds the whole batch.
+    /// Phase 3 dispatch window: a duty with `dispatch_window: "02:00-05:00"` holds a stimulus that
+    /// arrives outside the window (via `pop_after`) until it next opens; one arriving inside is
+    /// immediately eligible.
+    #[tokio::test]
+    async fn dispatch_window_defers_a_stimulus_until_the_window_opens() {
+        let def = StimulusDef::parse(
+            "---\nid: pubgroup\ntrigger: { type: webhook, path: /telegram/pub }\n\
+             directive_tier: self\nemits:\n  type: telegram_message\n  default_payload_tier: public\n\
+             dispatch_window: \"02:00-05:00\"\nentry: telegram/perceive\n---\nNoisy public group.\n",
+            "stimuli/pubgroup/STIMULUS.md",
+        )
+        .unwrap();
+
+        // Arrives at 00:00 UTC (received_at=0) — OUTSIDE the window → held until 02:00 (7200s).
+        let b = bus();
+        b.ingest(&def, vec![chat_cand(9, 1, "gm at midnight")], 0, TrustTier::public()).await.unwrap();
+        let row = b.queue.next().await.unwrap().unwrap();
+        assert_eq!(row.pop_after, Some(7_200), "held until the window opens at 02:00 UTC");
+
+        // Arrives at 03:00 UTC (received_at=10800) — INSIDE the window → no gate.
+        let b2 = bus();
+        b2.ingest(&def, vec![chat_cand(9, 2, "gm at 3am")], 10_800, TrustTier::public()).await.unwrap();
+        let row2 = b2.queue.next().await.unwrap().unwrap();
+        assert_eq!(row2.pop_after, None, "inside the window → immediately poppable");
+    }
+
     #[tokio::test]
     async fn batch_hoists_latest_fields_and_sets_pop_after() {
         let b = bus();

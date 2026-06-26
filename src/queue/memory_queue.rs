@@ -8,7 +8,7 @@ use std::sync::Mutex;
 
 use super::Queue;
 use crate::error::Result;
-use crate::model::stimulus::{Stimulus, StimulusId, StimulusStatus, StimulusType};
+use crate::model::stimulus::{Priority, Stimulus, StimulusId, StimulusStatus, StimulusType};
 
 #[derive(Default)]
 pub struct InMemoryQueue {
@@ -110,5 +110,36 @@ impl Queue for InMemoryQueue {
     async fn set_cursor(&self, key: &str, value: &str) -> Result<()> {
         self.cursors.lock().unwrap().insert(key.to_string(), value.to_string());
         Ok(())
+    }
+
+    async fn shed(&self, max_depth: usize) -> Result<Vec<StimulusId>> {
+        let mut rows = self.rows.lock().unwrap();
+        let pending = rows.iter().filter(|s| s.status == StimulusStatus::Pending).count();
+        if pending <= max_depth {
+            return Ok(Vec::new());
+        }
+        let excess = pending - max_depth;
+        let low_rank = Priority::Low.numeric();
+        // Indices of the OLDEST low-priority pending rows (stalest, least-urgent), `excess` of them.
+        let mut cand: Vec<(usize, i64)> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.status == StimulusStatus::Pending && s.priority.numeric() >= low_rank)
+            .map(|(i, s)| (i, s.received_at))
+            .collect();
+        cand.sort_by_key(|(_, r)| *r);
+        let victims: std::collections::HashSet<usize> =
+            cand.into_iter().take(excess).map(|(i, _)| i).collect();
+        let mut shed = Vec::new();
+        let mut idx = 0usize;
+        rows.retain(|s| {
+            let keep = !victims.contains(&idx);
+            if !keep {
+                shed.push(s.id.clone());
+            }
+            idx += 1;
+            keep
+        });
+        Ok(shed)
     }
 }

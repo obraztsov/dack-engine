@@ -109,6 +109,9 @@ fn default_reaches() -> ConsciousnessState {
 fn default_reflect_interval() -> i64 {
     86_400 // one day — a sane self-modification cadence; the operator may loosen or `0` to disable.
 }
+fn default_queue_max_depth() -> Option<usize> {
+    Some(10_000)
+}
 fn default_session_ttl() -> i64 {
     3_600 // one hour idle before a sticky session is dropped.
 }
@@ -509,6 +512,16 @@ pub struct DackConfig {
     /// Default 1 hour. `0` = never evict (not recommended).
     #[serde(default = "default_session_ttl")]
     pub session_ttl_secs: i64,
+    /// **Load-shedding cap** (Phase 4): the max PENDING queue depth before the OLDEST `Low`-priority
+    /// items are evicted (Normal+ is the protected floor, never shed; every eviction is logged).
+    /// Protects a busy duck from a runaway low-priority fan-out backlog. `None` = unbounded.
+    #[serde(default = "default_queue_max_depth")]
+    pub queue_max_depth: Option<usize>,
+    /// **Baton TTL** (Phase 4, seconds): a deferred baton continuation older than this is EXPIRED
+    /// (dropped + logged) at dispatch instead of acting on a stale context — the world moved on while
+    /// it waited behind higher-priority work. `None` (default) = a continuation never expires by age.
+    #[serde(default)]
+    pub baton_ttl_secs: Option<u64>,
     /// The state-prompt id harness-synthesized stimuli enter at (operator `dack say`, the
     /// boot back-online ping) — duties that carry no `entry:` of their own (MCP2-B). Defaults to
     /// the flat `perceive` prompt.

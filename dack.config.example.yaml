@@ -148,6 +148,8 @@ default_entry: perceive                  # state-prompt that `dack say` / the bo
 reflect_schedule: "0 4 * * *"            # cron for the nightly self-modification run (omit for manual)
 reflect_min_interval_secs: 86400         # min seconds between Reflect runs (self-edit cadence); 0 = off
 session_ttl_secs: 3600                   # idle seconds before a sticky engine session is dropped
+queue_max_depth: 10000                   # load-shed cap: evict OLDEST low-prio items over this (Normal+ kept); null = unbounded
+# baton_ttl_secs: 86400                  # expire a deferred baton older than this (stale context); omit = never expire
 db_path: "dack.sqlite"                   # embedded queue (ephemeral; losing it loses only the queue)
 webhook_addr: "127.0.0.1:8787"           # localhost-only webhook listener
 invoke_timeout_secs: 300                 # budget for one consciousness invocation

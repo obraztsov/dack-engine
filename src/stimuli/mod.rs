@@ -84,6 +84,11 @@ pub struct StimulusFrontmatter {
     pub entry: String,
     #[serde(default)]
     pub priority: Option<Priority>,
+    /// **Dispatch window** (Phase 3): a daily UTC range `"HH:MM-HH:MM"` (may cross midnight, e.g.
+    /// `"22:00-05:00"`). A stimulus arriving OUTSIDE it is held — via `pop_after` — until the window
+    /// next opens: "handle the noisy public groups only at deep night." `None` ⇒ always eligible.
+    #[serde(default)]
+    pub dispatch_window: Option<String>,
     /// Secrets-provider scopes this duty's sensor needs (by provider `name`). The harness
     /// runs those trusted provider scripts and injects only their short-lived token env — the
     /// sensor never holds the root credential (PRD §7.2; `docs/SECRETS-AND-SANDBOX.md`).
@@ -93,6 +98,55 @@ pub struct StimulusFrontmatter {
     /// sensors (mentions) so the duck never re-processes (or re-replies to) an already-seen item.
     #[serde(default)]
     pub cursor: Option<CursorSpec>,
+}
+
+/// A daily **dispatch window** in UTC (Phase 3), parsed from `"HH:MM-HH:MM"`. A stimulus arriving
+/// outside the window is deferred — via the queue's `pop_after` gate — to the next time it opens.
+/// Crosses midnight when `start > end` (e.g. `"22:00-05:00"`). UTC keeps it deterministic; the
+/// operator picks the range in UTC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DispatchWindow {
+    start_min: u32,
+    end_min: u32,
+}
+
+impl DispatchWindow {
+    /// Parse `"HH:MM-HH:MM"` (24h, UTC). `None` on any malformed/degenerate (start == end) input.
+    pub fn parse(s: &str) -> Option<Self> {
+        let (a, b) = s.split_once('-')?;
+        let parse_min = |x: &str| -> Option<u32> {
+            let (h, m) = x.trim().split_once(':')?;
+            let (h, m): (u32, u32) = (h.trim().parse().ok()?, m.trim().parse().ok()?);
+            (h < 24 && m < 60).then_some(h * 60 + m)
+        };
+        let (start_min, end_min) = (parse_min(a)?, parse_min(b)?);
+        (start_min != end_min).then_some(Self { start_min, end_min })
+    }
+
+    /// Whether `minute_of_day` (0..1440) is inside the window (handles the midnight wrap).
+    pub fn contains(&self, minute_of_day: u32) -> bool {
+        if self.start_min <= self.end_min {
+            minute_of_day >= self.start_min && minute_of_day < self.end_min
+        } else {
+            minute_of_day >= self.start_min || minute_of_day < self.end_min
+        }
+    }
+
+    /// The unix second at which this window is next OPEN for a stimulus arriving at `at` (UTC): `at`
+    /// itself if already open, else the next occurrence of the window's start.
+    pub fn next_open(&self, at: i64) -> i64 {
+        const DAY: i64 = 86_400;
+        let since_midnight = at.rem_euclid(DAY);
+        if self.contains((since_midnight / 60) as u32) {
+            return at;
+        }
+        let start_today = (at - since_midnight) + self.start_min as i64 * 60;
+        if start_today > at {
+            start_today
+        } else {
+            start_today + DAY
+        }
+    }
 }
 
 /// A registered duty: parsed frontmatter + the trusted directive body.
@@ -257,6 +311,27 @@ fn rel(path: &Path, root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dispatch_window_parse_contains_and_next_open() {
+        // 02:00–05:00 UTC (a normal, non-wrapping window).
+        let w = DispatchWindow::parse("02:00-05:00").unwrap();
+        assert!(w.contains(3 * 60) && !w.contains(1 * 60) && !w.contains(6 * 60));
+        assert_eq!(w.next_open(0), 7_200, "midnight → held until 02:00 today");
+        assert_eq!(w.next_open(10_000), 10_000, "inside the window → open now");
+        assert_eq!(w.next_open(43_200), 86_400 + 7_200, "noon → 02:00 tomorrow");
+
+        // 22:00–05:00 UTC (wraps midnight).
+        let w = DispatchWindow::parse("22:00-05:00").unwrap();
+        assert!(w.contains(23 * 60) && w.contains(3 * 60) && !w.contains(12 * 60));
+        assert_eq!(w.next_open(43_200), 22 * 3_600, "noon → 22:00 today");
+        assert_eq!(w.next_open(23 * 3_600), 23 * 3_600, "23:00 is inside → now");
+
+        // Malformed / degenerate → None.
+        assert!(DispatchWindow::parse("nope").is_none());
+        assert!(DispatchWindow::parse("25:00-05:00").is_none());
+        assert!(DispatchWindow::parse("02:00-02:00").is_none());
+    }
 
     // The §5.4 worked example, verbatim shape.
     const CLARITY: &str = r#"---

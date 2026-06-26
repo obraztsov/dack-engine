@@ -129,6 +129,18 @@ impl Harness {
                 }
                 continue;
             }
+            // Load-shed (Phase 4): bound the pending queue, dropping only the stalest low-prio work.
+            if let Some(max) = self.config.queue_max_depth {
+                match self.queue.shed(max).await {
+                    Ok(shed) if !shed.is_empty() => eprintln!(
+                        "dack: load-shed {} low-prio queue item(s) over cap {max}: {}",
+                        shed.len(),
+                        shed.iter().map(|i| i.0.as_str()).collect::<Vec<_>>().join(", ")
+                    ),
+                    Ok(_) => {}
+                    Err(e) => eprintln!("dack: load-shed failed: {e}"),
+                }
+            }
             match self.queue.next().await? {
                 Some(stimulus) => {
                     let snap = stimulus.clone();
@@ -212,11 +224,33 @@ impl Harness {
         // the accumulated tier maps to the state CEILING (`reaches`) — how far the chain may walk.
         // I18: an `operator_signed` directive is honored ONLY against a verifying signature — never
         // a self-asserted label (the `dack say` path); a bad/absent signature downgrades to public.
-        let directive_tier = self.verified_directive_tier(&stimulus).await;
-        let cycle_trust = lattice.meet(&directive_tier, &stimulus.payload_tier);
+        // Phase 2: a DEFERRED BATON CONTINUATION pops here like any stimulus, but is NOT re-perceived
+        // — it carries a digested Baton and its already-firebreak-clamped accumulated trust, so it
+        // runs directly as the act-state on that baton (no re-verify, no re-meet). A RAW stimulus
+        // instead opens Perceive on the (untrusted) payload after verifying its directive tier (I18).
+        let continuation = parse_continuation(&stimulus);
+        // Phase 4 — baton TTL: a deferred baton that waited too long behind higher-priority work is
+        // STALE (the context it digested has moved on). Expire it instead of acting on a dead gist.
+        if continuation.is_some() {
+            if let Some(ttl) = self.config.baton_ttl_secs {
+                let age = now - stimulus.received_at;
+                if age > ttl as i64 {
+                    eprintln!("dispatch: stale baton expired ({age}s old > {ttl}s TTL) — dropped ({})", stimulus.id);
+                    return Ok(());
+                }
+            }
+        }
+        let (cycle_trust, entry_step, depth) = match &continuation {
+            Some((baton, d)) => (stimulus.payload_tier.clone(), StepInput::Act(baton.clone()), *d),
+            None => {
+                let directive_tier = self.verified_directive_tier(&stimulus).await;
+                (lattice.meet(&directive_tier, &stimulus.payload_tier), StepInput::Entry, 0usize)
+            }
+        };
         let ceiling = lattice.reaches(&cycle_trust);
 
-        // Resolve the ENTRY state-prompt (live from the soul repo, so Reflect edits take effect).
+        // Resolve the ENTRY state-prompt (live from the soul repo, so Reflect edits take effect). For
+        // a continuation this is the baton's destination state; for a raw stimulus, the duty's entry.
         let current = match self.resolve_state_prompt(&stimulus.entry).await {
             Ok(p) => p,
             Err(e) => {
@@ -257,8 +291,10 @@ impl Harness {
             ceiling: ConsciousnessState,
         }
         let mut work: std::collections::VecDeque<Branch> = std::collections::VecDeque::new();
-        work.push_back(Branch { prompt: current, step: StepInput::Entry, trust: cycle_trust, ceiling });
+        work.push_back(Branch { prompt: current, step: entry_step, trust: cycle_trust, ceiling });
         let mut steps = 0usize;
+        // Per-dispatch sequence for unique deferred-continuation ids.
+        let mut deferred_seq = 0usize;
         while let Some(b) = work.pop_front() {
             steps += 1;
             if steps > MAX_CYCLE_STEPS {
@@ -358,12 +394,35 @@ impl Harness {
                 // branch's accumulated trust), never raw bytes.
                 let baton =
                     build_baton_from_intent(&intent, &out, &stimulus, runlog_ref.clone(), trust.clone());
-                work.push_back(Branch {
-                    prompt: next,
-                    step: StepInput::Act(baton),
-                    trust: trust.clone(),
-                    ceiling,
-                });
+                // DEFER to the durable queue (Phase 2) ONLY when the model EXPLICITLY marks this branch
+                // low-priority ("do it later") — so a higher-priority stimulus can be processed first.
+                // A legacy/inherited priority runs in-wake as the natural continuation. Bounded by
+                // recursion depth, beyond which even a low baton runs in-wake to terminate. (Priority ⟂
+                // trust: it changes WHEN a branch runs, never WHAT it may do. Full per-item priority +
+                // the ≤-origin clamp arrive in Phase 3.)
+                if intent.priority == Some(Priority::Low) && depth < MAX_LINEAGE_DEPTH {
+                    deferred_seq += 1;
+                    let cont = continuation_stimulus(
+                        &stimulus, &next.id, &baton, trust.clone(), Priority::Low, depth + 1, deferred_seq, now,
+                    );
+                    match self.queue.enqueue(cont).await {
+                        Ok(()) => eprintln!(
+                            "dispatch: deferred low-prio baton → queue (`{}`, depth {}) ({})",
+                            next.id, depth + 1, stimulus.id
+                        ),
+                        Err(e) => {
+                            eprintln!("dispatch: enqueue deferred baton failed ({}): {e} — running in-wake", stimulus.id);
+                            work.push_back(Branch { prompt: next, step: StepInput::Act(baton), trust: trust.clone(), ceiling });
+                        }
+                    }
+                } else {
+                    work.push_back(Branch {
+                        prompt: next,
+                        step: StepInput::Act(baton),
+                        trust: trust.clone(),
+                        ceiling,
+                    });
+                }
                 emitted += 1;
             }
         }
@@ -1037,6 +1096,61 @@ const MAX_CYCLE_STEPS: usize = 12;
 /// Hard cap on how many intent-batons ONE step may fan out to. Extra batons beyond this are dropped
 /// (logged). Keeps a single confused step from flooding the worklist; real fan-out is 1–3 branches.
 const MAX_FANOUT_WIDTH: usize = 5;
+
+/// How many times a lineage may DEFER a low-priority baton back through the durable queue (Phase 2)
+/// before further low-prio batons are just run in-wake instead — bounds queue-recursion depth so a
+/// self-reproducing fan-out can't grow the queue without end (the global cap lands in Phase 4).
+const MAX_LINEAGE_DEPTH: usize = 4;
+
+/// The reserved `Stimulus::type_` marking a DURABLE BATON CONTINUATION (Phase 2): a fan-out branch
+/// DEFERRED to the queue instead of run in-wake, so a low-priority follow-on can be jumped by a
+/// higher-priority stimulus. Created ONLY by the harness (never a sensor/duty); dispatch runs it as
+/// `StepInput::Act(baton)` at `entry`, reseeded from the already-firebreak-clamped trust it carries
+/// in `payload_tier` — no re-perceive, no re-verify.
+const BATON_CONTINUATION_TYPE: &str = "baton-continuation";
+
+/// Pack a deferred branch into a durable continuation `Stimulus`. The Baton (the agent's digested
+/// product + accumulated trust) rides in `payload`; `payload_tier` carries the branch trust so
+/// dispatch reseeds from it; `priority` is the clamped scheduling priority; `depth` bounds recursion.
+#[allow(clippy::too_many_arguments)]
+fn continuation_stimulus(
+    origin: &Stimulus,
+    dest_prompt: &str,
+    baton: &Baton,
+    trust: TrustTier,
+    priority: Priority,
+    depth: usize,
+    seq: usize,
+    now: i64,
+) -> Stimulus {
+    Stimulus {
+        id: StimulusId(format!("{}-b{seq}", origin.id.0)),
+        source: origin.source.clone(),
+        type_: StimulusType::from(BATON_CONTINUATION_TYPE),
+        directive_tier: origin.directive_tier.clone(),
+        payload_tier: trust,
+        payload: serde_json::json!({ "baton": baton, "depth": depth }),
+        provenance: None,
+        received_at: now,
+        dedup_key: None,
+        pop_after: None,
+        priority,
+        status: StimulusStatus::Pending,
+        directive_body: String::new(),
+        entry: dest_prompt.to_string(),
+    }
+}
+
+/// Recover a deferred continuation's `(Baton, depth)` from a popped `Stimulus`, or `None` if it is a
+/// raw (perceive) stimulus.
+fn parse_continuation(stimulus: &Stimulus) -> Option<(Baton, usize)> {
+    if stimulus.type_.0 != BATON_CONTINUATION_TYPE {
+        return None;
+    }
+    let baton: Baton = serde_json::from_value(stimulus.payload.get("baton")?.clone()).ok()?;
+    let depth = stimulus.payload.get("depth").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    Some((baton, depth))
+}
 
 /// What a [`run_step`](Harness::run_step) invocation is seeded with: the ENTRY step ingests the
 /// directive + untrusted payload; every later step opens fresh on the digested [`Baton`] (the
@@ -2192,6 +2306,150 @@ mod tests {
         let seen = runtime.seen.lock().unwrap();
         assert_eq!(seen.len(), 2, "perceive + express; the settle baton was above the public ceiling");
         assert_eq!(seen[1].spec.state, ConsciousnessState::Express, "the admitted branch is Express");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Phase 2: a baton the model marks EXPLICITLY low-priority is DEFERRED to the durable queue (not
+    /// run in-wake), and dispatching that continuation later runs the destination act-state on the
+    /// carried baton — no re-perceive. The express branch (no explicit priority) still runs in-wake.
+    #[tokio::test]
+    async fn low_prio_baton_defers_to_queue_then_runs_as_continuation() {
+        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::queue::InMemoryQueue;
+        use crate::repo::git::PlainGitRepo;
+        use crate::runlog::FileRunLog;
+        use std::collections::{HashMap, VecDeque};
+
+        let tmp = std::env::temp_dir().join(format!("dack-defer-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        seed_prompts(&tmp);
+
+        let perceive_out = AgentOutput {
+            thought: "now + later".into(),
+            memory_append: None,
+            proposal: None,
+            spawn: None,
+            transition: Transition::default(),
+            batons: vec![
+                BatonIntent { to_prompt: "express".into(), gist: "reply now".into(), priority: None, reason: String::new() },
+                BatonIntent { to_prompt: "settle".into(), gist: "trade later".into(), priority: Some(Priority::Low), reason: String::new() },
+            ],
+        };
+        let runtime = Arc::new(ScriptedRuntime {
+            seen: std::sync::Mutex::new(Vec::new()),
+            outs: std::sync::Mutex::new(VecDeque::from(vec![perceive_out])),
+        });
+        let config = Arc::new(DackConfig::from_yaml("operator_did: \"did:x\"").unwrap());
+        let queue: Arc<dyn Queue> = Arc::new(InMemoryQueue::new());
+        let harness = Harness {
+            config: config.clone(),
+            queue: queue.clone(),
+            bus: Arc::new(Bus::new(config.clone(), queue.clone())),
+            runtime: runtime.clone(),
+            repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
+            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
+            broker: Arc::new(SecretsBroker::new(vec![])),
+            sessions: Default::default(),
+        };
+
+        // Self-tier so the settle branch is within the ceiling.
+        let mut stim = poisoned_stimulus();
+        stim.payload_tier = TrustTier::self_();
+        harness.dispatch(stim).await.unwrap();
+
+        // In-wake: perceive + express ran (2). The Low settle baton was DEFERRED, not run in-wake.
+        assert_eq!(runtime.seen.lock().unwrap().len(), 2, "perceive + express in-wake; settle deferred");
+        // The queue holds exactly that one durable continuation.
+        let cont = queue.next().await.unwrap().expect("a deferred continuation is queued");
+        assert_eq!(cont.type_.0, "baton-continuation");
+        assert_eq!(cont.entry, "settle");
+
+        // Dispatching it runs the settle act-state on the carried baton (no re-perceive).
+        harness.dispatch(cont).await.unwrap();
+        let seen = runtime.seen.lock().unwrap();
+        assert_eq!(seen.len(), 3, "the continuation ran the deferred settle branch");
+        assert_eq!(seen[2].spec.state, ConsciousnessState::Settle, "the continuation's act state is Settle");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Phase 2 headline: a fresh higher-priority stimulus is popped BEFORE a low-priority continuation
+    /// already waiting in the queue — the "high-prio stimulus jumps the low-prio follow-on backlog".
+    #[tokio::test]
+    async fn higher_priority_stimulus_preempts_a_deferred_low_baton() {
+        use crate::queue::InMemoryQueue;
+        let queue = InMemoryQueue::new();
+
+        // A deferred low-prio continuation is already waiting...
+        let mut low = poisoned_stimulus();
+        low.id = StimulusId("lin-b1".into());
+        low.type_ = StimulusType::from("baton-continuation");
+        low.priority = Priority::Low;
+        queue.enqueue(low).await.unwrap();
+
+        // ...then a fresh NORMAL-priority stimulus arrives.
+        let mut fresh = poisoned_stimulus();
+        fresh.id = StimulusId("fresh".into());
+        fresh.priority = Priority::Normal;
+        queue.enqueue(fresh).await.unwrap();
+
+        // next() pops the higher-priority fresh stimulus FIRST; the low baton waits its turn.
+        assert_eq!(queue.next().await.unwrap().unwrap().id.0, "fresh", "higher priority preempts");
+        assert_eq!(queue.next().await.unwrap().unwrap().id.0, "lin-b1", "then the deferred low baton");
+    }
+
+    /// Phase 4 — baton TTL: a deferred baton continuation older than `baton_ttl_secs` is EXPIRED at
+    /// dispatch (the world moved on while it waited) — it never invokes the model.
+    #[tokio::test]
+    async fn stale_baton_continuation_is_expired_at_dispatch() {
+        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::queue::InMemoryQueue;
+        use crate::repo::git::PlainGitRepo;
+        use crate::runlog::FileRunLog;
+        use std::collections::{BTreeMap, HashMap, VecDeque};
+
+        let tmp = std::env::temp_dir().join(format!("dack-ttl-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        seed_prompts(&tmp);
+
+        let runtime = Arc::new(ScriptedRuntime {
+            seen: std::sync::Mutex::new(Vec::new()),
+            outs: std::sync::Mutex::new(VecDeque::new()),
+        });
+        // A 60-second baton TTL.
+        let config = Arc::new(DackConfig::from_yaml("operator_did: \"did:x\"\nbaton_ttl_secs: 60").unwrap());
+        let queue: Arc<dyn Queue> = Arc::new(InMemoryQueue::new());
+        let harness = Harness {
+            config: config.clone(),
+            queue: queue.clone(),
+            bus: Arc::new(Bus::new(config.clone(), queue.clone())),
+            runtime: runtime.clone(),
+            repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
+            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
+            broker: Arc::new(SecretsBroker::new(vec![])),
+            sessions: Default::default(),
+        };
+
+        // A continuation with an ANCIENT received_at (0) — far older than the 60s TTL.
+        let baton = Baton {
+            gist: "stale gist".into(),
+            refs: BTreeMap::new(),
+            directive_tier: TrustTier::self_(),
+            payload_tier: TrustTier::self_(),
+            runlog_ref: "rl".into(),
+            thoughts: "t".into(),
+        };
+        let cont = continuation_stimulus(
+            &poisoned_stimulus(), "settle", &baton, TrustTier::self_(), Priority::Low, 1, 1, 0,
+        );
+        harness.dispatch(cont).await.unwrap();
+
+        assert!(runtime.seen.lock().unwrap().is_empty(), "stale baton expired — the model never ran");
 
         std::fs::remove_dir_all(&tmp).ok();
     }

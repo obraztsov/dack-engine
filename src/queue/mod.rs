@@ -52,6 +52,15 @@ pub trait Queue: Send + Sync {
     /// Persist a cursor watermark (insert-or-replace). Called after a poll with the max seen
     /// value; single-flight makes the read-modify-write race-free.
     async fn set_cursor(&self, key: &str, value: &str) -> Result<()>;
+
+    /// **Load-shedding** (Phase 4): if more than `max_depth` rows are PENDING, delete the OLDEST
+    /// `Low`-priority pending rows (the stalest, least-urgent work) until at/under the cap or none
+    /// remain — Normal+ is the protected floor and is NEVER shed. Returns the shed ids (the harness
+    /// logs them; no silent truncation). A queue still over cap with no `Low` to shed is genuine
+    /// backpressure, not a drop. Default: a no-op store with no notion of bounding.
+    async fn shed(&self, _max_depth: usize) -> Result<Vec<StimulusId>> {
+        Ok(Vec::new())
+    }
 }
 
 mod memory_queue;

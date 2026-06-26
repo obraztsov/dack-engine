@@ -120,7 +120,7 @@ impl RepoHost for GitlawbRepo {
 /// permanent rejection (auth, conflict). The gitlawb node returns plain git/HTTP errors, so we
 /// classify on the message — conservative: only clear transient signatures retry; everything else
 /// (incl. `403`/`non-fast-forward`) fails fast so we don't loop on an unfixable error.
-fn is_transient_push_error(msg: &str) -> bool {
+pub(crate) fn is_transient_push_error(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
     [
         "500", "502", "503", "504",

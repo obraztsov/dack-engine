@@ -83,3 +83,4 @@ pub trait RepoHost: Send + Sync {
 pub mod git;
 pub mod gitcore;
 pub mod gitlawb;
+pub mod multi;

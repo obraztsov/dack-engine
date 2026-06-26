@@ -189,15 +189,35 @@ runs its bridge inside a container.
 
 ---
 
-## Soul repo & signing
+## Soul repo & push destinations
+
+The soul is one local git repo (`soul_repo`); `soul_remotes` is the list of places it's pushed after
+each cycle. Backend is inferred per URL — `gitlawb://…` signs a ref-update, anything else is a plain
+`git push`. Each target is best-effort unless `required: true`, so a flaky mirror never blocks a cycle.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `soul_repo` | string | `.` | Path to the actor bundle (holds `SOUL.md`, `prompts/`, `stimuli/`, `memory/`, …). |
-| `soul_remote` | string | none | The signed push remote, e.g. `gitlawb://<soul-did>/<repo>`. With `identities.soul` set, each per-run commit + runlog is committed as the Soul DID and pushed as a signed `gitlawb://` ref. Omit for plain-git, local-only. |
-| `gitlawb_node` | string | `https://node.gitlawb.com` | The Gitlawb node the signed push targets. |
-| `identities` | object | `{}` | `gl` identity directories per role: `soul`, `operator`, `builder` (each holds `identity.pem` + `ucan.json`). The Soul dir signs soul commits + the push and never enters agent env. |
+| `soul_remotes` | list | `[]` | Push destinations (see entry fields below). Empty ⇒ local-only (commits, no push). |
+| `soul_remote` | string | none | **Legacy** single remote. Still honored — treated as a one-element best-effort `soul_remotes` list. Prefer `soul_remotes`. |
+| `gitlawb_node` | string | `https://node.gitlawb.com` | Default node for any `gitlawb://` entry that omits its own `node:` (and for the legacy `soul_remote`). |
+| `identities` | object | `{}` | `gl` identity directories per role: `soul`, `operator`, `builder` (each holds `identity.pem` + `ucan.json`). The Soul dir signs soul commits + gitlawb pushes and never enters agent env. |
 | `secrets.soul_did_key` | ref | — | Reference to the Soul DID key (resolved by the harness; never forwarded). |
+
+### `soul_remotes[]` — one push destination
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `url` | string | — | The push URL. Scheme selects the backend: `gitlawb://<soul-did>/<repo>` → signed push; `git@…` / `https://…` / local path → plain `git push`. |
+| `kind` | `git` \| `gitlawb` | inferred | Force the backend instead of inferring from `url`. |
+| `required` | bool | `false` | `true` ⇒ a push failure to this target fails the cycle's push step. `false` ⇒ best-effort (logged, retried next cycle). |
+| `node` | string | `gitlawb_node` | gitlawb only — the node this signed push targets. |
+| `identity` | string | `soul` | gitlawb only — which `identities.<role>` key signs the push. |
+| `auth` | object | none | Plain-git HTTPS only — `{ token_env, username }`. `token_env` names an env var in the daemon's environment holding the access token (e.g. a GitHub PAT), injected as an ephemeral credential at push time; never in config, disk, argv, or agent context. `username` defaults to `x-access-token`. SSH remotes need no `auth`. |
+
+GitHub (or any plain-git host) transport auth is **independent of the soul DID** — the DID is the
+commit author; you authenticate the push with an SSH deploy key (no `auth` needed) or an HTTPS PAT via
+`auth.token_env`. See [operations → pushing to a GitHub remote](operations.md#pushing-to-a-github-or-any-plain-git-remote).
 
 ---
 

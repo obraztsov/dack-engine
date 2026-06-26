@@ -43,13 +43,43 @@ soul repo, the agent's full operational history is attributable to it and inspec
 The agent's durable identity is a git repository (`soul_repo`), separate from the engine. The harness
 commits to it after each run — the per-cycle changes (memory, any Reflect edits) plus the runlog.
 
-Two modes:
+It's **one local git repo**; `soul_remotes` is the list of places it's pushed after each cycle. The
+backend is inferred per URL: `gitlawb://…` is a signed ref-update, anything else (`git@…`, `https://…`,
+a local path) is a plain `git push`. Each target is **best-effort** unless `required: true`, so a flaky
+mirror never blocks a cycle — the next cycle re-pushes. List several to get redundancy:
 
-- **Local-only (plain git).** Omit `soul_remote`. Commits are local; nothing is pushed. Good for
-  development.
-- **Signed push (Gitlawb).** Set `soul_remote: "gitlawb://<soul-did>/<repo>"` and `identities.soul`.
-  Each per-run commit is authored as the Soul DID and pushed as a signed `gitlawb://` ref-update to
-  `gitlawb_node`. The agent's history is then cryptographically attributable to its own key.
+```yaml
+soul_remotes:
+  - url: "git@github.com:youruser/my-soul.git"        # reliable primary
+    required: true
+  - url: "gitlawb://did:key:<soul-did>/my-soul"        # decentralized mirror, best-effort
+    identity: soul
+```
+
+- **Local-only.** Omit `soul_remotes` entirely. Commits are local; nothing is pushed.
+- **Plain git (GitHub / GitLab / Gitea / self-hosted).** A normal `git push`. Commits are authored as
+  the Soul DID (attribution by author identity). The most reliable option.
+- **Signed push (gitlawb).** A `gitlawb://<soul-did>/<repo>` URL: each per-run commit is pushed as a
+  signed ref-update to the node (`gitlawb_node`, or the entry's `node:`), signed with the key named by
+  `identity:` (default `soul`). This adds cryptographic, node-verifiable provenance on top of authorship.
+
+The legacy single `soul_remote:` field still works — it's treated as a one-element best-effort list.
+
+### Pushing to a GitHub (or any plain-git) remote
+
+GitHub transport auth is **separate from the soul DID** — GitHub doesn't understand DIDs, so the DID
+keys don't grant push. The DID stays the commit *author*; you authenticate the *push* with ordinary
+GitHub credentials:
+
+- **SSH (simplest).** Add a deploy key (or your machine's SSH key) to the repo on GitHub, and use the
+  `git@github.com:owner/repo.git` URL. No token in config — the ambient SSH key authenticates.
+- **HTTPS token.** Create a fine-grained PAT with `contents: write` on that repo, export it in the
+  daemon's environment (e.g. `GITHUB_TOKEN`), and reference it with `auth: { token_env: GITHUB_TOKEN }`.
+  The token is read at push time and injected as an ephemeral credential — never written to disk, never
+  on a command line, never in the agent's context.
+
+The repo must already exist on GitHub (create it empty, no auto-README, to avoid a non-fast-forward on
+the first push).
 
 ### Identities
 

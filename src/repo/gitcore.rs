@@ -246,13 +246,33 @@ impl GitCore {
     /// `git push <remote> HEAD:<branch>` with `env` overlaid (the signed `gitlawb://` helper
     /// reads `GITLAWB_KEY`/`GITLAWB_NODE`). The branch is HEAD's current branch.
     pub async fn push(&self, remote: &str, env: &[(&str, String)]) -> Result<()> {
+        self.push_with(remote, env, &[]).await
+    }
+
+    /// As [`push`](Self::push), but with extra `-c <cfg>` overrides prepended — used to inject an
+    /// ephemeral HTTPS credential helper (`credential.helper=…`) for a plain-git token push, so the
+    /// token rides in `env` (out of argv) while the helper that reads it rides in the config args.
+    pub async fn push_with(
+        &self,
+        remote: &str,
+        env: &[(&str, String)],
+        config_args: &[String],
+    ) -> Result<()> {
         let branch = self
             .git(&["rev-parse", "--abbrev-ref", "HEAD"])
             .await?
             .trim()
             .to_string();
         let refspec = format!("HEAD:refs/heads/{branch}");
-        self.git_env(&["push", remote, &refspec], env).await?;
+        let mut args: Vec<&str> = Vec::with_capacity(config_args.len() * 2 + 3);
+        for c in config_args {
+            args.push("-c");
+            args.push(c);
+        }
+        args.push("push");
+        args.push(remote);
+        args.push(&refspec);
+        self.git_env(&args, env).await?;
         Ok(())
     }
 }

@@ -7,6 +7,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use super::stimulus::Priority;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Intent {
@@ -68,12 +70,34 @@ where
 /// — exactly one of the current prompt's declared `transitions` (or `None` to terminate). Whether
 /// it is honored is decided by the harness: the id must be in the allowed set, resolve to a real
 /// `prompts/<id>.md`, sit within the route ceiling, and pass [`crate::state::allowed_transition`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Transition {
     /// `None` = terminate this cycle. Otherwise the chosen next state-prompt id (e.g.
     /// `twitter/feed_reply`).
     #[serde(default)]
     pub to_prompt: Option<String>,
+    #[serde(default)]
+    pub reason: String,
+}
+
+/// One **fan-out branch** the model proposes from a state (Phase 1). A single cycle may emit
+/// SEVERAL — each its own digested gist + destination state-prompt, processed as an independent
+/// branch with its own taint trajectory (the in-wake worklist). Supersedes the single [`Transition`]
+/// (still accepted and normalized to a one-element fan-out by [`AgentOutput::fan_out`]).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BatonIntent {
+    /// The next state-prompt id this branch continues to — must be one of the EMITTING prompt's
+    /// declared `transitions:` (and within the branch's trust ceiling; the harness re-checks both).
+    pub to_prompt: String,
+    /// The digested intent for THIS branch — the agent's OWN product (the firebreak), never raw
+    /// stimulus text. Empty ⇒ the harness falls back to the proposal gist / thought (the legacy
+    /// single-baton behaviour), so an old-shape output keeps working.
+    #[serde(default)]
+    pub gist: String,
+    /// Proposed scheduling priority for this branch. Harness-CLAMPED (never trusted to raise above
+    /// the origin) — `None` ⇒ inherit the cycle's. Honored from Phase 3; carried here from Phase 1.
+    #[serde(default)]
+    pub priority: Option<Priority>,
     #[serde(default)]
     pub reason: String,
 }
@@ -92,7 +116,7 @@ pub struct SpawnRequest {
 }
 
 /// The full agent return value (PRD §6.2).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentOutput {
     /// Internal reasoning — **logged, never published** (Eliza-style "thought").
     /// Rides the Baton for continuity but is NOT a safety boundary (PRD §6.4).
@@ -107,7 +131,35 @@ pub struct AgentOutput {
     /// an untrusted `worker_completion` stimulus. `None` (the common case) = no delegation.
     #[serde(default)]
     pub spawn: Option<SpawnRequest>,
+    /// Legacy single transition (still accepted). `fan_out()` folds it into `batons`.
+    #[serde(default)]
     pub transition: Transition,
+    /// **Fan-out** (Phase 1): the branches this cycle wants to take. Several = do several things at
+    /// once, each its own gist + destination, each an independent branch. Empty = terminate. Wins
+    /// over the legacy `transition` when present.
+    #[serde(default)]
+    pub batons: Vec<BatonIntent>,
+}
+
+impl AgentOutput {
+    /// The branches to fan out to, normalizing the legacy single `transition` into a one-element
+    /// list: `batons` when present; else a `transition.to_prompt` becomes one branch; else empty
+    /// (terminate). A synthesized branch carries an empty `gist` so the harness falls back to the
+    /// proposal/thought (preserving the exact legacy single-baton payload).
+    pub fn fan_out(&self) -> Vec<BatonIntent> {
+        if !self.batons.is_empty() {
+            return self.batons.clone();
+        }
+        match &self.transition.to_prompt {
+            Some(id) => vec![BatonIntent {
+                to_prompt: id.clone(),
+                gist: String::new(),
+                priority: None,
+                reason: self.transition.reason.clone(),
+            }],
+            None => Vec::new(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -138,5 +190,42 @@ mod tests {
         assert!(p.refs.is_empty());
         let p: Proposal = serde_json::from_str(r#"{"intent":"noop","gist":"g"}"#).unwrap();
         assert!(p.refs.is_empty());
+    }
+
+    /// `fan_out()` normalizes both shapes: the new `batons` list wins; a legacy single `transition`
+    /// folds to one branch; nothing ⇒ terminate. This is the back-compat contract for Phase 1.
+    #[test]
+    fn fan_out_normalizes_legacy_and_multi() {
+        // New shape: an explicit batons list is used verbatim (the fan-out).
+        let multi: AgentOutput = serde_json::from_str(
+            r#"{"thought":"t","batons":[
+                 {"to_prompt":"telegram/express","gist":"reply"},
+                 {"to_prompt":"settle","gist":"trade","priority":"high"}]}"#,
+        )
+        .unwrap();
+        let b = multi.fan_out();
+        assert_eq!(b.len(), 2);
+        assert_eq!(b[0].to_prompt, "telegram/express");
+        assert_eq!(b[1].to_prompt, "settle");
+        assert!(matches!(b[1].priority, Some(crate::model::stimulus::Priority::High)));
+
+        // Legacy shape: a single transition folds to exactly one branch (empty gist → harness
+        // falls back to proposal/thought when building the baton).
+        let legacy: AgentOutput = serde_json::from_str(
+            r#"{"thought":"t","proposal":{"intent":"reply","gist":"g"},
+                "transition":{"to_prompt":"express","reason":"r"}}"#,
+        )
+        .unwrap();
+        let b = legacy.fan_out();
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].to_prompt, "express");
+        assert!(b[0].gist.is_empty(), "synthesized branch defers gist to the harness");
+
+        // Terminate: no batons, null transition ⇒ no branches.
+        let term: AgentOutput =
+            serde_json::from_str(r#"{"thought":"t","transition":{"to_prompt":null}}"#).unwrap();
+        assert!(term.fan_out().is_empty());
+        // Default output also terminates (the ScriptedRuntime's terminal value).
+        assert!(AgentOutput::default().fan_out().is_empty());
     }
 }

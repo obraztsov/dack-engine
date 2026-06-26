@@ -22,6 +22,7 @@
  */
 
 import * as readline from 'node:readline'
+import { parseOutput } from './parse'
 
 // The SDK snapshots process.cwd() at MODULE-INIT and uses it for ALL tool/file path resolution
 // (getCwd → pwd → STATE.cwd; options.cwd is NOT honored on the programmatic query() path). So a
@@ -53,37 +54,15 @@ const emit = (obj: unknown) => process.stdout.write(JSON.stringify(obj) + '\n')
 
 const OUTPUT_INSTRUCTION =
   'When you have finished perceiving and taking any permitted actions, your FINAL message ' +
-  'MUST be ONLY a single JSON object (no prose, no markdown fence) with exactly this shape: ' +
+  'MUST be ONLY a single JSON object (no prose, no markdown fence) with this shape: ' +
   '{"thought": string, "memory_append": string|null, ' +
-  '"proposal": {"intent": "reply"|"post"|"research"|"ignore"|"noop", "gist": string}|null, ' +
   '"spawn": {"agent": string, "brief": string}|null, ' +
-  '"transition": {"to_prompt": string|null, "reason": string}}. ' +
-  'Set "to_prompt" to EXACTLY ONE of the state-prompt ids listed in your allowed-transitions ' +
-  'context block to continue to that next step, or null to stop here. Set "spawn" to delegate a job ' +
-  'to a worker (only if your orientation lists it as available; the worker runs detached and returns ' +
-  'later), else null. Output nothing after the JSON.'
-
-/** Ensure the parsed/fallback output satisfies the Rust AgentOutput contract. */
-function normalize(o: any, fallbackText: string): unknown {
-  const out = o && typeof o === 'object' ? { ...o } : {}
-  if (typeof out.thought !== 'string') out.thought = fallbackText.trim().slice(0, 2000) || '(no output)'
-  if (!out.transition || typeof out.transition !== 'object') out.transition = { to_prompt: null }
-  return out
-}
-
-/** Extract the AgentOutput JSON from the model's final text (tolerant of fences/prose). */
-function parseOutput(text: string): unknown {
-  let t = text.trim()
-  const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/i)
-  if (fence && fence[1]) t = fence[1].trim()
-  try { return normalize(JSON.parse(t), text) } catch {}
-  const start = t.indexOf('{')
-  const end = t.lastIndexOf('}')
-  if (start >= 0 && end > start) {
-    try { return normalize(JSON.parse(t.slice(start, end + 1)), text) } catch {}
-  }
-  return normalize(null, text)
-}
+  '"batons": [{"to_prompt": string, "gist": string, "priority": "low"|"normal"|"high"|"urgent"|null}]}. ' +
+  '"batons" is your fan-out: ONE element to take a single next step, SEVERAL to do several things at ' +
+  'once (each its OWN gist + destination, each gated independently by your trust ceiling), or [] to ' +
+  'stop. Each "to_prompt" must be one of the ids in your allowed-transitions context block. Set ' +
+  '"spawn" to delegate a job to a worker (only if your orientation lists it as available; the worker ' +
+  'runs detached and returns later), else null. Output nothing after the JSON.'
 
 const pending = new Map<string, (d: { allow: boolean; message?: string }) => void>()
 let started = false
@@ -183,6 +162,6 @@ async function runInvoke(inv: any) {
     }
   }
 
-  emit({ kind: 'result', output: parseOutput(finalText), session_id: sessionId })
+  emit({ kind: 'result', output: parseOutput(finalText, console.error), session_id: sessionId })
   process.exit(0)
 }

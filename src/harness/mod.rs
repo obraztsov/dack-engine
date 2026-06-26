@@ -28,7 +28,7 @@ use crate::identity::{Did, IdentityProvider, IdentityRole, Signature};
 use crate::secrets::providers::SecretsBroker;
 use crate::model::baton::Baton;
 use crate::agent_def::AgentDef;
-use crate::model::proposal::{AgentOutput, SpawnRequest};
+use crate::model::proposal::{AgentOutput, BatonIntent, SpawnRequest};
 use crate::model::runlog::{Outcome, RunLogEntry, ToolCallRecord};
 use crate::model::stimulus::{
     Priority, Stimulus, StimulusId, StimulusStatus, StimulusType, TrustTier,
@@ -213,11 +213,11 @@ impl Harness {
         // I18: an `operator_signed` directive is honored ONLY against a verifying signature — never
         // a self-asserted label (the `dack say` path); a bad/absent signature downgrades to public.
         let directive_tier = self.verified_directive_tier(&stimulus).await;
-        let mut cycle_trust = lattice.meet(&directive_tier, &stimulus.payload_tier);
-        let mut ceiling = lattice.reaches(&cycle_trust);
+        let cycle_trust = lattice.meet(&directive_tier, &stimulus.payload_tier);
+        let ceiling = lattice.reaches(&cycle_trust);
 
         // Resolve the ENTRY state-prompt (live from the soul repo, so Reflect edits take effect).
-        let mut current = match self.resolve_state_prompt(&stimulus.entry).await {
+        let current = match self.resolve_state_prompt(&stimulus.entry).await {
             Ok(p) => p,
             Err(e) => {
                 eprintln!(
@@ -243,95 +243,129 @@ impl Harness {
             let _ = self.queue.set_cursor("reflect:last", &now.to_string()).await;
         }
 
-        // Walk the chain: run a prompt, let the model pick exactly ONE next prompt from its
-        // declared `transitions` (or terminate). The firebreak (fresh session + a digested Baton)
-        // holds across every hop; the taint-derived ceiling + the structural rule + a hop cap bound
-        // the walk, and each step's ACTUAL capability access degrades the ceiling for the next hop.
-        let mut step = StepInput::Entry;
-        let mut hops = 0usize;
-        loop {
+        // Fan-out worklist (Phase 1): a state may emit SEVERAL intent-batons, each an independent
+        // branch with its OWN taint trajectory. We drain breadth-first IN-WAKE (no persistence yet —
+        // Phase 2 makes batons durable queue items). Every branch is gated by the same three checks
+        // as a single hop — the emitting prompt's `transitions:` allow-set, the branch's taint
+        // ceiling, and the structural rule — and the firebreak (fresh session + a digested Baton)
+        // holds across each. Bounded by a per-step fan-out WIDTH cap and a per-cycle total-step
+        // budget (generalizing the old single-chain hop cap).
+        struct Branch {
+            prompt: StatePrompt,
+            step: StepInput,
+            trust: TrustTier,
+            ceiling: ConsciousnessState,
+        }
+        let mut work: std::collections::VecDeque<Branch> = std::collections::VecDeque::new();
+        work.push_back(Branch { prompt: current, step: StepInput::Entry, trust: cycle_trust, ceiling });
+        let mut steps = 0usize;
+        while let Some(b) = work.pop_front() {
+            steps += 1;
+            if steps > MAX_CYCLE_STEPS {
+                eprintln!(
+                    "dispatch: cycle step budget ({MAX_CYCLE_STEPS}) reached — dropping {} pending branch(es) ({})",
+                    work.len() + 1,
+                    stimulus.id
+                );
+                break;
+            }
             let (out, runlog_ref, accessed) =
-                self.run_step(&current, &step, &stimulus, &cycle_trust, ceiling).await?;
-            // Taint by ACTUAL access: degrade the cycle trust by what this step actually called,
-            // then recompute the ceiling the NEXT transition is checked against (monotonic, I17).
+                self.run_step(&b.prompt, &b.step, &stimulus, &b.trust, b.ceiling).await?;
+            // Taint by ACTUAL access: degrade THIS branch's trust by what the step called, then
+            // recompute the ceiling its child batons are checked against (monotonic, I17).
+            let mut trust = b.trust.clone();
+            let mut ceiling = b.ceiling;
             if let Some(a) = accessed {
-                cycle_trust = lattice.meet(&cycle_trust, &a);
-                ceiling = lattice.reaches(&cycle_trust);
+                trust = lattice.meet(&trust, &a);
+                ceiling = lattice.reaches(&trust);
             }
 
-            // Worker delegation (Phase 10): an act-state `spawn` launches a DETACHED, sandboxed,
-            // KEYLESS worker; its summary returns later as an untrusted `worker_completion` stimulus
-            // (the return-firebreak). Gated to Express — the duck delegates, it never becomes the
-            // worker. Runs over cloned seams so it outlives this cycle.
+            // Worker delegation (Phase 10): an Express `spawn` launches a DETACHED, KEYLESS, sandboxed
+            // worker; its summary returns later as an untrusted `worker_completion` stimulus (the
+            // return-firebreak). Gated to Express — the duck delegates, it never becomes the worker.
             if let Some(spawn) = out.spawn.clone() {
-                if current.state == ConsciousnessState::Express {
+                if b.prompt.state == ConsciousnessState::Express {
                     let (rt, q, rp) = (self.runtime.clone(), self.queue.clone(), self.repo.clone());
                     let soul_root = self.soul_root();
                     tokio::spawn(async move { run_worker_detached(rt, q, rp, soul_root, spawn).await });
                 } else {
                     eprintln!(
                         "dispatch: `spawn` from {:?} ignored — workers launch only from Express ({})",
-                        current.state, stimulus.id
+                        b.prompt.state, stimulus.id
                     );
                 }
             }
 
-            hops += 1;
-            if hops >= MAX_CHAIN_HOPS {
-                eprintln!("dispatch: chain hop cap ({MAX_CHAIN_HOPS}) reached at `{}` ({})", current.id, stimulus.id);
-                break;
-            }
-            let Some(next_id) = out.transition.to_prompt.clone() else {
-                break; // the model chose to terminate this cycle.
-            };
-            // Soul's half: the chosen id must be in THIS prompt's allowed set.
-            if !current.permits_transition_to(&next_id) {
-                eprintln!(
-                    "dispatch: `{next_id}` not in `{}`'s transitions — terminating ({})",
-                    current.id, stimulus.id
-                );
-                break;
-            }
-            let next = match self.resolve_state_prompt(&next_id).await {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("dispatch: transition target `{next_id}` unresolved: {e} — terminating ({})", stimulus.id);
-                    break;
+            // Fan out: each intent-baton becomes a child branch if it survives the gates. The width
+            // cap stops one runaway step from flooding the worklist.
+            let mut emitted = 0usize;
+            for intent in out.fan_out() {
+                if intent.to_prompt.is_empty() {
+                    continue; // a baton with no destination = a terminal note; nothing to schedule.
                 }
-            };
-            // Taint enforcement: the chosen hop must be within the POST-step ceiling (a step that
-            // touched a lower-trust capability may have just dropped it below this target).
-            if !within_ceiling(next.state, ceiling) {
-                eprintln!(
-                    "dispatch: transition to `{}` (state {:?}) above trust ceiling {:?} (cycle trust `{}`) — dropped ({})",
-                    next.id, next.state, ceiling, cycle_trust.name(), stimulus.id
-                );
-                break;
-            }
-            if !allowed_transition(current.state, next.state) {
-                eprintln!(
-                    "dispatch: transition {:?}→{:?} structurally disallowed — terminating ({})",
-                    current.state, next.state, stimulus.id
-                );
-                break;
-            }
-            // Self-modification (Reflect) is rate-limited by the harness clock (TIER-4, invariant
-            // I6) — even a clean cycle that the taint ceiling admits may reflect only once per
-            // interval. The ceiling is the injection guard; this is the cadence guard.
-            if next.state == ConsciousnessState::Reflect {
-                if !self.reflect_rate_limit_ok(now).await {
+                if emitted >= MAX_FANOUT_WIDTH {
                     eprintln!(
-                        "dispatch: Reflect transition to `{}` rate-limited (< {}s since last) — dropped ({})",
-                        next.id, self.config.reflect_min_interval_secs, stimulus.id
+                        "dispatch: fan-out width cap ({MAX_FANOUT_WIDTH}) at `{}` — extra batons dropped ({})",
+                        b.prompt.id, stimulus.id
                     );
                     break;
                 }
-                let _ = self.queue.set_cursor("reflect:last", &now.to_string()).await;
+                let next_id = intent.to_prompt.clone();
+                // Soul's half: the chosen id must be in THIS prompt's allowed set.
+                if !b.prompt.permits_transition_to(&next_id) {
+                    eprintln!(
+                        "dispatch: `{next_id}` not in `{}`'s transitions — dropped ({})",
+                        b.prompt.id, stimulus.id
+                    );
+                    continue;
+                }
+                let next = match self.resolve_state_prompt(&next_id).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("dispatch: baton target `{next_id}` unresolved: {e} — dropped ({})", stimulus.id);
+                        continue;
+                    }
+                };
+                // Taint enforcement: the branch must be within the POST-step ceiling (a step that
+                // touched a lower-trust capability may have just dropped it below this target).
+                if !within_ceiling(next.state, ceiling) {
+                    eprintln!(
+                        "dispatch: baton to `{}` (state {:?}) above trust ceiling {:?} (branch trust `{}`) — dropped ({})",
+                        next.id, next.state, ceiling, trust.name(), stimulus.id
+                    );
+                    continue;
+                }
+                if !allowed_transition(b.prompt.state, next.state) {
+                    eprintln!(
+                        "dispatch: transition {:?}→{:?} structurally disallowed — dropped ({})",
+                        b.prompt.state, next.state, stimulus.id
+                    );
+                    continue;
+                }
+                // Self-modification (Reflect) is rate-limited by the harness clock (TIER-4, invariant
+                // I6) — even a clean branch the ceiling admits reflects only once per interval.
+                if next.state == ConsciousnessState::Reflect {
+                    if !self.reflect_rate_limit_ok(now).await {
+                        eprintln!(
+                            "dispatch: Reflect baton to `{}` rate-limited (< {}s since last) — dropped ({})",
+                            next.id, self.config.reflect_min_interval_secs, stimulus.id
+                        );
+                        continue;
+                    }
+                    let _ = self.queue.set_cursor("reflect:last", &now.to_string()).await;
+                }
+                // Cross the firebreak: the child opens fresh on its digested Baton (carrying the
+                // branch's accumulated trust), never raw bytes.
+                let baton =
+                    build_baton_from_intent(&intent, &out, &stimulus, runlog_ref.clone(), trust.clone());
+                work.push_back(Branch {
+                    prompt: next,
+                    step: StepInput::Act(baton),
+                    trust: trust.clone(),
+                    ceiling,
+                });
+                emitted += 1;
             }
-            // Cross the firebreak: the next step opens fresh on the digested Baton (carrying the
-            // accumulated trust), never raw bytes.
-            step = StepInput::Act(build_baton(&out, &stimulus, runlog_ref, cycle_trust.clone()));
-            current = next;
         }
 
         // One push per cycle ships every local commit made above (per-state runlogs, memory
@@ -994,9 +1028,15 @@ impl Harness {
     }
 }
 
-/// Hard cap on how many state-prompts one stimulus may walk through (MCP2-B) — a runaway-loop
-/// backstop for a soul whose `transitions` form a cycle. Real chains are 1–3 hops.
-const MAX_CHAIN_HOPS: usize = 6;
+/// Hard cap on TOTAL state-prompt invocations one stimulus may walk through, across its whole
+/// fan-out tree (Phase 1) — a runaway-loop backstop for a soul whose `transitions` form a cycle or
+/// a step that fans out unboundedly. Real cycles are a handful of steps; generalizes the old
+/// single-chain hop cap.
+const MAX_CYCLE_STEPS: usize = 12;
+
+/// Hard cap on how many intent-batons ONE step may fan out to. Extra batons beyond this are dropped
+/// (logged). Keeps a single confused step from flooding the worklist; real fan-out is 1–3 branches.
+const MAX_FANOUT_WIDTH: usize = 5;
 
 /// What a [`run_step`](Harness::run_step) invocation is seeded with: the ENTRY step ingests the
 /// directive + untrusted payload; every later step opens fresh on the digested [`Baton`] (the
@@ -1321,13 +1361,17 @@ fn baton_block(baton: &Baton) -> ContextBlock {
 /// (harness-authored from the soul's own `transitions:`).
 fn transitions_block(reachable: &[String]) -> ContextBlock {
     let body = if reachable.is_empty() {
-        "This is a terminal step (or every onward step is above your current trust ceiling): set \
-         transition.to_prompt = null (do not transition)."
+        "This is a terminal step (or every onward step is above your current trust ceiling): return \
+         an empty \"batons\": [] (do not continue)."
             .to_string()
     } else {
         format!(
-            "You may transition to EXACTLY ONE of these next state-prompts by setting \
-             transition.to_prompt to its id, or null to stop here:\n{}",
+            "Continue by returning \"batons\": a JSON array. Each element is {{\"to_prompt\": <one of \
+             the ids below>, \"gist\": <your digested intent for THAT branch>}} (optional \"priority\": \
+             \"low\"|\"normal\"|\"high\"|\"urgent\"). ONE element = take that single next step; SEVERAL \
+             = do them all at once, each its own gist (e.g. reply here AND open a research branch); [] \
+             = stop here. Each branch acts on its OWN gist and is gated independently by your trust \
+             ceiling — a branch above it is dropped. Allowed next state-prompts:\n{}",
             reachable.iter().map(|t| format!("  - {t}")).collect::<Vec<_>>().join("\n")
         )
     };
@@ -1477,19 +1521,29 @@ impl ActionResponder for RecordingResponder {
 /// Build the Baton from Perceive's output (PRD §6.4). Pure + testable: the firebreak's
 /// core invariant — the Baton carries the agent's **digested gist**, never the raw
 /// stimulus payload. Returns `None` when Perceive proposed nothing to carry forward.
-pub fn build_baton(
-    perceive: &AgentOutput,
+/// Build the Baton for ONE fan-out branch (Phase 1). The branch's own `gist` (from its
+/// [`BatonIntent`]) is the digested product that crosses the firebreak; an EMPTY gist falls back to
+/// the proposal gist — else the digested *thought* (a forced `PerceiveThenExpress` cycle, e.g. the
+/// heartbeat, must still open Express even if Perceive proposed nothing). Either way it is the
+/// agent's OWN product, never the raw untrusted payload. Harness-deterministic refs (reply target,
+/// telegram chat) are injected from the stimulus, never model-laundered text (PRD §6.4).
+pub fn build_baton_from_intent(
+    intent: &BatonIntent,
+    out: &AgentOutput,
     stimulus: &Stimulus,
     runlog_ref: String,
     cycle_trust: TrustTier,
 ) -> Baton {
-    // Carry the proposal's gist when present; else fall back to the digested *thought* — a
-    // forced `PerceiveThenExpress` cycle (e.g. the heartbeat) must still open Express even if
-    // Perceive proposed nothing explicit. Either way it is the agent's OWN digested product,
-    // never the raw untrusted payload (the firebreak, PRD §6.4).
-    let (gist, mut refs) = match &perceive.proposal {
-        Some(p) => (p.gist.clone(), p.refs.clone()),
-        None => (perceive.thought.clone(), Default::default()),
+    let (gist, mut refs) = if !intent.gist.is_empty() {
+        (
+            intent.gist.clone(),
+            out.proposal.as_ref().map(|p| p.refs.clone()).unwrap_or_default(),
+        )
+    } else {
+        match &out.proposal {
+            Some(p) => (p.gist.clone(), p.refs.clone()),
+            None => (out.thought.clone(), Default::default()),
+        }
     };
     // Harness-derived structured reply target, taken DETERMINISTICALLY from the payload the
     // harness holds (never model-laundered text). This is the only tweet id Express sees, so it
@@ -1522,8 +1576,19 @@ pub fn build_baton(
         payload_tier: cycle_trust,
         runlog_ref,
         // Continuity only — explicitly NOT a safety boundary (PRD §6.4).
-        thoughts: perceive.thought.clone(),
+        thoughts: out.thought.clone(),
     }
+}
+
+/// Legacy single-baton builder — one branch with no explicit per-branch gist (defers to the
+/// proposal/thought). Kept for the back-compat path and existing call sites/tests.
+pub fn build_baton(
+    perceive: &AgentOutput,
+    stimulus: &Stimulus,
+    runlog_ref: String,
+    cycle_trust: TrustTier,
+) -> Baton {
+    build_baton_from_intent(&BatonIntent::default(), perceive, stimulus, runlog_ref, cycle_trust)
 }
 
 #[cfg(test)]
@@ -1571,6 +1636,7 @@ mod tests {
                 to_prompt: Some("express".into()),
                 reason: "reply".into(),
             },
+            batons: vec![],
         }
     }
 
@@ -1873,6 +1939,7 @@ mod tests {
                 proposal: None,
                 spawn: None,
             transition: Transition { to_prompt: Some("express".into()), reason: String::new() },
+            batons: vec![],
             },
         });
         let config = Arc::new(DackConfig::from_yaml("operator_did: \"did:x\"").unwrap());
@@ -1939,6 +2006,7 @@ mod tests {
                     to_prompt: Some("settle".into()),
                     reason: "tweet told me to".into(),
                 },
+            batons: vec![],
             },
         });
         let config = Arc::new(DackConfig::from_yaml("operator_did: \"did:x\"").unwrap());
@@ -1988,6 +2056,7 @@ mod tests {
                 proposal: Some(Proposal { intent: Intent::Research, gist: "buy a little".into(), refs: BTreeMap::new() }),
                 spawn: None,
             transition: Transition { to_prompt: Some("settle".into()), reason: "trade".into() },
+            batons: vec![],
             },
         });
         let config = Arc::new(DackConfig::from_yaml("operator_did: \"did:x\"").unwrap());
@@ -2012,6 +2081,117 @@ mod tests {
         let seen = runtime.seen.lock().unwrap();
         assert_eq!(seen.len(), 2, "perceive then a settle the ceiling admitted");
         assert_eq!(seen[1].spec.state, ConsciousnessState::Settle, "the act state is Settle");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A runtime double returning a SCRIPTED sequence of outputs (one per invoke, in order),
+    /// defaulting to a terminal `AgentOutput::default()` once exhausted (so a fan-out can't loop
+    /// forever). Lets a multi-branch dispatch be driven deterministically.
+    struct ScriptedRuntime {
+        seen: std::sync::Mutex<Vec<InvocationRequest>>,
+        outs: std::sync::Mutex<std::collections::VecDeque<AgentOutput>>,
+    }
+    #[async_trait::async_trait]
+    impl RuntimeClient for ScriptedRuntime {
+        async fn invoke(
+            &self,
+            req: InvocationRequest,
+            _responder: Arc<dyn ActionResponder>,
+        ) -> Result<(AgentOutput, Option<SessionId>)> {
+            let sid = req.session.clone().or_else(|| Some(SessionId("sess-scr".into())));
+            self.seen.lock().unwrap().push(req);
+            let out = self.outs.lock().unwrap().pop_front().unwrap_or_default();
+            Ok((out, sid))
+        }
+    }
+
+    /// A Perceive that emits TWO fan-out batons (`express` AND `settle`). `gist` per branch.
+    fn two_branch_perceive() -> AgentOutput {
+        AgentOutput {
+            thought: "two things at once".into(),
+            memory_append: None,
+            proposal: None,
+            spawn: None,
+            transition: Transition::default(),
+            batons: vec![
+                BatonIntent { to_prompt: "express".into(), gist: "say hi".into(), priority: None, reason: String::new() },
+                BatonIntent { to_prompt: "settle".into(), gist: "nibble".into(), priority: None, reason: String::new() },
+            ],
+        }
+    }
+
+    async fn fanout_harness(tmp: &std::path::Path, runtime: Arc<ScriptedRuntime>) -> Harness {
+        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::queue::InMemoryQueue;
+        use crate::repo::git::PlainGitRepo;
+        use crate::runlog::FileRunLog;
+        let config = Arc::new(DackConfig::from_yaml("operator_did: \"did:x\"").unwrap());
+        let queue: Arc<dyn Queue> = Arc::new(InMemoryQueue::new());
+        let identity = GitlawbIdentity::resolve("gl", std::collections::HashMap::new()).await.unwrap();
+        Harness {
+            config: config.clone(),
+            queue: queue.clone(),
+            bus: Arc::new(Bus::new(config.clone(), queue.clone())),
+            runtime,
+            repo: Arc::new(PlainGitRepo::new(tmp, "did:x")),
+            identity: Arc::new(identity),
+            runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
+            broker: Arc::new(SecretsBroker::new(vec![])),
+            sessions: Default::default(),
+        }
+    }
+
+    /// Phase 1 fan-out: a Perceive that emits TWO intent-batons runs BOTH branches in one wake (the
+    /// in-wake worklist) when the cycle is clean enough to admit them — express AND settle both run.
+    #[tokio::test]
+    async fn perceive_fans_out_to_all_admitted_branches() {
+        let tmp = std::env::temp_dir().join(format!("dack-fanout-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        seed_prompts(&tmp);
+
+        let runtime = Arc::new(ScriptedRuntime {
+            seen: std::sync::Mutex::new(Vec::new()),
+            outs: std::sync::Mutex::new(std::collections::VecDeque::from(vec![two_branch_perceive()])),
+        });
+        let harness = fanout_harness(&tmp, runtime.clone()).await;
+
+        // A self-tier (clean) cycle: its ceiling admits BOTH express and settle.
+        let mut stim = poisoned_stimulus();
+        stim.payload_tier = TrustTier::self_();
+        harness.dispatch(stim).await.unwrap();
+
+        let seen = runtime.seen.lock().unwrap();
+        assert_eq!(seen.len(), 3, "perceive + BOTH fanned-out branches");
+        let states: Vec<_> = seen.iter().map(|r| r.spec.state).collect();
+        assert!(states.contains(&ConsciousnessState::Express), "express branch ran: {states:?}");
+        assert!(states.contains(&ConsciousnessState::Settle), "settle branch ran: {states:?}");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Phase 1 fan-out + taint: a PUBLIC cycle fanning to [express, settle] runs ONLY express — the
+    /// settle baton is above the public ceiling and is dropped per-branch (the firebreak, applied to
+    /// each fan-out branch exactly as to a single hop).
+    #[tokio::test]
+    async fn fan_out_settle_baton_above_ceiling_is_dropped() {
+        let tmp = std::env::temp_dir().join(format!("dack-fanceil-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        seed_prompts(&tmp);
+
+        let runtime = Arc::new(ScriptedRuntime {
+            seen: std::sync::Mutex::new(Vec::new()),
+            outs: std::sync::Mutex::new(std::collections::VecDeque::from(vec![two_branch_perceive()])),
+        });
+        let harness = fanout_harness(&tmp, runtime.clone()).await;
+
+        harness.dispatch(poisoned_stimulus()).await.unwrap(); // public seed → reaches express only
+
+        let seen = runtime.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "perceive + express; the settle baton was above the public ceiling");
+        assert_eq!(seen[1].spec.state, ConsciousnessState::Express, "the admitted branch is Express");
 
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -2310,6 +2490,7 @@ mod tests {
             proposal: None,
             spawn: None,
             transition: Transition { to_prompt: Some("reflect".into()), reason: "reflect".into() },
+            batons: vec![],
         };
         let runtime = Arc::new(RecordingRuntime { seen: std::sync::Mutex::new(Vec::new()), out });
         // Default lattice (self → reflect) + a 1h reflect rate-limit.

@@ -240,11 +240,18 @@ impl Harness {
                 }
             }
         }
-        let (cycle_trust, entry_step, depth) = match &continuation {
-            Some((baton, d)) => (stimulus.payload_tier.clone(), StepInput::Act(baton.clone()), *d),
+        let (cycle_trust, entry_step, depth, entry_scope) = match &continuation {
+            // A deferred continuation carries its reply-target scope (the selected item) so a deferred
+            // reply still threads to the right message.
+            Some((baton, d, scope)) => (
+                stimulus.payload_tier.clone(),
+                StepInput::Act(baton.clone()),
+                *d,
+                scope.clone(),
+            ),
             None => {
                 let directive_tier = self.verified_directive_tier(&stimulus).await;
-                (lattice.meet(&directive_tier, &stimulus.payload_tier), StepInput::Entry, 0usize)
+                (lattice.meet(&directive_tier, &stimulus.payload_tier), StepInput::Entry, 0usize, None)
             }
         };
         let ceiling = lattice.reaches(&cycle_trust);
@@ -289,9 +296,19 @@ impl Harness {
             step: StepInput,
             trust: TrustTier,
             ceiling: ConsciousnessState,
+            /// Per-baton reply scope: the SELECTED in-batch item whose fields resolve `scope_env` for
+            /// this branch's reply MCP (`None` = the top-level/latest payload, legacy). Raw payload —
+            /// reaches ONLY `assemble_mcp_servers` (env vars), never the model (the firebreak).
+            scope_override: Option<serde_json::Value>,
         }
         let mut work: std::collections::VecDeque<Branch> = std::collections::VecDeque::new();
-        work.push_back(Branch { prompt: current, step: entry_step, trust: cycle_trust, ceiling });
+        work.push_back(Branch {
+            prompt: current,
+            step: entry_step,
+            trust: cycle_trust,
+            ceiling,
+            scope_override: entry_scope,
+        });
         let mut steps = 0usize;
         // Per-dispatch sequence for unique deferred-continuation ids.
         let mut deferred_seq = 0usize;
@@ -305,8 +322,9 @@ impl Harness {
                 );
                 break;
             }
-            let (out, runlog_ref, accessed) =
-                self.run_step(&b.prompt, &b.step, &stimulus, &b.trust, b.ceiling).await?;
+            let (out, runlog_ref, accessed) = self
+                .run_step(&b.prompt, &b.step, &stimulus, &b.trust, b.ceiling, b.scope_override.as_ref())
+                .await?;
             // Taint by ACTUAL access: degrade THIS branch's trust by what the step called, then
             // recompute the ceiling its child batons are checked against (monotonic, I17).
             let mut trust = b.trust.clone();
@@ -390,6 +408,22 @@ impl Harness {
                     }
                     let _ = self.queue.set_cursor("reflect:last", &now.to_string()).await;
                 }
+                // Per-baton reply target: resolve + VALIDATE the model's `reply_to` against THIS batch
+                // (the firebreak). The emitting prompt declares the id field (`reply_key`). A set
+                // `reply_to` that matches no item → log + None (the reply falls back to the latest,
+                // never an unvalidated id). The selected item feeds ONLY `scope_env`, never the model.
+                let scope_override = resolve_scope_override(
+                    &stimulus,
+                    &b.prompt.reply_key_fields(),
+                    intent.reply_to.as_deref(),
+                );
+                if intent.reply_to.is_some() && scope_override.is_none() {
+                    eprintln!(
+                        "dispatch: baton to `{}` reply_to `{}` matched no message in the batch — \
+                         replying to the latest instead ({})",
+                        next.id, intent.reply_to.as_deref().unwrap_or(""), stimulus.id
+                    );
+                }
                 // Cross the firebreak: the child opens fresh on its digested Baton (carrying the
                 // branch's accumulated trust), never raw bytes.
                 let baton =
@@ -404,6 +438,7 @@ impl Harness {
                     deferred_seq += 1;
                     let cont = continuation_stimulus(
                         &stimulus, &next.id, &baton, trust.clone(), Priority::Low, depth + 1, deferred_seq, now,
+                        scope_override.as_ref(),
                     );
                     match self.queue.enqueue(cont).await {
                         Ok(()) => eprintln!(
@@ -412,7 +447,7 @@ impl Harness {
                         ),
                         Err(e) => {
                             eprintln!("dispatch: enqueue deferred baton failed ({}): {e} — running in-wake", stimulus.id);
-                            work.push_back(Branch { prompt: next, step: StepInput::Act(baton), trust: trust.clone(), ceiling });
+                            work.push_back(Branch { prompt: next, step: StepInput::Act(baton), trust: trust.clone(), ceiling, scope_override });
                         }
                     }
                 } else {
@@ -421,6 +456,7 @@ impl Harness {
                         step: StepInput::Act(baton),
                         trust: trust.clone(),
                         ceiling,
+                        scope_override,
                     });
                 }
                 emitted += 1;
@@ -444,10 +480,12 @@ impl Harness {
         stimulus: &Stimulus,
         cycle_trust: &TrustTier,
         ceiling: ConsciousnessState,
+        scope_override: Option<&serde_json::Value>,
     ) -> Result<(AgentOutput, String, Option<TrustTier>)> {
         let spec = default_spec(prompt.state);
         // The capabilities this state-prompt plugs (the two-sided handshake, MCP2-B).
-        let (mcp_servers, inline_read) = self.assemble_mcp_servers(prompt, stimulus, cycle_trust).await;
+        let (mcp_servers, inline_read) =
+            self.assemble_mcp_servers(prompt, stimulus, cycle_trust, scope_override).await;
         let recorder = self.wall_for(spec.clone(), inline_read);
         let system_prompt = self.system_prompt_for_prompt(prompt).await;
         // Offer ONLY the transitions the current trust ceiling permits — the agent never sees a hop
@@ -846,6 +884,7 @@ impl Harness {
         prompt: &StatePrompt,
         stimulus: &Stimulus,
         cycle_trust: &TrustTier,
+        scope_override: Option<&serde_json::Value>,
     ) -> (BTreeMap<String, serde_json::Value>, Vec<CapabilityPrefix>) {
         let state = prompt.state;
         let policy = self.config.tier_policy_for(state);
@@ -899,12 +938,20 @@ impl Harness {
                         },
                         None => None,
                     };
-                    // Payload-scoped env (Phase 12): resolve each `scope_env` field from the waking
-                    // stimulus's payload and inject it into THIS server's env — so the capability is
-                    // locked to per-cycle data the model can't supply (e.g. telegram's source chat).
+                    // Payload-scoped env (Phase 12): resolve each `scope_env` field and inject it into
+                    // THIS server's env — so the capability is locked to harness-held data the model
+                    // can't supply (e.g. telegram's source chat). Per-BATON reply targeting: when this
+                    // branch carries a validated `scope_override` (a selected in-batch message), resolve
+                    // each field from IT first, falling back PER FIELD to the top-level payload (the
+                    // latest) — so `message_id` targets the chosen message while `chat_id` stays correct
+                    // even if a future sensor only carries `message_id` per item. The override item is
+                    // raw payload, read ONLY here for env vars; it never reaches the model.
                     let mut extra_env = std::collections::BTreeMap::new();
                     for (var, field) in &server.scope_env {
-                        if let Some(v) = stimulus.payload.get(field) {
+                        let v = scope_override
+                            .and_then(|o| o.get(field))
+                            .or_else(|| stimulus.payload.get(field));
+                        if let Some(v) = v {
                             let s = v.as_str().map(String::from).unwrap_or_else(|| v.to_string());
                             extra_env.insert(var.clone(), s);
                         }
@@ -1122,6 +1169,7 @@ fn continuation_stimulus(
     depth: usize,
     seq: usize,
     now: i64,
+    scope_override: Option<&serde_json::Value>,
 ) -> Stimulus {
     Stimulus {
         id: StimulusId(format!("{}-b{seq}", origin.id.0)),
@@ -1129,7 +1177,9 @@ fn continuation_stimulus(
         type_: StimulusType::from(BATON_CONTINUATION_TYPE),
         directive_tier: origin.directive_tier.clone(),
         payload_tier: trust,
-        payload: serde_json::json!({ "baton": baton, "depth": depth }),
+        // `scope` carries the deferred reply target (the selected item) so a deferred reply still
+        // threads to the right message. Internal harness state — never rendered to the model.
+        payload: serde_json::json!({ "baton": baton, "depth": depth, "scope": scope_override }),
         provenance: None,
         received_at: now,
         dedup_key: None,
@@ -1141,15 +1191,17 @@ fn continuation_stimulus(
     }
 }
 
-/// Recover a deferred continuation's `(Baton, depth)` from a popped `Stimulus`, or `None` if it is a
-/// raw (perceive) stimulus.
-fn parse_continuation(stimulus: &Stimulus) -> Option<(Baton, usize)> {
+/// Recover a deferred continuation's `(Baton, depth, scope_override)` from a popped `Stimulus`, or
+/// `None` if it is a raw (perceive) stimulus. The `scope` (reply target item) is `None` when the
+/// deferred baton had no reply target.
+fn parse_continuation(stimulus: &Stimulus) -> Option<(Baton, usize, Option<serde_json::Value>)> {
     if stimulus.type_.0 != BATON_CONTINUATION_TYPE {
         return None;
     }
     let baton: Baton = serde_json::from_value(stimulus.payload.get("baton")?.clone()).ok()?;
     let depth = stimulus.payload.get("depth").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-    Some((baton, depth))
+    let scope = stimulus.payload.get("scope").filter(|v| !v.is_null()).cloned();
+    Some((baton, depth, scope))
 }
 
 /// What a [`run_step`](Harness::run_step) invocation is seeded with: the ENTRY step ingests the
@@ -1705,6 +1757,32 @@ pub fn build_baton(
     build_baton_from_intent(&BatonIntent::default(), perceive, stimulus, runlog_ref, cycle_trust)
 }
 
+/// Resolve the in-batch item a baton's `reply_to` targets — the per-baton **scope override**,
+/// VALIDATED against the batch the harness holds (the firebreak). Returns the `payload.items` element
+/// whose `reply_key` field (string/number-normalized) equals `reply_to`; `None` (→ resolve `scope_env`
+/// from the top-level/latest payload, the legacy lock) when there is no `reply_to`, no `items` (a
+/// single-message wake), or NO MATCH — the harness never targets an id it didn't see in the batch.
+/// The returned item is raw payload; it reaches ONLY `assemble_mcp_servers` (env vars), never the model.
+fn resolve_scope_override(
+    stimulus: &Stimulus,
+    reply_key: &[&str],
+    reply_to: Option<&str>,
+) -> Option<serde_json::Value> {
+    let want = reply_to?;
+    let items = stimulus.payload.get("items")?.as_array()?;
+    items
+        .iter()
+        .find(|it| {
+            reply_key.iter().any(|k| {
+                it.get(*k)
+                    .map(|v| v.as_str().map(String::from).unwrap_or_else(|| v.to_string()))
+                    .as_deref()
+                    == Some(want)
+            })
+        })
+        .cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2229,8 +2307,8 @@ mod tests {
             spawn: None,
             transition: Transition::default(),
             batons: vec![
-                BatonIntent { to_prompt: "express".into(), gist: "say hi".into(), priority: None, reason: String::new() },
-                BatonIntent { to_prompt: "settle".into(), gist: "nibble".into(), priority: None, reason: String::new() },
+                BatonIntent { to_prompt: "express".into(), gist: "say hi".into(), priority: None, reply_to: None, reason: String::new() },
+                BatonIntent { to_prompt: "settle".into(), gist: "nibble".into(), priority: None, reply_to: None, reason: String::new() },
             ],
         }
     }
@@ -2333,8 +2411,8 @@ mod tests {
             spawn: None,
             transition: Transition::default(),
             batons: vec![
-                BatonIntent { to_prompt: "express".into(), gist: "reply now".into(), priority: None, reason: String::new() },
-                BatonIntent { to_prompt: "settle".into(), gist: "trade later".into(), priority: Some(Priority::Low), reason: String::new() },
+                BatonIntent { to_prompt: "express".into(), gist: "reply now".into(), priority: None, reply_to: None, reason: String::new() },
+                BatonIntent { to_prompt: "settle".into(), gist: "trade later".into(), priority: Some(Priority::Low), reply_to: None, reason: String::new() },
             ],
         };
         let runtime = Arc::new(ScriptedRuntime {
@@ -2445,7 +2523,7 @@ mod tests {
             thoughts: "t".into(),
         };
         let cont = continuation_stimulus(
-            &poisoned_stimulus(), "settle", &baton, TrustTier::self_(), Priority::Low, 1, 1, 0,
+            &poisoned_stimulus(), "settle", &baton, TrustTier::self_(), Priority::Low, 1, 1, 0, None,
         );
         harness.dispatch(cont).await.unwrap();
 
@@ -2702,20 +2780,21 @@ mod tests {
             transitions: vec![],
             model: None,
             session: None,
+            reply_key: None,
             body: String::new(),
         };
 
         // Perceive: only read-tier cove-read; trading (settle) is NOT exposed.
-        let (p, _) = harness.assemble_mcp_servers(&prompt(ConsciousnessState::Perceive), &stim, &TrustTier::self_()).await;
+        let (p, _) = harness.assemble_mcp_servers(&prompt(ConsciousnessState::Perceive), &stim, &TrustTier::self_(), None).await;
         assert!(p.contains_key("cove-read") && !p.contains_key("cove-trading"));
         assert_eq!(p["cove-read"]["headers"]["Authorization"], "Bearer cove-tok", "token injected, not in agent ctx");
 
         // Express: read but NEVER trading.
-        let (e, _) = harness.assemble_mcp_servers(&prompt(ConsciousnessState::Express), &stim, &TrustTier::self_()).await;
+        let (e, _) = harness.assemble_mcp_servers(&prompt(ConsciousnessState::Express), &stim, &TrustTier::self_(), None).await;
         assert!(e.contains_key("cove-read") && !e.contains_key("cove-trading"), "trading never in Express");
 
         // Settle: trading IS exposed (the only state that reaches it).
-        let (s, _) = harness.assemble_mcp_servers(&prompt(ConsciousnessState::Settle), &stim, &TrustTier::self_()).await;
+        let (s, _) = harness.assemble_mcp_servers(&prompt(ConsciousnessState::Settle), &stim, &TrustTier::self_(), None).await;
         assert!(s.contains_key("cove-trading") && s.contains_key("cove-read"));
 
         std::env::remove_var("DACK_COVE_TEST");
@@ -2827,9 +2906,9 @@ mod tests {
         // OPEN perceive: the inline public MCP is admitted, read-tier, with its wall prefix.
         let open = StatePrompt {
             id: "p".into(), state: ConsciousnessState::Perceive,
-            mcp: vec![inline(), McpRef::Import("cove-read".into())], transitions: vec![], model: None, session: None, body: String::new(),
+            mcp: vec![inline(), McpRef::Import("cove-read".into())], transitions: vec![], model: None, session: None, reply_key: None, body: String::new(),
         };
-        let (servers, inline_read) = harness.assemble_mcp_servers(&open, &stim, &TrustTier::self_()).await;
+        let (servers, inline_read) = harness.assemble_mcp_servers(&open, &stim, &TrustTier::self_(), None).await;
         assert!(servers.contains_key("rootai"), "inline admitted on an open tier");
         assert_eq!(servers["rootai"]["type"], "http");
         assert!(servers["rootai"]["headers"].as_object().unwrap().is_empty(), "inline carries NO secret");
@@ -2840,9 +2919,9 @@ mod tests {
         // LOCKED express (unconfigured → default locked): the same inline is rejected.
         let locked = StatePrompt {
             id: "e".into(), state: ConsciousnessState::Express,
-            mcp: vec![inline()], transitions: vec![], model: None, session: None, body: String::new(),
+            mcp: vec![inline()], transitions: vec![], model: None, session: None, reply_key: None, body: String::new(),
         };
-        let (servers, inline_read) = harness.assemble_mcp_servers(&locked, &stim, &TrustTier::self_()).await;
+        let (servers, inline_read) = harness.assemble_mcp_servers(&locked, &stim, &TrustTier::self_(), None).await;
         assert!(servers.is_empty() && inline_read.is_empty(), "no self-plug on a locked tier");
 
         std::fs::remove_dir_all(&tmp).ok();
@@ -2889,18 +2968,106 @@ mod tests {
         let stim = poisoned_stimulus();
         let express = StatePrompt {
             id: "e".into(), state: ConsciousnessState::Express,
-            mcp: vec![McpRef::Import("telegram".into())], transitions: vec![], model: None, session: None, body: String::new(),
+            mcp: vec![McpRef::Import("telegram".into())], transitions: vec![], model: None, session: None, reply_key: None, body: String::new(),
         };
 
         // public cycle (rank 0) < org (rank 1) → telegram WITHHELD.
-        let (servers, _) = harness.assemble_mcp_servers(&express, &stim, &TrustTier::public()).await;
+        let (servers, _) = harness.assemble_mcp_servers(&express, &stim, &TrustTier::public(), None).await;
         assert!(!servers.contains_key("telegram"), "min_trust:org is denied to a public cycle");
         // org cycle (rank 1) == org → admitted.
-        let (servers, _) = harness.assemble_mcp_servers(&express, &stim, &TrustTier("org".into())).await;
+        let (servers, _) = harness.assemble_mcp_servers(&express, &stim, &TrustTier("org".into()), None).await;
         assert!(servers.contains_key("telegram"), "min_trust:org is admitted to an org cycle");
         // self cycle (rank 2) > org → a higher-trust cycle also clears it.
-        let (servers, _) = harness.assemble_mcp_servers(&express, &stim, &TrustTier::self_()).await;
+        let (servers, _) = harness.assemble_mcp_servers(&express, &stim, &TrustTier::self_(), None).await;
         assert!(servers.contains_key("telegram"), "a higher-trust (self) cycle clears min_trust:org");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Reply targeting (firebreak): `resolve_scope_override` returns the in-batch item a `reply_to`
+    /// names, and ONLY one in the batch — an unknown id, a missing `reply_to`, or a single-message
+    /// wake (no `items`) all yield `None` (→ reply to the latest, never an unvalidated id).
+    #[test]
+    fn resolve_scope_override_validates_against_the_batch() {
+        let keys = ["message_id", "id"];
+        let mut stim = poisoned_stimulus();
+        stim.payload = serde_json::json!({
+            "chat_id": 7, "message_id": 20,
+            "items": [{"chat_id":7,"message_id":10},{"chat_id":7,"message_id":20}]
+        });
+        // Matches an item by id (the model emits a STRING; the item id is a JSON number → normalized).
+        assert_eq!(resolve_scope_override(&stim, &keys, Some("10")).unwrap()["message_id"], 10);
+        // Not in the batch → None (the firebreak).
+        assert!(resolve_scope_override(&stim, &keys, Some("999")).is_none());
+        // No target / no batch → None.
+        assert!(resolve_scope_override(&stim, &keys, None).is_none());
+        let mut single = poisoned_stimulus();
+        single.payload = serde_json::json!({ "message_id": 5 });
+        assert!(resolve_scope_override(&single, &keys, Some("5")).is_none(), "single-message wake");
+    }
+
+    /// Reply targeting (the per-baton resolution): `assemble_mcp_servers` resolves a scoped server's
+    /// `scope_env` from the SELECTED item when one is supplied (per-baton reply target), else the
+    /// top-level/latest payload — and per FIELD, so `chat_id` stays correct even on a partial item.
+    #[tokio::test]
+    async fn assemble_resolves_scope_env_per_baton_from_the_selected_item() {
+        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::queue::InMemoryQueue;
+        use crate::repo::git::PlainGitRepo;
+        use crate::runlog::FileRunLog;
+        use std::collections::HashMap;
+
+        let config = Arc::new(
+            DackConfig::from_yaml(
+                "operator_did: \"did:x\"\n\
+                 tier_policy:\n  express: { mcp_whitelist: true, import: [telegram] }\n\
+                 mcp_servers:\n  \
+                   - name: telegram\n    transport: { type: stdio, command: bun, args: [run, t.ts] }\n    tier: post\n    \
+                     scope_env: { TELEGRAM_REPLY_TO: message_id, TELEGRAM_REPLY_CHAT: chat_id }\n",
+            )
+            .unwrap(),
+        );
+        let queue: Arc<dyn Queue> = Arc::new(InMemoryQueue::new());
+        let tmp = std::env::temp_dir().join(format!("dack-perbaton-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).ok();
+        let harness = Harness {
+            config: config.clone(),
+            queue: queue.clone(),
+            bus: Arc::new(Bus::new(config.clone(), queue.clone())),
+            runtime: Arc::new(RecordingRuntime { seen: std::sync::Mutex::new(Vec::new()), out: perceive_output() }),
+            repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
+            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
+            broker: Arc::new(SecretsBroker::new(vec![])),
+            sessions: Default::default(),
+        };
+        let mut stim = poisoned_stimulus();
+        stim.payload = serde_json::json!({
+            "chat_id": 7, "message_id": 20,
+            "items": [{"chat_id":7,"message_id":10},{"chat_id":7,"message_id":20}]
+        });
+        let express = StatePrompt {
+            id: "e".into(), state: ConsciousnessState::Express,
+            mcp: vec![McpRef::Import("telegram".into())], transitions: vec![], model: None, session: None,
+            reply_key: None, body: String::new(),
+        };
+
+        // No override → the top-level latest (message_id 20).
+        let (s, _) = harness.assemble_mcp_servers(&express, &stim, &TrustTier::self_(), None).await;
+        assert_eq!(s["telegram"]["env"]["TELEGRAM_REPLY_TO"], "20");
+        assert_eq!(s["telegram"]["env"]["TELEGRAM_REPLY_CHAT"], "7");
+
+        // Override to the FIRST message → reply targets 10; chat stays 7.
+        let item = serde_json::json!({ "chat_id": 7, "message_id": 10 });
+        let (s, _) = harness.assemble_mcp_servers(&express, &stim, &TrustTier::self_(), Some(&item)).await;
+        assert_eq!(s["telegram"]["env"]["TELEGRAM_REPLY_TO"], "10", "per-baton: the selected message");
+        assert_eq!(s["telegram"]["env"]["TELEGRAM_REPLY_CHAT"], "7");
+
+        // Per-field fallback: a partial item (only message_id) → chat_id falls back to the top-level.
+        let partial = serde_json::json!({ "message_id": 10 });
+        let (s, _) = harness.assemble_mcp_servers(&express, &stim, &TrustTier::self_(), Some(&partial)).await;
+        assert_eq!(s["telegram"]["env"]["TELEGRAM_REPLY_TO"], "10");
+        assert_eq!(s["telegram"]["env"]["TELEGRAM_REPLY_CHAT"], "7", "chat_id falls back to top-level");
 
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -3088,18 +3255,19 @@ mod tests {
             transitions: vec![],
             model: Some(model.into()),
             session: None,
+            reply_key: None,
             body: "go".into(),
         };
 
         // perceive: the soul's `model:` is honored (override allowed).
         let p = prompt(ConsciousnessState::Perceive, "frontier-x");
-        harness.run_step(&p, &StepInput::Entry, &stim, &TrustTier::self_(), ConsciousnessState::Reflect).await.unwrap();
+        harness.run_step(&p, &StepInput::Entry, &stim, &TrustTier::self_(), ConsciousnessState::Reflect, None).await.unwrap();
         // express: the soul's `model:` is IGNORED (locked) — the operator default stands.
         let e = prompt(ConsciousnessState::Express, "sneaky-upgrade");
-        harness.run_step(&e, &StepInput::Entry, &stim, &TrustTier::self_(), ConsciousnessState::Reflect).await.unwrap();
+        harness.run_step(&e, &StepInput::Entry, &stim, &TrustTier::self_(), ConsciousnessState::Reflect, None).await.unwrap();
         // settle: no policy → None (→ the client's configured model).
         let s = prompt(ConsciousnessState::Settle, "nope");
-        harness.run_step(&s, &StepInput::Entry, &stim, &TrustTier::self_(), ConsciousnessState::Reflect).await.unwrap();
+        harness.run_step(&s, &StepInput::Entry, &stim, &TrustTier::self_(), ConsciousnessState::Reflect, None).await.unwrap();
 
         let seen = runtime.seen.lock().unwrap();
         assert_eq!(seen[0].model.as_deref(), Some("frontier-x"), "override honored on an open tier");
@@ -3169,18 +3337,19 @@ mod tests {
             transitions: vec![],
             model: None,
             session: Some(SessionConfig { sticky: true, key: vec!["thread_id".into()] }),
+            reply_key: None,
             body: "go".into(),
         };
         // Two items in the SAME thread (same dedup_key) → one resumed session.
         let mut item = poisoned_stimulus();
         item.dedup_key = Some("conv-1".into());
         let trust = TrustTier::public();
-        harness.run_step(&sticky, &StepInput::Entry, &item, &trust, ConsciousnessState::Express).await.unwrap();
-        harness.run_step(&sticky, &StepInput::Entry, &item, &trust, ConsciousnessState::Express).await.unwrap();
+        harness.run_step(&sticky, &StepInput::Entry, &item, &trust, ConsciousnessState::Express, None).await.unwrap();
+        harness.run_step(&sticky, &StepInput::Entry, &item, &trust, ConsciousnessState::Express, None).await.unwrap();
         // A DIFFERENT thread → its own fresh session.
         let mut other = poisoned_stimulus();
         other.dedup_key = Some("conv-2".into());
-        harness.run_step(&sticky, &StepInput::Entry, &other, &trust, ConsciousnessState::Express).await.unwrap();
+        harness.run_step(&sticky, &StepInput::Entry, &other, &trust, ConsciousnessState::Express, None).await.unwrap();
 
         let seen = runtime.seen.lock().unwrap();
         assert!(seen[0].session.is_none(), "first item in a thread starts fresh");

@@ -98,6 +98,14 @@ pub struct BatonIntent {
     /// the origin) — `None` ⇒ inherit the cycle's. Honored from Phase 3; carried here from Phase 1.
     #[serde(default)]
     pub priority: Option<Priority>,
+    /// The message this branch REPLIES TO — the id the model copies from a message it saw in the
+    /// batch (`payload.items`), e.g. a telegram `message_id`. The harness VALIDATES it against the
+    /// batch it holds (the firebreak): an id not in `items` is ignored (the reply falls back to the
+    /// latest/top-level, never an arbitrary target). `None` = reply to the coalesced top-level (the
+    /// latest message — legacy). Platform-agnostic; the identifier FIELD is the emitting prompt's
+    /// `reply_key` (default `message_id`→`id`).
+    #[serde(default)]
+    pub reply_to: Option<String>,
     #[serde(default)]
     pub reason: String,
 }
@@ -155,6 +163,7 @@ impl AgentOutput {
                 to_prompt: id.clone(),
                 gist: String::new(),
                 priority: None,
+                reply_to: None,
                 reason: self.transition.reason.clone(),
             }],
             None => Vec::new(),
@@ -199,14 +208,16 @@ mod tests {
         // New shape: an explicit batons list is used verbatim (the fan-out).
         let multi: AgentOutput = serde_json::from_str(
             r#"{"thought":"t","batons":[
-                 {"to_prompt":"telegram/express","gist":"reply"},
+                 {"to_prompt":"telegram/express","gist":"reply","reply_to":"42"},
                  {"to_prompt":"settle","gist":"trade","priority":"high"}]}"#,
         )
         .unwrap();
         let b = multi.fan_out();
         assert_eq!(b.len(), 2);
         assert_eq!(b[0].to_prompt, "telegram/express");
+        assert_eq!(b[0].reply_to.as_deref(), Some("42"), "reply target parses");
         assert_eq!(b[1].to_prompt, "settle");
+        assert!(b[1].reply_to.is_none());
         assert!(matches!(b[1].priority, Some(crate::model::stimulus::Priority::High)));
 
         // Legacy shape: a single transition folds to exactly one branch (empty gist → harness
@@ -220,6 +231,7 @@ mod tests {
         assert_eq!(b.len(), 1);
         assert_eq!(b[0].to_prompt, "express");
         assert!(b[0].gist.is_empty(), "synthesized branch defers gist to the harness");
+        assert!(b[0].reply_to.is_none(), "legacy transition has no reply target");
 
         // Terminate: no batons, null transition ⇒ no branches.
         let term: AgentOutput =

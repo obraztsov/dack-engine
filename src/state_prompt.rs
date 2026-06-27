@@ -81,6 +81,13 @@ pub struct StatePromptFrontmatter {
     /// Optional sticky-session config (resume-by-id). `None`/`sticky:false` = a fresh session per run.
     #[serde(default)]
     pub session: Option<SessionConfig>,
+    /// The payload-item FIELD a baton's `reply_to` is matched against — the reply identifier the model
+    /// copies from `payload.items` (e.g. `message_id`). The harness validates `reply_to` against this
+    /// field of the batch it holds (the firebreak), then resolves the reply destination from the
+    /// matched item. `None` = the platform-agnostic default (`message_id`, then `id`). Generic: a
+    /// twitter prompt would set `reply_key: id`.
+    #[serde(default)]
+    pub reply_key: Option<String>,
 }
 
 /// A parsed state-prompt: its id (path), frontmatter, and the trusted directive body.
@@ -95,6 +102,8 @@ pub struct StatePrompt {
     pub model: Option<String>,
     /// Sticky-session opt-in (resume-by-id). `None` = a fresh session each run (firebreak default).
     pub session: Option<SessionConfig>,
+    /// The reply-identifier field a baton's `reply_to` is matched against (default `message_id`→`id`).
+    pub reply_key: Option<String>,
     /// The directive text (the body below the frontmatter fence). Trusted.
     pub body: String,
 }
@@ -114,8 +123,19 @@ impl StatePrompt {
             transitions: fm.transitions,
             model: fm.model,
             session: fm.session,
+            reply_key: fm.reply_key,
             body: body.trim().to_string(),
         })
+    }
+
+    /// The payload-item field(s) a baton's `reply_to` is matched against (the reply identifier). The
+    /// soul declares it per-prompt (`reply_key`); unset = the platform-agnostic default
+    /// `message_id`→`id` (covers telegram + twitter without config).
+    pub fn reply_key_fields(&self) -> Vec<&str> {
+        match &self.reply_key {
+            Some(k) => vec![k.as_str()],
+            None => vec!["message_id", "id"],
+        }
     }
 
     /// The repo-relative file a state-prompt id resolves to (`prompts/<id>.md`).
@@ -156,5 +176,19 @@ mod tests {
         assert_eq!(sp.state, ConsciousnessState::Settle);
         assert!(sp.mcp.is_empty());
         assert!(sp.transitions.is_empty());
+    }
+
+    #[test]
+    fn reply_key_fields_default_and_declared() {
+        // Declared → that one field; the model's `reply_to` is matched against it.
+        let sp = StatePrompt::parse(
+            "telegram/perceive",
+            "---\nstate: perceive\nreply_key: message_id\ntransitions: [telegram/express]\n---\nRead.",
+        )
+        .unwrap();
+        assert_eq!(sp.reply_key_fields(), vec!["message_id"]);
+        // Unset → the platform-agnostic default (message_id, then id).
+        let sp = StatePrompt::parse("settle", "---\nstate: settle\n---\nAct.").unwrap();
+        assert_eq!(sp.reply_key_fields(), vec!["message_id", "id"]);
     }
 }

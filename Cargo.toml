@@ -24,6 +24,7 @@ serde_yaml = "0.9"
 thiserror = "1"
 anyhow = "1"
 async-trait = "0.1"
+futures = "0.3"  # FutureExt::catch_unwind — panic-isolate each dispatch cycle
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "sync", "fs", "io-util", "net", "signal"] }
 clap = { version = "4", features = ["derive"] }
 rusqlite = { version = "0.31", features = ["bundled"] }

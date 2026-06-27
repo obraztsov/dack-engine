@@ -71,6 +71,22 @@ impl DailyFileRunLog {
             if let Some(p) = &out.proposal {
                 s.push_str(&format!("- proposal: {:?} — {}\n", p.intent, p.gist));
             }
+            // The fan-out the model chose: each branch's destination + reply target (which message it
+            // threads to — an id from the batch, or `(latest)` when it set none) + the digested gist.
+            if !out.batons.is_empty() {
+                s.push_str("- batons:\n");
+                for b in &out.batons {
+                    let rt = match &b.reply_to {
+                        Some(r) => format!("reply_to={r}"),
+                        None => "reply_to=(latest)".to_string(),
+                    };
+                    s.push_str(&format!(
+                        "  - → {} [{rt}]: {}\n",
+                        b.to_prompt,
+                        b.gist.replace('\n', " ")
+                    ));
+                }
+            }
         }
         // The wall's decisions — an injection path (a denied tool) is visible here post-hoc.
         if !entry.tool_calls.is_empty() {

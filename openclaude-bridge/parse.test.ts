@@ -39,6 +39,16 @@ test('fenced single object still parses', () => {
   expect(out.thought).toBe('f')
 })
 
+test('multi-object batons are CONCATENATED, not dropped (later-wins would lose some)', () => {
+  // The model split its fan-out across two JSON objects — both batons must survive.
+  const text =
+    '{"thought":"a","batons":[{"to_prompt":"telegram/express","reply_to":"10","gist":"A"}]}\n' +
+    '{"thought":"b","batons":[{"to_prompt":"telegram/express","reply_to":"20","gist":"B"}]}'
+  const out: any = parseOutput(text, () => {})
+  expect(out.batons.length).toBe(2)
+  expect(out.batons.map((b: any) => b.reply_to)).toEqual(['10', '20'])
+})
+
 test('total garbage logs loudly and terminates (to_prompt null), never silently', () => {
   const logs: string[] = []
   const out: any = parseOutput('the model rambled with no json at all', (m) => logs.push(m))

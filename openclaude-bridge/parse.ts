@@ -76,11 +76,17 @@ export function parseOutput(text: string, log: (m: string) => void = () => {}): 
   const objs = extractJsonObjects(t)
   if (objs.length === 1) return normalize(objs[0], text)
   if (objs.length > 1) {
+    // Merge later-wins for scalar fields (thought/transition/spawn), but CONCATENATE the `batons`
+    // arrays across objects — the model sometimes splits its fan-out across several JSON objects, and
+    // a plain later-wins merge would silently DROP the earlier objects' batons.
+    const merged: any = Object.assign({}, ...objs)
+    const allBatons = objs.flatMap((o: any) => (Array.isArray(o.batons) ? o.batons : []))
+    if (allBatons.length) merged.batons = allBatons
     log(
-      `[bridge:parse] multi-object output: ${objs.length} JSON objects — merged later-wins so the ` +
-        `transition survives (Phase 1 will fan these out as batons)`,
+      `[bridge:parse] multi-object output: ${objs.length} JSON objects — merged ` +
+        `(${allBatons.length} batons concatenated)`,
     )
-    return normalize(Object.assign({}, ...objs), text)
+    return normalize(merged, text)
   }
 
   // Nothing parseable: keep the raw text in `thought` and terminate — but LOUD, never silent.

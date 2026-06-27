@@ -21,6 +21,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::FutureExt; // catch_unwind for per-dispatch panic isolation
+
 use crate::bus::Bus;
 use crate::config::{CapabilityPrefix, CapabilityTier, DackConfig, McpServerConfig, McpTransport};
 use crate::error::{DackError, Result};
@@ -144,16 +146,30 @@ impl Harness {
             match self.queue.next().await? {
                 Some(stimulus) => {
                     let snap = stimulus.clone();
-                    match self.dispatch(stimulus).await {
+                    // Panic-isolate the cycle: logging-not-rollback (PRD §7.5) extended to PANICS. A
+                    // panic in ONE dispatch (a malformed payload, a unicode edge, …) must NOT crash the
+                    // whole duck — catch it, record a failed cycle, keep the loop alive. Essential for a
+                    // hosted fleet: one bad message can never take a user's duck down.
+                    match std::panic::AssertUnwindSafe(self.dispatch(stimulus)).catch_unwind().await {
                         // Terminal states (PRD §5.6): a processed row never sticks in `dispatched`.
-                        Ok(()) => {
+                        Ok(Ok(())) => {
                             let _ = self.queue.update_status(&snap.id, StimulusStatus::Done).await;
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             // logging-not-rollback (PRD §7.5): a failed run is a tagged entry + a
                             // terminal `failed` row, never a crash of the single-flight loop.
                             eprintln!("dack: dispatch error ({}): {e}", snap.id);
                             self.log_dispatch_failure(&snap, &e).await;
+                            let _ = self.queue.update_status(&snap.id, StimulusStatus::Failed).await;
+                        }
+                        Err(panic) => {
+                            let msg = panic
+                                .downcast_ref::<&str>()
+                                .map(|s| s.to_string())
+                                .or_else(|| panic.downcast_ref::<String>().cloned())
+                                .unwrap_or_else(|| "unknown panic".into());
+                            eprintln!("dack: dispatch PANICKED ({}): {msg} — cycle failed, loop continues", snap.id);
+                            self.log_dispatch_failure(&snap, &DackError::Runtime(format!("panic: {msg}"))).await;
                             let _ = self.queue.update_status(&snap.id, StimulusStatus::Failed).await;
                         }
                     }
@@ -323,7 +339,7 @@ impl Harness {
                 break;
             }
             let (out, runlog_ref, accessed) = self
-                .run_step(&b.prompt, &b.step, &stimulus, &b.trust, b.ceiling, b.scope_override.as_ref())
+                .run_step(&b.prompt, &b.step, &stimulus, &b.trust, b.ceiling, b.scope_override.as_ref(), steps)
                 .await?;
             // Taint by ACTUAL access: degrade THIS branch's trust by what the step called, then
             // recompute the ceiling its child batons are checked against (monotonic, I17).
@@ -423,6 +439,13 @@ impl Harness {
                          replying to the latest instead ({})",
                         next.id, intent.reply_to.as_deref().unwrap_or(""), stimulus.id
                     );
+                } else if let Some(item) = &scope_override {
+                    eprintln!(
+                        "dispatch: baton to `{}` threads reply to message {} ({})",
+                        next.id,
+                        item.get("message_id").map(|v| v.to_string()).unwrap_or_else(|| "?".into()),
+                        stimulus.id
+                    );
                 }
                 // Cross the firebreak: the child opens fresh on its digested Baton (carrying the
                 // branch's accumulated trust), never raw bytes.
@@ -481,6 +504,7 @@ impl Harness {
         cycle_trust: &TrustTier,
         ceiling: ConsciousnessState,
         scope_override: Option<&serde_json::Value>,
+        step_seq: usize,
     ) -> Result<(AgentOutput, String, Option<TrustTier>)> {
         let spec = default_spec(prompt.state);
         // The capabilities this state-prompt plugs (the two-sided handshake, MCP2-B).
@@ -580,7 +604,7 @@ impl Harness {
         self.honor_memory_append(prompt.state, &out).await;
         let reverted = self.reconcile_soul(prompt.state, &stimulus.id.0).await;
         let runlog_ref = self
-            .write_runlog(prompt.state, stimulus, &out, tool_calls, &reverted)
+            .write_runlog(prompt.state, stimulus, &out, tool_calls, &reverted, step_seq)
             .await?;
         Ok((out, runlog_ref, accessed))
     }
@@ -1106,6 +1130,7 @@ impl Harness {
         out: &AgentOutput,
         tool_calls: Vec<ToolCallRecord>,
         reverted: &[String],
+        step_seq: usize,
     ) -> Result<String> {
         let outcome = if reverted.is_empty() {
             Outcome::Ok
@@ -1116,7 +1141,13 @@ impl Harness {
             ))
         };
         let entry = RunLogEntry {
-            run_id: format!("run-{}-{}", stimulus.id.0, state_tag(state)),
+            // Unique per step: the entry (step 1) keeps the clean id; each later fan-out baton gets a
+            // `-b{n}` suffix so N in-wake batons don't collide on one run-id in the runlog (they did).
+            run_id: if step_seq > 1 {
+                format!("run-{}-{}-b{step_seq}", stimulus.id.0, state_tag(state))
+            } else {
+                format!("run-{}-{}", stimulus.id.0, state_tag(state))
+            },
             stimulus_id: stimulus.id.clone(),
             state,
             context_summary: format!(
@@ -1672,7 +1703,14 @@ impl ActionResponder for RecordingResponder {
         // the tool name — the audit trail of what the duck actually did (PRD §7.5). Truncated.
         let mut input = req.input.to_string();
         if input.len() > 240 {
-            input.truncate(240);
+            // Truncate on a CHAR BOUNDARY: `req.input` is often multi-byte UTF-8 (e.g. Cyrillic reply
+            // text), and `String::truncate` PANICS if byte 240 lands mid-character. Walk back to the
+            // nearest boundary first.
+            let mut end = 240;
+            while end > 0 && !input.is_char_boundary(end) {
+                end -= 1;
+            }
+            input.truncate(end);
             input.push('…');
         }
         self.calls.lock().unwrap().push(ToolCallRecord {
@@ -3261,13 +3299,13 @@ mod tests {
 
         // perceive: the soul's `model:` is honored (override allowed).
         let p = prompt(ConsciousnessState::Perceive, "frontier-x");
-        harness.run_step(&p, &StepInput::Entry, &stim, &TrustTier::self_(), ConsciousnessState::Reflect, None).await.unwrap();
+        harness.run_step(&p, &StepInput::Entry, &stim, &TrustTier::self_(), ConsciousnessState::Reflect, None, 1).await.unwrap();
         // express: the soul's `model:` is IGNORED (locked) — the operator default stands.
         let e = prompt(ConsciousnessState::Express, "sneaky-upgrade");
-        harness.run_step(&e, &StepInput::Entry, &stim, &TrustTier::self_(), ConsciousnessState::Reflect, None).await.unwrap();
+        harness.run_step(&e, &StepInput::Entry, &stim, &TrustTier::self_(), ConsciousnessState::Reflect, None, 1).await.unwrap();
         // settle: no policy → None (→ the client's configured model).
         let s = prompt(ConsciousnessState::Settle, "nope");
-        harness.run_step(&s, &StepInput::Entry, &stim, &TrustTier::self_(), ConsciousnessState::Reflect, None).await.unwrap();
+        harness.run_step(&s, &StepInput::Entry, &stim, &TrustTier::self_(), ConsciousnessState::Reflect, None, 1).await.unwrap();
 
         let seen = runtime.seen.lock().unwrap();
         assert_eq!(seen[0].model.as_deref(), Some("frontier-x"), "override honored on an open tier");
@@ -3344,12 +3382,12 @@ mod tests {
         let mut item = poisoned_stimulus();
         item.dedup_key = Some("conv-1".into());
         let trust = TrustTier::public();
-        harness.run_step(&sticky, &StepInput::Entry, &item, &trust, ConsciousnessState::Express, None).await.unwrap();
-        harness.run_step(&sticky, &StepInput::Entry, &item, &trust, ConsciousnessState::Express, None).await.unwrap();
+        harness.run_step(&sticky, &StepInput::Entry, &item, &trust, ConsciousnessState::Express, None, 1).await.unwrap();
+        harness.run_step(&sticky, &StepInput::Entry, &item, &trust, ConsciousnessState::Express, None, 1).await.unwrap();
         // A DIFFERENT thread → its own fresh session.
         let mut other = poisoned_stimulus();
         other.dedup_key = Some("conv-2".into());
-        harness.run_step(&sticky, &StepInput::Entry, &other, &trust, ConsciousnessState::Express, None).await.unwrap();
+        harness.run_step(&sticky, &StepInput::Entry, &other, &trust, ConsciousnessState::Express, None, 1).await.unwrap();
 
         let seen = runtime.seen.lock().unwrap();
         assert!(seen[0].session.is_none(), "first item in a thread starts fresh");

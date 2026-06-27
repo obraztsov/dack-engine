@@ -23,6 +23,40 @@ pub struct CoalescePolicy {
     pub window_sec: Option<u64>,
     #[serde(default)]
     pub dedup_key: Option<String>,
+    /// Adaptive (`batch` only): instead of a flat `window_sec`, grow the coalesce window as each chat
+    /// spends a daily credit budget — snappy while there's budget, gracefully slower as a chat gets
+    /// noisy, with a per-chat daily cost ceiling. When set, `window_sec` is ignored. Tuned by the soul
+    /// in Reflect (responsiveness is a knob the duck owns).
+    #[serde(default)]
+    pub adaptive: Option<AdaptiveCoalesce>,
+}
+
+/// Per-chat adaptive coalesce budget. A *credit* = one wake (one new batch accumulator). The window
+/// grows as a chat spends its daily credits: every time it burns half its REMAINING credits, the
+/// window ×10, capped at `max_window_sec`. `step = floor(log2(daily_credits / remaining))`,
+/// `window = min(initial_window_sec · 10^step, max_window_sec)`; underwater (remaining ≤ 0) ⇒ the cap.
+/// So a normal chat never leaves `initial_window_sec`; only a noisy one throttles itself. Per chat
+/// (`dedup_key`), reset daily. (A regenerating GLOBAL pool per stimulus is a deferred follow-up.)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdaptiveCoalesce {
+    pub initial_window_sec: u64,
+    pub daily_credits: u64,
+    pub max_window_sec: u64,
+}
+
+impl AdaptiveCoalesce {
+    /// The coalesce window (seconds) given how many credits this chat has already spent today.
+    pub fn window_sec(&self, consumed: u64) -> u64 {
+        let remaining = self.daily_credits.saturating_sub(consumed);
+        if remaining == 0 {
+            return self.max_window_sec;
+        }
+        // step = number of times the budget has halved = floor(log2(daily_credits / remaining)).
+        let step = ((self.daily_credits as f64 / remaining as f64).log2()).floor().max(0.0) as u32;
+        self.initial_window_sec
+            .saturating_mul(10u64.saturating_pow(step))
+            .min(self.max_window_sec)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -948,6 +982,19 @@ forwarded_env: [TWITTER_API_KEY, BANKR_API_KEY, BUILDER_DID_KEY, DACK_HANDLE, RA
 secrets:
   soul_did_key: "file:///run/secrets/soul_did_key"
 "#;
+
+    #[test]
+    fn adaptive_window_grows_each_time_half_the_budget_is_spent() {
+        let a = AdaptiveCoalesce { initial_window_sec: 10, daily_credits: 100, max_window_sec: 1800 };
+        assert_eq!(a.window_sec(0), 10, "fresh budget → initial window");
+        assert_eq!(a.window_sec(49), 10, "under half spent → still initial");
+        assert_eq!(a.window_sec(50), 100, "half spent → ×10");
+        assert_eq!(a.window_sec(74), 100, "under three-quarters → still ×10");
+        assert_eq!(a.window_sec(75), 1000, "three-quarters spent → ×100");
+        assert_eq!(a.window_sec(88), 1800, "next step (×1000=10000) clamps to the cap");
+        assert_eq!(a.window_sec(100), 1800, "budget exhausted → cap");
+        assert_eq!(a.window_sec(250), 1800, "underwater (saturating) → cap, never panics");
+    }
 
     #[test]
     fn parses_sample_config() {

@@ -85,12 +85,21 @@ impl Bus {
                         }
                     }
                     CoalesceMode::Batch => {
-                        if let Some(acc) = self
-                            .within_window(&type_, key, received_at, policy.window_sec)
+                        // Fixed mode bounds coalescable rows by `window_sec`; adaptive's window is
+                        // variable (encoded per-row in `pop_after`), so scan unbounded and fold only
+                        // into an accumulator whose window is still OPEN (`received_at < pop_after`) —
+                        // never into one already firing. The fixed path is unchanged (`find` on a
+                        // `true` predicate = the old `.next()`).
+                        let bound = if policy.adaptive.is_some() { None } else { policy.window_sec };
+                        let acc = self
+                            .within_window(&type_, key, received_at, bound)
                             .await?
                             .into_iter()
-                            .next()
-                        {
+                            .find(|s| {
+                                policy.adaptive.is_none()
+                                    || s.pop_after.map_or(false, |p| received_at < p)
+                            });
+                        if let Some(acc) = acc {
                             // Fold into the accumulator; keep its received_at (FIFO fairness)
                             // so a hot thread can't starve older pending stimuli.
                             let merged = merge_batch(acc.payload, &payload);
@@ -114,9 +123,38 @@ impl Bus {
             // `pop_after` (earliest-poppable) second; the effective gate is the LATER of the two —
             // a windowed group message still folds for its debounce, then waits for the window.
             let coalesce_pop_after = match &fm.coalesce {
-                Some(p) if matches!(p.mode, CoalesceMode::Batch) => {
-                    p.window_sec.filter(|w| *w > 0).map(|w| received_at + w as i64)
-                }
+                Some(p) if matches!(p.mode, CoalesceMode::Batch) => match &p.adaptive {
+                    // Adaptive: size this NEW accumulator's window from the chat's daily credit budget,
+                    // then SPEND one credit (this accumulator becomes one wake). A noisier chat burns
+                    // its budget → the window grows → it slows itself down. Per-chat (dedup_key), reset
+                    // daily (date in the cursor key). Spending here (at creation, not dispatch) keeps the
+                    // accounting self-contained and lets the next accumulator see the new count at once.
+                    Some(ad) => match dedup_key.as_deref() {
+                        Some(chat) => {
+                            let key = adaptive_credit_key(&fm.id, chat, received_at);
+                            let spent = self
+                                .queue
+                                .get_cursor(&key)
+                                .await?
+                                .and_then(|v| v.parse::<u64>().ok())
+                                .unwrap_or(0);
+                            let window = ad.window_sec(spent);
+                            self.queue.set_cursor(&key, &(spent + 1).to_string()).await?;
+                            // Observable: the window stepping up as a chat spends its daily budget.
+                            eprintln!(
+                                "dack: coalesce[adaptive] {}:{} spent={}/{} → window={window}s",
+                                fm.id,
+                                chat,
+                                spent + 1,
+                                ad.daily_credits
+                            );
+                            Some(received_at + window as i64)
+                        }
+                        // No per-chat key to budget against — fall back to the initial window.
+                        None => Some(received_at + ad.initial_window_sec as i64),
+                    },
+                    None => p.window_sec.filter(|w| *w > 0).map(|w| received_at + w as i64),
+                },
                 _ => None,
             };
             let window_pop_after = fm
@@ -173,6 +211,12 @@ impl Bus {
         Ok(rows)
     }
 
+}
+
+/// Per-chat, per-UTC-day cursor key for the adaptive coalesce credit budget. `received_at / 86_400` is
+/// the epoch-day, so a new day naturally yields a fresh key (= a fresh budget) — no explicit reset.
+fn adaptive_credit_key(source: &str, dedup_key: &str, received_at: i64) -> String {
+    format!("credits:{source}:{dedup_key}:{}", received_at / 86_400)
 }
 
 /// Fold a new payload into a batch accumulator. Shape: `{<latest msg's fields…>, "_coalesced": true,
@@ -318,6 +362,59 @@ mod tests {
         let items = row.payload.get("items").and_then(|v| v.as_array()).unwrap();
         assert_eq!(items.len(), 3, "every message kept in items for context");
         assert!(row.payload.get("_coalesced").unwrap().as_bool().unwrap());
+    }
+
+    /// An adaptive duty. As a chat spends its daily credits, the new-accumulator window grows (×10 each
+    /// time half the remaining budget is burned), and exactly one credit is spent per wake.
+    fn adaptive_duty(credits: u64, initial: u64) -> StimulusDef {
+        let text = format!(
+            "---\nid: tg\ntrigger: {{ type: webhook, path: /telegram/trusted }}\n\
+             directive_tier: self\nemits:\n  type: telegram_message\n\
+             coalesce: {{ mode: batch, adaptive: {{ initial_window_sec: {initial}, daily_credits: {credits}, max_window_sec: 1800 }} }}\n\
+             entry: telegram/perceive\n---\nGroup.\n"
+        );
+        StimulusDef::parse(&text, "stimuli/tg/STIMULUS.md").unwrap()
+    }
+
+    #[tokio::test]
+    async fn adaptive_window_grows_as_a_chat_spends_its_credits() {
+        let b = bus();
+        let def = adaptive_duty(2, 10); // tiny budget so one wake crosses the half-spent threshold
+        let key = format!("credits:tg:7:{}", 1000 / 86_400);
+
+        // First burst, chat 7: spent 0, remaining 2 → step 0 → initial 10s; one credit spent.
+        b.ingest(&def, vec![chat_cand(7, 1, "gm")], 1000, TrustTier::public()).await.unwrap();
+        let r1 = b.queue.next().await.unwrap().unwrap();
+        assert_eq!(r1.pop_after, Some(1010), "full budget → initial window");
+        assert_eq!(b.queue.get_cursor(&key).await.unwrap().as_deref(), Some("1"), "one wake = one credit");
+
+        // Second burst (r1 already popped → new accumulator): spent 1, remaining 1 → step 1 → ×10.
+        b.ingest(&def, vec![chat_cand(7, 2, "wen")], 2000, TrustTier::public()).await.unwrap();
+        let r2 = b.queue.next().await.unwrap().unwrap();
+        assert_eq!(r2.pop_after, Some(2100), "half the budget spent → window ×10");
+        assert_eq!(b.queue.get_cursor(&key).await.unwrap().as_deref(), Some("2"));
+    }
+
+    #[tokio::test]
+    async fn adaptive_folds_spend_one_credit_per_batch_not_per_message() {
+        let b = bus();
+        let def = adaptive_duty(100, 10);
+        // Three messages in one chat fold into ONE accumulator → exactly one credit.
+        b.ingest(
+            &def,
+            vec![chat_cand(7, 1, "a"), chat_cand(7, 2, "b"), chat_cand(7, 3, "c")],
+            1000,
+            TrustTier::public(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(b.queue.depth().await.unwrap(), 1, "the chat folds into one wake");
+        let key = format!("credits:tg:7:{}", 1000 / 86_400);
+        assert_eq!(
+            b.queue.get_cursor(&key).await.unwrap().as_deref(),
+            Some("1"),
+            "a batch costs one credit, not one per message"
+        );
     }
 
     #[tokio::test]

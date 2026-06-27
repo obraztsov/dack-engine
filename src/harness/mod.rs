@@ -511,7 +511,6 @@ impl Harness {
         let (mcp_servers, inline_read) =
             self.assemble_mcp_servers(prompt, stimulus, cycle_trust, scope_override).await;
         let recorder = self.wall_for(spec.clone(), inline_read);
-        let system_prompt = self.system_prompt_for_prompt(prompt).await;
         // Offer ONLY the transitions the current trust ceiling permits — the agent never sees a hop
         // it couldn't take (taint model). A step that then touches a lower-trust capability may drop
         // even an offered hop (enforced post-step in `dispatch`).
@@ -573,6 +572,9 @@ impl Harness {
             None => None,
         };
 
+        // Built AFTER the resume lookup: a sticky RESUME gets the lean `resume_body`, a fresh run the
+        // full body. (`is_some()` borrows `resume`; it's moved into `session` just below.)
+        let system_prompt = self.system_prompt_for_prompt(prompt, resume.is_some()).await;
         let req = InvocationRequest {
             system_prompt,
             spec: spec.clone(),
@@ -1048,13 +1050,21 @@ impl Harness {
     /// `prompts/<id>.md` when the prompt was resolved, so a Reflect edit takes effect next wake. The
     /// bridge appends the structured-output instruction. An empty soul + body degrades to a minimal
     /// header rather than failing the run (PRD §4, §6.2).
-    async fn system_prompt_for_prompt(&self, prompt: &StatePrompt) -> String {
+    async fn system_prompt_for_prompt(&self, prompt: &StatePrompt, is_resume: bool) -> String {
         let soul = self.repo.read_file(&RepoPath("SOUL.md".into())).await.unwrap_or_default();
         let soul = String::from_utf8_lossy(&soul);
-        if soul.trim().is_empty() && prompt.body.trim().is_empty() {
+        // On a sticky RESUME use the lean `resume_body` (if the prompt declared a `---resume---` section)
+        // so we don't re-teach the whole prompt every turn; otherwise (fresh, or no section) the full body.
+        // SOUL.md (the constant self) still rides every turn.
+        let body = if is_resume {
+            prompt.resume_body.as_deref().unwrap_or(&prompt.body)
+        } else {
+            &prompt.body
+        };
+        if soul.trim().is_empty() && body.trim().is_empty() {
             format!("You are a DACK actor in the {:?} state ({}).", prompt.state, prompt.id)
         } else {
-            format!("{}\n\n---\n\n{}", soul.trim_end(), prompt.body.trim_end())
+            format!("{}\n\n---\n\n{}", soul.trim_end(), body.trim_end())
         }
     }
 
@@ -2820,6 +2830,7 @@ mod tests {
             session: None,
             reply_key: None,
             body: String::new(),
+            resume_body: None,
         };
 
         // Perceive: only read-tier cove-read; trading (settle) is NOT exposed.
@@ -2944,7 +2955,7 @@ mod tests {
         // OPEN perceive: the inline public MCP is admitted, read-tier, with its wall prefix.
         let open = StatePrompt {
             id: "p".into(), state: ConsciousnessState::Perceive,
-            mcp: vec![inline(), McpRef::Import("cove-read".into())], transitions: vec![], model: None, session: None, reply_key: None, body: String::new(),
+            mcp: vec![inline(), McpRef::Import("cove-read".into())], transitions: vec![], model: None, session: None, reply_key: None, body: String::new(), resume_body: None,
         };
         let (servers, inline_read) = harness.assemble_mcp_servers(&open, &stim, &TrustTier::self_(), None).await;
         assert!(servers.contains_key("rootai"), "inline admitted on an open tier");
@@ -2957,7 +2968,7 @@ mod tests {
         // LOCKED express (unconfigured → default locked): the same inline is rejected.
         let locked = StatePrompt {
             id: "e".into(), state: ConsciousnessState::Express,
-            mcp: vec![inline()], transitions: vec![], model: None, session: None, reply_key: None, body: String::new(),
+            mcp: vec![inline()], transitions: vec![], model: None, session: None, reply_key: None, body: String::new(), resume_body: None,
         };
         let (servers, inline_read) = harness.assemble_mcp_servers(&locked, &stim, &TrustTier::self_(), None).await;
         assert!(servers.is_empty() && inline_read.is_empty(), "no self-plug on a locked tier");
@@ -3006,7 +3017,7 @@ mod tests {
         let stim = poisoned_stimulus();
         let express = StatePrompt {
             id: "e".into(), state: ConsciousnessState::Express,
-            mcp: vec![McpRef::Import("telegram".into())], transitions: vec![], model: None, session: None, reply_key: None, body: String::new(),
+            mcp: vec![McpRef::Import("telegram".into())], transitions: vec![], model: None, session: None, reply_key: None, body: String::new(), resume_body: None,
         };
 
         // public cycle (rank 0) < org (rank 1) → telegram WITHHELD.
@@ -3087,7 +3098,7 @@ mod tests {
         let express = StatePrompt {
             id: "e".into(), state: ConsciousnessState::Express,
             mcp: vec![McpRef::Import("telegram".into())], transitions: vec![], model: None, session: None,
-            reply_key: None, body: String::new(),
+            reply_key: None, body: String::new(), resume_body: None,
         };
 
         // No override → the top-level latest (message_id 20).
@@ -3295,6 +3306,7 @@ mod tests {
             session: None,
             reply_key: None,
             body: "go".into(),
+            resume_body: None,
         };
 
         // perceive: the soul's `model:` is honored (override allowed).
@@ -3376,7 +3388,8 @@ mod tests {
             model: None,
             session: Some(SessionConfig { sticky: true, key: vec!["thread_id".into()] }),
             reply_key: None,
-            body: "go".into(),
+            body: "FULL-BODY-go".into(),
+            resume_body: Some("LEAN-RESUME-only-new".into()),
         };
         // Two items in the SAME thread (same dedup_key) → one resumed session.
         let mut item = poisoned_stimulus();
@@ -3397,6 +3410,20 @@ mod tests {
             "second item in the same thread RESUMES the session"
         );
         assert!(seen[2].session.is_none(), "a different thread starts its own fresh session");
+
+        // The lean `---resume---` body: a fresh wake gets the FULL body, a resume gets the LEAN one.
+        assert!(
+            seen[0].system_prompt.contains("FULL-BODY-go") && !seen[0].system_prompt.contains("LEAN-RESUME"),
+            "first (fresh) item uses the full body"
+        );
+        assert!(
+            seen[1].system_prompt.contains("LEAN-RESUME-only-new") && !seen[1].system_prompt.contains("FULL-BODY"),
+            "resumed item uses the lean resume body, not the full one"
+        );
+        assert!(
+            seen[2].system_prompt.contains("FULL-BODY-go"),
+            "a different thread's fresh item uses the full body again"
+        );
 
         std::fs::remove_dir_all(&tmp).ok();
     }

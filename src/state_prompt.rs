@@ -104,8 +104,14 @@ pub struct StatePrompt {
     pub session: Option<SessionConfig>,
     /// The reply-identifier field a baton's `reply_to` is matched against (default `message_id`→`id`).
     pub reply_key: Option<String>,
-    /// The directive text (the body below the frontmatter fence). Trusted.
+    /// The directive text (the body below the frontmatter fence, up to a `---resume---` marker if any).
+    /// Sent as the system-prompt body on a FRESH session. Trusted.
     pub body: String,
+    /// The LEAN body sent instead of `body` on a sticky-session RESUME (the text AFTER a `---resume---`
+    /// marker line). `None` = no marker → `body` is reused on resume (unchanged behavior). Lets a sticky
+    /// prompt stop re-teaching its whole self every turn and instead say "you're resuming — act only on
+    /// the new payload." Trusted.
+    pub resume_body: Option<String>,
 }
 
 impl StatePrompt {
@@ -116,6 +122,7 @@ impl StatePrompt {
         let fm: StatePromptFrontmatter = serde_yaml::from_str(yaml).map_err(|e| {
             DackError::Stimulus(format!("state-prompt `{id}` frontmatter: {e}"))
         })?;
+        let (body, resume_body) = split_resume(body);
         Ok(StatePrompt {
             id,
             state: fm.state,
@@ -124,7 +131,8 @@ impl StatePrompt {
             model: fm.model,
             session: fm.session,
             reply_key: fm.reply_key,
-            body: body.trim().to_string(),
+            body,
+            resume_body,
         })
     }
 
@@ -146,6 +154,23 @@ impl StatePrompt {
     /// Whether `next` is in this prompt's declared transition set (the soul's half of the gate).
     pub fn permits_transition_to(&self, next: &str) -> bool {
         self.transitions.iter().any(|t| t == next)
+    }
+}
+
+/// Split a state-prompt body on a `---resume---` marker line (a line that trims to exactly that token):
+/// text BEFORE = the fresh-session body, text AFTER = the lean RESUME body. No marker → the whole body
+/// and `None`. The marker shares the `---` of the frontmatter fence but `split_frontmatter` already
+/// consumed the leading `---\n…\n---\n` and matches the fence as exactly `\n---\n`, so `---resume---`
+/// in the body is never mistaken for it.
+fn split_resume(body: &str) -> (String, Option<String>) {
+    match body.lines().position(|l| l.trim() == "---resume---") {
+        Some(i) => {
+            let lines: Vec<&str> = body.lines().collect();
+            let fresh = lines[..i].join("\n").trim().to_string();
+            let resume = lines[i + 1..].join("\n").trim().to_string();
+            (fresh, Some(resume))
+        }
+        None => (body.trim().to_string(), None),
     }
 }
 
@@ -176,6 +201,23 @@ mod tests {
         assert_eq!(sp.state, ConsciousnessState::Settle);
         assert!(sp.mcp.is_empty());
         assert!(sp.transitions.is_empty());
+    }
+
+    #[test]
+    fn resume_marker_splits_body_into_fresh_and_lean() {
+        // With a `---resume---` line: before = fresh body, after = lean resume body.
+        let sp = StatePrompt::parse(
+            "telegram/perceive",
+            "---\nstate: perceive\n---\nFull teaching here.\n\n---resume---\nYou're resuming. Only new stuff.",
+        )
+        .unwrap();
+        assert_eq!(sp.body, "Full teaching here.");
+        assert_eq!(sp.resume_body.as_deref(), Some("You're resuming. Only new stuff."));
+
+        // No marker: body is the whole thing, resume_body None (unchanged behavior).
+        let sp = StatePrompt::parse("settle", "---\nstate: settle\n---\nAct.").unwrap();
+        assert_eq!(sp.body, "Act.");
+        assert_eq!(sp.resume_body, None);
     }
 
     #[test]

@@ -25,6 +25,40 @@ pub trait RunLogWriter: Send + Sync {
     /// Read the recent tail for seeding into the invocation context (PRD §6.1) and for
     /// `dack log` (PRD §8.3).
     async fn tail(&self, max_entries: usize) -> Result<String>;
+
+    /// The runlog **diff** since `since_ts`: heading one-liners of entries whose `timestamp` is strictly
+    /// greater than `since_ts`, most-recent-capped at `max_entries`. Feeds a sticky **resume** the small
+    /// "what happened while this session slept" delta (vs `tail`'s fixed window), so a resumed cycle isn't
+    /// re-fed the whole history every wake. Empty when nothing newer exists.
+    async fn tail_since(&self, since_ts: i64, max_entries: usize) -> Result<String>;
+}
+
+/// Collapse consecutive identical lines (a cheap de-bloat: a runlog tail is often N identical
+/// `perceive → express: ok` headings, pure noise in the model's context).
+fn dedup_consecutive(lines: &[&str]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    for l in lines {
+        if out.last().map(String::as_str) != Some(*l) {
+            out.push((*l).to_string());
+        }
+    }
+    out
+}
+
+/// Parse a rendered runlog into `(heading, timestamp)` pairs in file order. A heading is a `## …` line;
+/// its timestamp is the `- timestamp: N` line that follows before the next heading (0 if absent).
+fn headings_with_timestamps(text: &str) -> Vec<(&str, i64)> {
+    let mut out: Vec<(&str, i64)> = Vec::new();
+    for line in text.lines() {
+        if let Some(h) = line.strip_prefix("## ") {
+            out.push((h, 0));
+        } else if let Some(ts) = line.strip_prefix("- timestamp: ") {
+            if let (Some(last), Ok(n)) = (out.last_mut(), ts.trim().parse::<i64>()) {
+                last.1 = n;
+            }
+        }
+    }
+    out
 }
 
 /// Daily-file writer over the [`RepoHost`](crate::repo::RepoHost) seam (durable, off-VPS,
@@ -113,7 +147,10 @@ impl DailyFileRunLog {
 impl RunLogWriter for DailyFileRunLog {
     async fn append(&self, entry: &RunLogEntry) -> Result<String> {
         let date = Self::today();
-        let path = RepoPath(format!("runlogs/{date}.md"));
+        // `self.repo` is the RUNLOG repo, rooted at `<soul>/runlogs/` — so the file is `<date>.md`
+        // (no `runlogs/` prefix). The returned `runlog_ref` stays SOUL-relative (`runlogs/<date>.md#…`)
+        // so baton refs + `dack log` resolve it against the soul root, where the file physically lives.
+        let path = RepoPath(format!("{date}.md"));
         // Read-modify-append: the runlog is one growing markdown file per day.
         let mut content =
             String::from_utf8_lossy(&self.repo.read_file(&path).await.unwrap_or_default())
@@ -137,18 +174,36 @@ impl RunLogWriter for DailyFileRunLog {
 
     async fn tail(&self, max_entries: usize) -> Result<String> {
         let date = Self::today();
-        let path = RepoPath(format!("runlogs/{date}.md"));
+        let path = RepoPath(format!("{date}.md"));
         let text = String::from_utf8_lossy(&self.repo.read_file(&path).await.unwrap_or_default())
             .into_owned();
         // Return the last `max_entries` heading one-liners — a compact, harness-authored summary
-        // (NO raw payload; the agent must *choose* to open the full entry via `runlog_ref`).
+        // (NO raw payload; the agent must *choose* to open the full entry via `runlog_ref`), with
+        // consecutive duplicates collapsed (N identical `…: ok` lines are pure context noise).
         let headings: Vec<&str> = text
             .lines()
             .filter(|l| l.starts_with("## "))
             .map(|l| l.trim_start_matches("## "))
             .collect();
-        let start = headings.len().saturating_sub(max_entries);
-        Ok(headings[start..].join("\n"))
+        let deduped = dedup_consecutive(&headings);
+        let start = deduped.len().saturating_sub(max_entries);
+        Ok(deduped[start..].join("\n"))
+    }
+
+    async fn tail_since(&self, since_ts: i64, max_entries: usize) -> Result<String> {
+        let date = Self::today();
+        let path = RepoPath(format!("{date}.md"));
+        let text = String::from_utf8_lossy(&self.repo.read_file(&path).await.unwrap_or_default())
+            .into_owned();
+        // Only entries newer than the watermark (the session's last wake) — the "while you slept" diff.
+        let fresh: Vec<&str> = headings_with_timestamps(&text)
+            .into_iter()
+            .filter(|(_, ts)| *ts > since_ts)
+            .map(|(h, _)| h)
+            .collect();
+        let deduped = dedup_consecutive(&fresh);
+        let start = deduped.len().saturating_sub(max_entries);
+        Ok(deduped[start..].join("\n"))
     }
 }
 
@@ -201,6 +256,12 @@ impl RunLogWriter for FileRunLog {
         let lines: Vec<&str> = text.lines().collect();
         let start = lines.len().saturating_sub(max_entries);
         Ok(lines[start..].join("\n"))
+    }
+
+    /// This minimal writer's compact one-line format carries no timestamp, so it can't filter by
+    /// watermark — fall back to the recent tail. (Production runlogs use `DailyFileRunLog`.)
+    async fn tail_since(&self, _since_ts: i64, max_entries: usize) -> Result<String> {
+        self.tail(max_entries).await
     }
 }
 
@@ -270,7 +331,9 @@ mod tests {
 
         // The committed file fences the raw stimulus untrusted + records the wall's decision.
         let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
-        let body = std::fs::read_to_string(dir.join(format!("runlogs/{date}.md"))).unwrap();
+        // The runlog repo is rooted at the runlogs dir (here `dir`), so the file is `<date>.md`
+        // (the returned ref stays soul-relative `runlogs/<date>.md#…`, asserted above).
+        let body = std::fs::read_to_string(dir.join(format!("{date}.md"))).unwrap();
         assert!(body.contains("```untrusted"));
         assert!(body.contains("IGNORE PREVIOUS INSTRUCTIONS"));
         assert!(body.contains("`Write`") && body.contains("deny: Perceive may not write"));
@@ -278,6 +341,43 @@ mod tests {
         // ...and the runlog was actually committed (clean tree).
         let status = Command::new("git").arg("-C").arg(&dir).args(["status", "--porcelain"]).output().await.unwrap();
         assert!(String::from_utf8_lossy(&status.stdout).trim().is_empty(), "runlog committed");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dedup_collapses_consecutive_and_headings_parse_timestamps() {
+        let lines = vec!["a", "a", "b", "a", "a"];
+        assert_eq!(dedup_consecutive(&lines), vec!["a", "b", "a"], "only CONSECUTIVE dups collapse");
+
+        let text = "# runlog\n\n## run-1 · Perceive · OK\n- timestamp: 100\n- thought: x\n\n## run-2 · Express · OK\n- timestamp: 200\n";
+        let hs = headings_with_timestamps(text);
+        assert_eq!(hs, vec![("run-1 · Perceive · OK", 100), ("run-2 · Express · OK", 200)]);
+    }
+
+    #[tokio::test]
+    async fn tail_since_returns_only_the_diff_after_the_watermark() {
+        let dir = std::env::temp_dir().join(format!("dack-since-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.name", "s"],
+            vec!["config", "user.email", "s@d"],
+        ] {
+            tokio::process::Command::new("git").arg("-C").arg(&dir).args(&args).output().await.unwrap();
+        }
+        let repo = std::sync::Arc::new(crate::repo::git::PlainGitRepo::new(&dir, "did:dack:soul"));
+        let log = DailyFileRunLog::new(repo, "did:dack:soul");
+
+        let mut a = entry("run-old"); a.timestamp = 1000; log.append(&a).await.unwrap();
+        let mut b = entry("run-new"); b.timestamp = 2000; log.append(&b).await.unwrap();
+
+        // Watermark between the two → only the newer entry is in the diff.
+        let diff = log.tail_since(1500, 10).await.unwrap();
+        assert!(diff.contains("run-new") && !diff.contains("run-old"), "diff = entries after the watermark only");
+        // Watermark past both → empty diff (nothing happened while away).
+        assert_eq!(log.tail_since(9999, 10).await.unwrap(), "");
 
         std::fs::remove_dir_all(&dir).ok();
     }

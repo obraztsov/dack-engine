@@ -12,6 +12,7 @@
 
 use async_trait::async_trait;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::gitcore::GitCore;
 use super::gitlawb::is_transient_push_error;
@@ -121,6 +122,12 @@ impl PushTarget {
 pub struct MultiRemoteRepo {
     core: GitCore,
     targets: Vec<PushTarget>,
+    /// Unpushed-commits flag: set by any mutating op, cleared by a successful `push()`. Lets `push()`
+    /// skip the per-cycle network round-trip when nothing changed (so a chat-only cycle that touches no
+    /// soul file doesn't push at all). Starts `true` so the first push after boot flushes any commits a
+    /// crash left local. A `required`-target failure keeps it set (retry next cycle); a best-effort
+    /// failure does NOT (so a permanently-down mirror can't force a push every cycle).
+    dirty: AtomicBool,
 }
 
 impl MultiRemoteRepo {
@@ -132,6 +139,7 @@ impl MultiRemoteRepo {
         Self {
             core: GitCore::new(workdir, author_did),
             targets,
+            dirty: AtomicBool::new(true),
         }
     }
 
@@ -151,13 +159,21 @@ impl RepoHost for MultiRemoteRepo {
         contents: &[u8],
         commit: &CommitMeta,
     ) -> Result<CommitId> {
-        self.core.write_file(path, contents, commit).await
+        let r = self.core.write_file(path, contents, commit).await;
+        if r.is_ok() {
+            self.dirty.store(true, Ordering::Relaxed);
+        }
+        r
     }
     async fn list_dir(&self, path: &RepoPath, max_depth: usize) -> Result<Vec<RepoPath>> {
         self.core.list_dir(path, max_depth).await
     }
     async fn revert_file(&self, path: &RepoPath) -> Result<CommitId> {
-        self.core.revert_file(path).await
+        let r = self.core.revert_file(path).await;
+        if r.is_ok() {
+            self.dirty.store(true, Ordering::Relaxed);
+        }
+        r
     }
     async fn status(&self) -> Result<Vec<RepoChange>> {
         self.core.status_porcelain().await
@@ -167,9 +183,14 @@ impl RepoHost for MultiRemoteRepo {
         paths: &[RepoPath],
         commit: &CommitMeta,
     ) -> Result<Option<CommitId>> {
-        self.core
+        let r = self
+            .core
             .commit_paths(paths, &commit.message, &commit.author_did)
-            .await
+            .await;
+        if matches!(r, Ok(Some(_))) {
+            self.dirty.store(true, Ordering::Relaxed);
+        }
+        r
     }
     async fn restore_to_head(&self, change: &RepoChange) -> Result<()> {
         self.core.restore_to_head(change).await
@@ -179,6 +200,11 @@ impl RepoHost for MultiRemoteRepo {
     /// one); a best-effort target's failure is logged and swallowed. No targets ⇒ no-op (local
     /// commits already happened).
     async fn push(&self) -> Result<()> {
+        // Skip the network round-trip when nothing was committed since the last successful push — a
+        // chat-only cycle (no soul file touched; runlogs live in their own repo now) pushes nothing.
+        if !self.dirty.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         let mut first_required_err: Option<DackError> = None;
         for t in &self.targets {
             match t.push(&self.core).await {
@@ -199,8 +225,13 @@ impl RepoHost for MultiRemoteRepo {
             }
         }
         match first_required_err {
+            // A required target failed → stay dirty so the next cycle retries. A best-effort-only
+            // failure still clears dirty (a permanently-down mirror must not force a push every cycle).
             Some(e) => Err(e),
-            None => Ok(()),
+            None => {
+                self.dirty.store(false, Ordering::Relaxed);
+                Ok(())
+            }
         }
     }
 }

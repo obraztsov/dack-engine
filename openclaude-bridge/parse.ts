@@ -16,6 +16,15 @@ export function normalize(o: any, fallbackText: string): unknown {
   const out = o && typeof o === 'object' ? { ...o } : {}
   if (typeof out.thought !== 'string') out.thought = fallbackText.trim().slice(0, 2000) || '(no output)'
   if (!out.transition || typeof out.transition !== 'object') out.transition = { to_prompt: null }
+  // The model is told to set a baton's `reply_to` to a `message_id`, which is naturally NUMERIC — so it
+  // often emits `reply_to: 273` (a JSON number). Rust's `BatonIntent.reply_to` is `Option<String>` and
+  // serde rejects an integer ("invalid type: integer 273, expected a string") → the whole cycle fails to
+  // parse. Coerce id-like baton fields to strings so a numeric id can't kill a dispatch.
+  if (Array.isArray(out.batons)) {
+    for (const b of out.batons) {
+      if (b && typeof b.reply_to === 'number') b.reply_to = String(b.reply_to)
+    }
+  }
   return out
 }
 

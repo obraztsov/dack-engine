@@ -516,9 +516,38 @@ impl Harness {
         // even an offered hop (enforced post-step in `dispatch`).
         let reachable = self.reachable_transitions(prompt, ceiling).await;
 
+        // STICKY SESSION (resume-by-id): a prompt with `session.sticky` reuses + resumes the engine
+        // session for its key `(prompt-id, taint, …dims)` across items, accumulating context. The
+        // FIREBREAK still holds — a different state-prompt is a different key (so Express never
+        // resumes Perceive's session), and only the digested Baton gist crosses. `None` = fresh.
+        // Resolved BEFORE block assembly so the blocks are resume-aware (a resume drops the memory the
+        // session already carries + sends the runlog as a small diff since its `last_used` watermark).
+        let session_key = prompt
+            .session
+            .as_ref()
+            .filter(|s| s.sticky)
+            .map(|s| sticky_session_key(&prompt.id, cycle_trust, &s.key, stimulus));
+        let resume = match &session_key {
+            Some(key) => {
+                let r = self.sticky_resume(key);
+                eprintln!(
+                    "sticky[{key}]: {}",
+                    match &r {
+                        Some((id, _)) => format!("RESUME session {id}"),
+                        None => "fresh session".into(),
+                    }
+                );
+                r
+            }
+            None => None,
+        };
+        let is_resume = resume.is_some();
+        let watermark = resume.as_ref().map(|(_, ts)| *ts);
+
         // ORIENTATION first (where am I · what may I do here · what's plugged · how far this cycle
         // walks) — grounds the model so it stops guessing paths / out-of-scope tools. Then the
-        // state's own context (directive+payload, or the digested Baton). Then allowed transitions.
+        // state's own context (directive+payload + memory/runlog, or the digested Baton). Then
+        // allowed transitions.
         let mut blocks = vec![orientation_block(
             prompt,
             &self.soul_root(),
@@ -526,12 +555,7 @@ impl Harness {
             cycle_trust,
             ceiling,
         )];
-        match step {
-            // ENTRY: directive (trusted) + payload (untrusted) kept SEPARATE + memory + runlog.
-            StepInput::Entry => blocks.extend(self.entry_blocks(stimulus).await),
-            // ACT: the agent's own digested product + harness-trusted refs — NOT raw bytes.
-            StepInput::Act(baton) => blocks.push(baton_block(baton)),
-        }
+        blocks.extend(self.context_blocks(step, stimulus, is_resume, watermark, &prompt.context()).await);
         blocks.push(transitions_block(&reachable));
         // The agent never receives a raw secret env (TIER-4): capability tokens are injected into
         // the MCP transport server-side, never the agent's context. Sensor secrets live in ingest.
@@ -548,39 +572,15 @@ impl Harness {
             .flatten()
             .or_else(|| policy.model.clone());
 
-        // STICKY SESSION (resume-by-id): a prompt with `session.sticky` reuses + resumes the engine
-        // session for its key `(prompt-id, taint, …dims)` across items, accumulating context. The
-        // FIREBREAK still holds — a different state-prompt is a different key (so Express never
-        // resumes Perceive's session), and only the digested Baton gist crosses. `None` = fresh.
-        let session_key = prompt
-            .session
-            .as_ref()
-            .filter(|s| s.sticky)
-            .map(|s| sticky_session_key(&prompt.id, cycle_trust, &s.key, stimulus));
-        let resume = match &session_key {
-            Some(key) => {
-                let r = self.sticky_resume(key);
-                eprintln!(
-                    "sticky[{key}]: {}",
-                    match &r {
-                        Some(id) => format!("RESUME session {id}"),
-                        None => "fresh session".into(),
-                    }
-                );
-                r
-            }
-            None => None,
-        };
-
         // Built AFTER the resume lookup: a sticky RESUME gets the lean `resume_body`, a fresh run the
-        // full body. (`is_some()` borrows `resume`; it's moved into `session` just below.)
-        let system_prompt = self.system_prompt_for_prompt(prompt, resume.is_some()).await;
+        // full body.
+        let system_prompt = self.system_prompt_for_prompt(prompt, is_resume).await;
         let req = InvocationRequest {
             system_prompt,
             spec: spec.clone(),
             blocks,
             // Fresh session by default (the firebreak); a sticky prompt resumes its keyed session.
-            session: resume.map(SessionId),
+            session: resume.map(|(id, _)| SessionId(id)),
             workdir: Some(self.soul_root()),
             secret_env,
             mcp_servers,
@@ -714,12 +714,15 @@ impl Harness {
 
     /// Resume the engine session for a sticky `key`, if one is live and within the idle TTL. A stale
     /// entry is evicted (→ fresh session). Returns the `session_id` to resume, or `None` for fresh.
-    fn sticky_resume(&self, key: &str) -> Option<String> {
+    /// Resume a live sticky session: returns `(session_id, last_used)` — `last_used` is the previous
+    /// wake's unix time, the watermark for the runlog "while you slept" diff. `None` = no live session
+    /// (fresh), incl. an evicted-stale one.
+    fn sticky_resume(&self, key: &str) -> Option<(String, i64)> {
         let now = chrono::Utc::now().timestamp();
         let ttl = self.config.session_ttl_secs;
         let mut map = self.sessions.lock().unwrap();
         match map.get(key) {
-            Some((sid, last)) if ttl <= 0 || now - last < ttl => Some(sid.clone()),
+            Some((sid, last)) if ttl <= 0 || now - last < ttl => Some((sid.clone(), *last)),
             Some(_) => {
                 map.remove(key); // stale → drop so the next run starts a fresh session
                 None
@@ -1013,36 +1016,79 @@ impl Harness {
         (out, inline_read)
     }
 
-    /// The ENTRY-step context blocks (MCP2-B): the directive (trusted intent) and the payload
-    /// (untrusted world) as SEPARATE, visibly-framed blocks — the §5.3 rule carried into context
-    /// assembly — plus a **short** tail of the duck's own memory and the recent runlog for
-    /// continuity (PRD §6.1: seed a summary, not full memory; the agent pulls more via file tools).
-    /// The caller ([`run_step`](Self::run_step)) appends the allowed-transitions block.
-    async fn entry_blocks(&self, stimulus: &Stimulus) -> Vec<ContextBlock> {
-        vec![
-            ContextBlock {
-                label: "standing-directive".into(),
-                body: stimulus.directive_body.clone(),
-                trusted: true,
-            },
-            ContextBlock {
-                label: "world-payload".into(),
-                body: stimulus.payload.to_string(),
-                trusted: false, // delimited as untrusted regardless of content.
-            },
-            ContextBlock {
-                label: "memory-recent".into(),
-                body: self.memory_tail(40).await,
-                trusted: true, // the duck's own self-authored notes (not world data).
-            },
-            ContextBlock {
-                label: "runlog-recent".into(),
-                // Harness-authored one-line records — NO raw payload (that stays in the
-                // runlog body the agent must *choose* to read via runlog_ref).
-                body: self.runlog.tail(20).await.unwrap_or_default(),
-                trusted: true,
-            },
-        ]
+    /// The state's context blocks, **resume-aware** (the de-bloat that keeps a sticky session coherent):
+    /// - ENTRY (Perceive): directive (trusted intent) + payload (untrusted world) as SEPARATE blocks
+    ///   (§5.3) — always. Plus, on a FRESH wake only, a memory tail (grounding) + the runlog tail. On a
+    ///   RESUME, memory is DROPPED (the session already carries it; the duck `Read`s `memory/` on demand)
+    ///   and the runlog becomes the small **diff since the session's last wake** (`watermark`).
+    /// - ACT (Express): the digested Baton (never raw bytes) — always. Plus, on a RESUME, the runlog
+    ///   **diff** so the duck knows what it did while away (instead of confabulating it). A fresh Act stays
+    ///   clean (baton only).
+    /// `ctx` (the prompt's `context:` knobs) can suppress memory and/or runlog entirely. An empty runlog
+    /// diff yields no block (no noise). The caller appends orientation (before) + transitions (after).
+    async fn context_blocks(
+        &self,
+        step: &StepInput,
+        stimulus: &Stimulus,
+        is_resume: bool,
+        watermark: Option<i64>,
+        ctx: &crate::state_prompt::ContextConfig,
+    ) -> Vec<ContextBlock> {
+        let mut out = Vec::new();
+        match step {
+            StepInput::Entry => {
+                out.push(ContextBlock {
+                    label: "standing-directive".into(),
+                    body: stimulus.directive_body.clone(),
+                    trusted: true,
+                });
+                out.push(ContextBlock {
+                    label: "world-payload".into(),
+                    body: stimulus.payload.to_string(),
+                    trusted: false, // delimited as untrusted regardless of content.
+                });
+                // Memory: FRESH grounding only — never re-injected on a resume (the session holds it).
+                if ctx.memory && !is_resume {
+                    out.push(ContextBlock {
+                        label: "memory-recent".into(),
+                        body: self.memory_tail(40).await,
+                        trusted: true, // the duck's own self-authored notes (not world data).
+                    });
+                }
+                if ctx.runlog {
+                    if let Some(b) = self.runlog_block(is_resume, watermark).await {
+                        out.push(b);
+                    }
+                }
+            }
+            StepInput::Act(baton) => {
+                out.push(baton_block(baton));
+                // A resumed Act gets the "while you slept" runlog diff; a fresh Act stays baton-only.
+                if ctx.runlog && is_resume {
+                    if let Some(b) = self.runlog_block(true, watermark).await {
+                        out.push(b);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The runlog context block: on a FRESH wake the recent tail (continuity grounding); on a RESUME the
+    /// **diff** since the session's `watermark` (only what happened while it slept). `None` when the diff
+    /// is empty (nothing to say → no noise). Harness-authored one-liners — NO raw payload (the agent opens
+    /// a full entry via `runlog_ref` if it wants it).
+    async fn runlog_block(&self, is_resume: bool, watermark: Option<i64>) -> Option<ContextBlock> {
+        let (label, body) = if is_resume {
+            let since = watermark.unwrap_or(0);
+            ("runlog-since-last-wake", self.runlog.tail_since(since, 20).await.unwrap_or_default())
+        } else {
+            ("runlog-recent", self.runlog.tail(10).await.unwrap_or_default())
+        };
+        if body.trim().is_empty() {
+            return None;
+        }
+        Some(ContextBlock { label: label.into(), body, trusted: true })
     }
 
     /// A state-prompt's system prompt = **SOUL.md** (the constant self) + the state-prompt's own
@@ -1201,6 +1247,20 @@ const BATON_CONTINUATION_TYPE: &str = "baton-continuation";
 /// product + accumulated trust) rides in `payload`; `payload_tier` carries the branch trust so
 /// dispatch reseeds from it; `priority` is the clamped scheduling priority; `depth` bounds recursion.
 #[allow(clippy::too_many_arguments)]
+/// The reply-destination scalars from a stimulus payload (`chat_id`, `message_id`, … — the top-level
+/// fields `scope_env` reads), WITHOUT the bulky `items` batch array. Used as a deferred baton's scope
+/// fallback so it threads to the same "latest" destination an in-wake reply would. `None` if the payload
+/// isn't an object. Env-only (never rendered to the model), same trust class as a `scope_override` item.
+fn origin_reply_scope(payload: &serde_json::Value) -> Option<serde_json::Value> {
+    let obj = payload.as_object()?;
+    let scalars: serde_json::Map<String, serde_json::Value> = obj
+        .iter()
+        .filter(|(_, v)| !v.is_array() && !v.is_object())
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    (!scalars.is_empty()).then(|| serde_json::Value::Object(scalars))
+}
+
 fn continuation_stimulus(
     origin: &Stimulus,
     dest_prompt: &str,
@@ -1218,9 +1278,18 @@ fn continuation_stimulus(
         type_: StimulusType::from(BATON_CONTINUATION_TYPE),
         directive_tier: origin.directive_tier.clone(),
         payload_tier: trust,
-        // `scope` carries the deferred reply target (the selected item) so a deferred reply still
-        // threads to the right message. Internal harness state — never rendered to the model.
-        payload: serde_json::json!({ "baton": baton, "depth": depth, "scope": scope_override }),
+        // `scope` carries the deferred reply DESTINATION so the continuation can resolve `scope_env`
+        // (the reply MCP's chat/message lock) — an in-wake express reads this off the live telegram
+        // stimulus, but a deferred one's stimulus is THIS synthetic continuation (no `chat_id`), so we
+        // must carry it. Prefer the explicit per-baton target (a selected in-batch item); else fall back
+        // to the origin's hoisted reply scalars (the "latest" destination) — WITHOUT that fallback, a
+        // `priority:low` reply with no explicit `reply_to` deferred to the queue loses its destination
+        // ("no source chat in scope"). Internal harness state — never rendered to the model.
+        payload: serde_json::json!({
+            "baton": baton,
+            "depth": depth,
+            "scope": scope_override.cloned().or_else(|| origin_reply_scope(&origin.payload)),
+        }),
         provenance: None,
         received_at: now,
         dedup_key: None,
@@ -2481,9 +2550,13 @@ mod tests {
             sessions: Default::default(),
         };
 
-        // Self-tier so the settle branch is within the ceiling.
+        // Self-tier so the settle branch is within the ceiling. Chat-shaped payload (hoisted scalars +
+        // an `items` batch array) so we can check the deferred continuation keeps the reply destination.
         let mut stim = poisoned_stimulus();
         stim.payload_tier = TrustTier::self_();
+        stim.payload = serde_json::json!({
+            "chat_id": 80375347i64, "message_id": 379, "text": "x", "items": [{"message_id": 1}]
+        });
         harness.dispatch(stim).await.unwrap();
 
         // In-wake: perceive + express ran (2). The Low settle baton was DEFERRED, not run in-wake.
@@ -2492,6 +2565,13 @@ mod tests {
         let cont = queue.next().await.unwrap().expect("a deferred continuation is queued");
         assert_eq!(cont.type_.0, "baton-continuation");
         assert_eq!(cont.entry, "settle");
+        // The deferred baton had NO explicit reply_to → its `scope` falls back to the origin's reply
+        // scalars, so the deferred reply still resolves its chat (the "no source chat in scope" bug). The
+        // bulky `items` array is stripped — scope is env-only, not the whole batch.
+        let scope = cont.payload.get("scope").expect("continuation carries a scope");
+        assert_eq!(scope.get("chat_id").and_then(|v| v.as_i64()), Some(80375347), "scope keeps the origin chat");
+        assert_eq!(scope.get("message_id").and_then(|v| v.as_i64()), Some(379), "scope keeps the latest message");
+        assert!(scope.get("items").is_none(), "the batch `items` array is stripped from the carried scope");
 
         // Dispatching it runs the settle act-state on the carried baton (no re-perceive).
         harness.dispatch(cont).await.unwrap();
@@ -2829,6 +2909,7 @@ mod tests {
             model: None,
             session: None,
             reply_key: None,
+            context: None,
             body: String::new(),
             resume_body: None,
         };
@@ -2955,7 +3036,7 @@ mod tests {
         // OPEN perceive: the inline public MCP is admitted, read-tier, with its wall prefix.
         let open = StatePrompt {
             id: "p".into(), state: ConsciousnessState::Perceive,
-            mcp: vec![inline(), McpRef::Import("cove-read".into())], transitions: vec![], model: None, session: None, reply_key: None, body: String::new(), resume_body: None,
+            mcp: vec![inline(), McpRef::Import("cove-read".into())], transitions: vec![], model: None, session: None, reply_key: None, context: None, body: String::new(), resume_body: None,
         };
         let (servers, inline_read) = harness.assemble_mcp_servers(&open, &stim, &TrustTier::self_(), None).await;
         assert!(servers.contains_key("rootai"), "inline admitted on an open tier");
@@ -2968,7 +3049,7 @@ mod tests {
         // LOCKED express (unconfigured → default locked): the same inline is rejected.
         let locked = StatePrompt {
             id: "e".into(), state: ConsciousnessState::Express,
-            mcp: vec![inline()], transitions: vec![], model: None, session: None, reply_key: None, body: String::new(), resume_body: None,
+            mcp: vec![inline()], transitions: vec![], model: None, session: None, reply_key: None, context: None, body: String::new(), resume_body: None,
         };
         let (servers, inline_read) = harness.assemble_mcp_servers(&locked, &stim, &TrustTier::self_(), None).await;
         assert!(servers.is_empty() && inline_read.is_empty(), "no self-plug on a locked tier");
@@ -3017,7 +3098,7 @@ mod tests {
         let stim = poisoned_stimulus();
         let express = StatePrompt {
             id: "e".into(), state: ConsciousnessState::Express,
-            mcp: vec![McpRef::Import("telegram".into())], transitions: vec![], model: None, session: None, reply_key: None, body: String::new(), resume_body: None,
+            mcp: vec![McpRef::Import("telegram".into())], transitions: vec![], model: None, session: None, reply_key: None, context: None, body: String::new(), resume_body: None,
         };
 
         // public cycle (rank 0) < org (rank 1) → telegram WITHHELD.
@@ -3098,7 +3179,7 @@ mod tests {
         let express = StatePrompt {
             id: "e".into(), state: ConsciousnessState::Express,
             mcp: vec![McpRef::Import("telegram".into())], transitions: vec![], model: None, session: None,
-            reply_key: None, body: String::new(), resume_body: None,
+            reply_key: None, context: None, body: String::new(), resume_body: None,
         };
 
         // No override → the top-level latest (message_id 20).
@@ -3305,6 +3386,7 @@ mod tests {
             model: Some(model.into()),
             session: None,
             reply_key: None,
+            context: None,
             body: "go".into(),
             resume_body: None,
         };
@@ -3388,6 +3470,7 @@ mod tests {
             model: None,
             session: Some(SessionConfig { sticky: true, key: vec!["thread_id".into()] }),
             reply_key: None,
+            context: None,
             body: "FULL-BODY-go".into(),
             resume_body: Some("LEAN-RESUME-only-new".into()),
         };
@@ -3424,6 +3507,15 @@ mod tests {
             seen[2].system_prompt.contains("FULL-BODY-go"),
             "a different thread's fresh item uses the full body again"
         );
+
+        // Resume-aware blocks: memory is grounding on a FRESH wake, DROPPED on a resume; the runlog
+        // appears as the "while you slept" diff once there's prior runlog to diff against.
+        let has = |i: usize, label: &str| seen[i].blocks.iter().any(|b| b.label == label);
+        assert!(has(0, "memory-recent"), "fresh wake carries the memory block (grounding)");
+        assert!(!has(1, "memory-recent"), "RESUME drops memory (the session already has it)");
+        assert!(has(1, "runlog-since-last-wake"), "RESUME injects the runlog DIFF block");
+        assert!(!has(1, "runlog-recent"), "a resume uses the diff label, not the fresh tail");
+        assert!(has(2, "memory-recent"), "a different thread's fresh wake carries memory again");
 
         std::fs::remove_dir_all(&tmp).ok();
     }

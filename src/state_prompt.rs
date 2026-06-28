@@ -61,6 +61,29 @@ pub struct SessionConfig {
     pub key: Vec<String>,
 }
 
+fn default_true() -> bool {
+    true
+}
+
+/// What context blocks a state-prompt wants injected (de-bloat knobs; resume-awareness is automatic).
+/// Absent ⇒ both true. `memory` injects the memory tail on a FRESH wake only (never re-sent on a sticky
+/// resume — the session already carries it; the duck `Read`s `memory/` on demand). `runlog` injects the
+/// runlog: the recent tail on a fresh Entry wake, the **diff since last wake** on a resume; `false` = never
+/// (a prompt that doesn't want runlog noise at all).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextConfig {
+    #[serde(default = "default_true")]
+    pub memory: bool,
+    #[serde(default = "default_true")]
+    pub runlog: bool,
+}
+
+impl Default for ContextConfig {
+    fn default() -> Self {
+        Self { memory: true, runlog: true }
+    }
+}
+
 /// The YAML frontmatter of a `prompts/**/*.md` state-prompt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatePromptFrontmatter {
@@ -88,6 +111,9 @@ pub struct StatePromptFrontmatter {
     /// twitter prompt would set `reply_key: id`.
     #[serde(default)]
     pub reply_key: Option<String>,
+    /// De-bloat knobs for the injected context blocks (memory/runlog). `None` ⇒ both on.
+    #[serde(default)]
+    pub context: Option<ContextConfig>,
 }
 
 /// A parsed state-prompt: its id (path), frontmatter, and the trusted directive body.
@@ -104,6 +130,8 @@ pub struct StatePrompt {
     pub session: Option<SessionConfig>,
     /// The reply-identifier field a baton's `reply_to` is matched against (default `message_id`→`id`).
     pub reply_key: Option<String>,
+    /// De-bloat knobs for the injected context blocks (memory/runlog). `None` ⇒ both on (`ContextConfig::default`).
+    pub context: Option<ContextConfig>,
     /// The directive text (the body below the frontmatter fence, up to a `---resume---` marker if any).
     /// Sent as the system-prompt body on a FRESH session. Trusted.
     pub body: String,
@@ -131,9 +159,15 @@ impl StatePrompt {
             model: fm.model,
             session: fm.session,
             reply_key: fm.reply_key,
+            context: fm.context,
             body,
             resume_body,
         })
+    }
+
+    /// The context-block knobs for this prompt (memory/runlog), or the all-on default.
+    pub fn context(&self) -> ContextConfig {
+        self.context.clone().unwrap_or_default()
     }
 
     /// The payload-item field(s) a baton's `reply_to` is matched against (the reply identifier). The
@@ -201,6 +235,19 @@ mod tests {
         assert_eq!(sp.state, ConsciousnessState::Settle);
         assert!(sp.mcp.is_empty());
         assert!(sp.transitions.is_empty());
+    }
+
+    #[test]
+    fn context_config_parses_and_defaults_all_on() {
+        // Absent → default (both on).
+        let sp = StatePrompt::parse("p", "---\nstate: perceive\n---\nx").unwrap();
+        assert!(sp.context.is_none());
+        let c = sp.context();
+        assert!(c.memory && c.runlog, "unconfigured = both on");
+        // Declared partial → the named field overrides, the other defaults true.
+        let sp = StatePrompt::parse("p", "---\nstate: perceive\ncontext: { runlog: false }\n---\nx").unwrap();
+        let c = sp.context();
+        assert!(c.memory && !c.runlog, "runlog off, memory still defaults on");
     }
 
     #[test]

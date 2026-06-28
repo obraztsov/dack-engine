@@ -49,6 +49,15 @@ test('multi-object batons are CONCATENATED, not dropped (later-wins would lose s
   expect(out.batons.map((b: any) => b.reply_to)).toEqual(['10', '20'])
 })
 
+test('a NUMERIC baton reply_to is coerced to a string (Rust expects Option<String>)', () => {
+  // The model emits the message_id as a JSON number; an integer would crash the Rust deserialize.
+  const out: any = parseOutput(
+    '{"thought":"t","batons":[{"to_prompt":"telegram/express","reply_to":273,"gist":"reply"}]}',
+  )
+  expect(out.batons[0].reply_to).toBe('273')
+  expect(typeof out.batons[0].reply_to).toBe('string')
+})
+
 test('total garbage logs loudly and terminates (to_prompt null), never silently', () => {
   const logs: string[] = []
   const out: any = parseOutput('the model rambled with no json at all', (m) => logs.push(m))

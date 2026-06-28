@@ -626,6 +626,14 @@ pub struct DackConfig {
     /// scheme unless `kind` overrides it.
     #[serde(default)]
     pub soul_remotes: Vec<SoulRemote>,
+    /// **Runlog push destination** (optional) — the runlogs live in their OWN private git repo
+    /// (`<soul>/runlogs/`, gitignored by the soul) so they never reach the PUBLIC soul (they carry chat
+    /// detail + telegram handles). `None` ⇒ local-only (the repo stays on the box, disposable: a corrupt
+    /// repo is wiped + re-init'd fresh). `Some` ⇒ also push there (e.g. a hosting-provided PRIVATE repo),
+    /// which then becomes the durable backup a corrupt local repo is re-cloned from. Same spec as a
+    /// `soul_remotes` entry (url/kind/node/identity/auth).
+    #[serde(default)]
+    pub runlog_remote: Option<SoulRemote>,
     /// Wall-clock budget (seconds) for one consciousness invocation, incl. the wall round-trips.
     /// A hung LLM/bridge elapses here rather than freezing the single-flight loop (PRD §11.8).
     #[serde(default = "default_invoke_timeout_secs")]

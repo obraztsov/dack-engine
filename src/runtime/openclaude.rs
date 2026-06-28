@@ -99,10 +99,14 @@ enum FromBridge {
     },
     /// The run finished; `output` is the agent's `submit`ted structured proposal. `session_id` is
     /// the engine session this run ran in (for sticky-session resume), when the bridge reports it.
+    /// `usage` is the SDK's token accounting for this turn — its `input_tokens` + `cache_read_input_tokens`
+    /// = the resumed CONTEXT size, which the harness uses to size-evict a bloated sticky session.
     Result {
         output: AgentOutput,
         #[serde(default)]
         session_id: Option<String>,
+        #[serde(default)]
+        usage: Option<super::InvokeUsage>,
     },
     /// The run failed inside the engine/bridge.
     Error { message: String },
@@ -248,7 +252,7 @@ impl RuntimeClient for OpenClaudeClient {
         &self,
         req: InvocationRequest,
         responder: Arc<dyn ActionResponder>,
-    ) -> Result<(AgentOutput, Option<SessionId>)> {
+    ) -> Result<(AgentOutput, Option<SessionId>, Option<super::InvokeUsage>)> {
         // Per-invocation model (8.7) routed to the channel the engine reads (see [`resolve_model_env`]):
         // on an OpenAI-compatible gateway the model goes to the child's `OPENAI_MODEL` env (the SDK
         // rejects a gateway name as `options.model`); on the Anthropic catalog it goes to `options.model`.
@@ -404,8 +408,8 @@ impl RuntimeClient for OpenClaudeClient {
                         )
                         .await?;
                     }
-                    FromBridge::Result { output, session_id } => {
-                        return Ok((output, session_id.map(SessionId)))
+                    FromBridge::Result { output, session_id, usage } => {
+                        return Ok((output, session_id.map(SessionId), usage))
                     }
                     FromBridge::Error { message } => return Err(DackError::Runtime(message)),
                     FromBridge::Log { message } => eprintln!("[bridge] {message}"),
@@ -559,7 +563,7 @@ mod tests {
             asked: Mutex::new(vec![]),
             allow: false,
         });
-        let (out, _) = client.invoke(perceive_req(), rec.clone()).await.unwrap();
+        let (out, _, _) = client.invoke(perceive_req(), rec.clone()).await.unwrap();
 
         assert_eq!(out.thought, "done");
         assert!(out.transition.to_prompt.is_none());
@@ -578,7 +582,7 @@ mod tests {
             asked: Mutex::new(vec![]),
             allow: true,
         });
-        let (out, _) = client.invoke(perceive_req(), rec).await.unwrap();
+        let (out, _, _) = client.invoke(perceive_req(), rec).await.unwrap();
         assert_eq!(out.thought, "hi");
         assert_eq!(out.proposal.unwrap().gist, "g");
     }

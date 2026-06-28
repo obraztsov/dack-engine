@@ -27,10 +27,19 @@ pub trait RunLogWriter: Send + Sync {
     async fn tail(&self, max_entries: usize) -> Result<String>;
 
     /// The runlog **diff** since `since_ts`: heading one-liners of entries whose `timestamp` is strictly
-    /// greater than `since_ts`, most-recent-capped at `max_entries`. Feeds a sticky **resume** the small
-    /// "what happened while this session slept" delta (vs `tail`'s fixed window), so a resumed cycle isn't
-    /// re-fed the whole history every wake. Empty when nothing newer exists.
-    async fn tail_since(&self, since_ts: i64, max_entries: usize) -> Result<String>;
+    /// Filtered tail — the heading one-liners of entries, most-recent-capped at `max_entries`, optionally
+    /// gated by time and/or tag:
+    /// - `since = Some(ts)` keeps only entries with `timestamp > ts` (the "while you slept" diff); `None`
+    ///   = no time gate (a plain recent tail).
+    /// - `tag = Some(t)` keeps only entries whose `tags` contain `t` (a conversation/topic view); `None`
+    ///   = the global view.
+    /// Consecutive duplicates are collapsed. Empty when nothing matches.
+    async fn tail_filtered(
+        &self,
+        since: Option<i64>,
+        max_entries: usize,
+        tag: Option<&str>,
+    ) -> Result<String>;
 }
 
 /// Collapse consecutive identical lines (a cheap de-bloat: a runlog tail is often N identical
@@ -45,20 +54,44 @@ fn dedup_consecutive(lines: &[&str]) -> Vec<String> {
     out
 }
 
-/// Parse a rendered runlog into `(heading, timestamp)` pairs in file order. A heading is a `## …` line;
-/// its timestamp is the `- timestamp: N` line that follows before the next heading (0 if absent).
-fn headings_with_timestamps(text: &str) -> Vec<(&str, i64)> {
-    let mut out: Vec<(&str, i64)> = Vec::new();
+/// One parsed runlog entry's metadata (file order): its `## …` heading, the `- timestamp: N` line that
+/// follows (0 if absent), and the comma-separated `- tags: a, b` line (empty if absent).
+struct EntryMeta<'a> {
+    heading: &'a str,
+    timestamp: i64,
+    tags: Vec<&'a str>,
+}
+
+fn entries_meta(text: &str) -> Vec<EntryMeta<'_>> {
+    let mut out: Vec<EntryMeta<'_>> = Vec::new();
     for line in text.lines() {
         if let Some(h) = line.strip_prefix("## ") {
-            out.push((h, 0));
+            out.push(EntryMeta { heading: h, timestamp: 0, tags: Vec::new() });
         } else if let Some(ts) = line.strip_prefix("- timestamp: ") {
             if let (Some(last), Ok(n)) = (out.last_mut(), ts.trim().parse::<i64>()) {
-                last.1 = n;
+                last.timestamp = n;
+            }
+        } else if let Some(tags) = line.strip_prefix("- tags: ") {
+            if let Some(last) = out.last_mut() {
+                last.tags = tags.split(',').map(str::trim).filter(|t| !t.is_empty()).collect();
             }
         }
     }
     out
+}
+
+/// Shared filter-and-render: heading one-liners of entries matching the optional time + tag gates,
+/// deduped, most-recent-capped. Used by every `tail*` reader over a rendered runlog.
+fn filter_headings(text: &str, since: Option<i64>, max: usize, tag: Option<&str>) -> String {
+    let kept: Vec<&str> = entries_meta(text)
+        .into_iter()
+        .filter(|e| since.map_or(true, |s| e.timestamp > s))
+        .filter(|e| tag.map_or(true, |t| e.tags.iter().any(|et| *et == t)))
+        .map(|e| e.heading)
+        .collect();
+    let deduped = dedup_consecutive(&kept);
+    let start = deduped.len().saturating_sub(max);
+    deduped[start..].join("\n")
 }
 
 /// Daily-file writer over the [`RepoHost`](crate::repo::RepoHost) seam (durable, off-VPS,
@@ -99,6 +132,10 @@ impl DailyFileRunLog {
             entry.run_id, entry.state, tag, entry.context_summary
         ));
         s.push_str(&format!("- timestamp: {}\n", entry.timestamp));
+        // Conversation/topic tags (parsed back by `entries_meta` for the tagged context views).
+        if !entry.tags.is_empty() {
+            s.push_str(&format!("- tags: {}\n", entry.tags.join(", ")));
+        }
         // The digested output (the input→proposal mapping; the firebreak's product, not raw).
         if let Some(out) = &entry.output {
             s.push_str(&format!("- thought: {}\n", out.thought.replace('\n', " ")));
@@ -173,37 +210,21 @@ impl RunLogWriter for DailyFileRunLog {
     }
 
     async fn tail(&self, max_entries: usize) -> Result<String> {
-        let date = Self::today();
-        let path = RepoPath(format!("{date}.md"));
-        let text = String::from_utf8_lossy(&self.repo.read_file(&path).await.unwrap_or_default())
-            .into_owned();
-        // Return the last `max_entries` heading one-liners — a compact, harness-authored summary
-        // (NO raw payload; the agent must *choose* to open the full entry via `runlog_ref`), with
-        // consecutive duplicates collapsed (N identical `…: ok` lines are pure context noise).
-        let headings: Vec<&str> = text
-            .lines()
-            .filter(|l| l.starts_with("## "))
-            .map(|l| l.trim_start_matches("## "))
-            .collect();
-        let deduped = dedup_consecutive(&headings);
-        let start = deduped.len().saturating_sub(max_entries);
-        Ok(deduped[start..].join("\n"))
+        // The recent global tail (`dack log` + the fresh "environment" view): no time/tag gate.
+        self.tail_filtered(None, max_entries, None).await
     }
 
-    async fn tail_since(&self, since_ts: i64, max_entries: usize) -> Result<String> {
+    async fn tail_filtered(
+        &self,
+        since: Option<i64>,
+        max_entries: usize,
+        tag: Option<&str>,
+    ) -> Result<String> {
         let date = Self::today();
         let path = RepoPath(format!("{date}.md"));
         let text = String::from_utf8_lossy(&self.repo.read_file(&path).await.unwrap_or_default())
             .into_owned();
-        // Only entries newer than the watermark (the session's last wake) — the "while you slept" diff.
-        let fresh: Vec<&str> = headings_with_timestamps(&text)
-            .into_iter()
-            .filter(|(_, ts)| *ts > since_ts)
-            .map(|(h, _)| h)
-            .collect();
-        let deduped = dedup_consecutive(&fresh);
-        let start = deduped.len().saturating_sub(max_entries);
-        Ok(deduped[start..].join("\n"))
+        Ok(filter_headings(&text, since, max_entries, tag))
     }
 }
 
@@ -258,9 +279,14 @@ impl RunLogWriter for FileRunLog {
         Ok(lines[start..].join("\n"))
     }
 
-    /// This minimal writer's compact one-line format carries no timestamp, so it can't filter by
-    /// watermark — fall back to the recent tail. (Production runlogs use `DailyFileRunLog`.)
-    async fn tail_since(&self, _since_ts: i64, max_entries: usize) -> Result<String> {
+    /// This minimal writer's compact one-line format carries no timestamp/tags, so it can't filter —
+    /// fall back to the recent tail. (Production runlogs use `DailyFileRunLog`.)
+    async fn tail_filtered(
+        &self,
+        _since: Option<i64>,
+        max_entries: usize,
+        _tag: Option<&str>,
+    ) -> Result<String> {
         self.tail(max_entries).await
     }
 }
@@ -284,6 +310,7 @@ mod tests {
             output: None,
             outcome: Outcome::Ok,
             timestamp: 1000,
+            tags: vec![],
         }
     }
 
@@ -346,17 +373,20 @@ mod tests {
     }
 
     #[test]
-    fn dedup_collapses_consecutive_and_headings_parse_timestamps() {
+    fn dedup_and_entries_meta_parse_timestamps_and_tags() {
         let lines = vec!["a", "a", "b", "a", "a"];
         assert_eq!(dedup_consecutive(&lines), vec!["a", "b", "a"], "only CONSECUTIVE dups collapse");
 
-        let text = "# runlog\n\n## run-1 · Perceive · OK\n- timestamp: 100\n- thought: x\n\n## run-2 · Express · OK\n- timestamp: 200\n";
-        let hs = headings_with_timestamps(text);
-        assert_eq!(hs, vec![("run-1 · Perceive · OK", 100), ("run-2 · Express · OK", 200)]);
+        let text = "# runlog\n\n## run-1 · Perceive · OK\n- timestamp: 100\n- tags: chatA, topicX\n- thought: x\n\n## run-2 · Express · OK\n- timestamp: 200\n";
+        let m = entries_meta(text);
+        assert_eq!(m.len(), 2);
+        assert_eq!((m[0].heading, m[0].timestamp), ("run-1 · Perceive · OK", 100));
+        assert_eq!(m[0].tags, vec!["chatA", "topicX"]);
+        assert_eq!((m[1].heading, m[1].timestamp, m[1].tags.len()), ("run-2 · Express · OK", 200, 0));
     }
 
     #[tokio::test]
-    async fn tail_since_returns_only_the_diff_after_the_watermark() {
+    async fn tail_filtered_gates_by_time_and_tag() {
         let dir = std::env::temp_dir().join(format!("dack-since-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
@@ -370,14 +400,20 @@ mod tests {
         let repo = std::sync::Arc::new(crate::repo::git::PlainGitRepo::new(&dir, "did:dack:soul"));
         let log = DailyFileRunLog::new(repo, "did:dack:soul");
 
-        let mut a = entry("run-old"); a.timestamp = 1000; log.append(&a).await.unwrap();
-        let mut b = entry("run-new"); b.timestamp = 2000; log.append(&b).await.unwrap();
+        let mut a = entry("run-old"); a.timestamp = 1000; a.tags = vec!["chatA".into()]; log.append(&a).await.unwrap();
+        let mut b = entry("run-new"); b.timestamp = 2000; b.tags = vec!["chatB".into()]; log.append(&b).await.unwrap();
 
-        // Watermark between the two → only the newer entry is in the diff.
-        let diff = log.tail_since(1500, 10).await.unwrap();
-        assert!(diff.contains("run-new") && !diff.contains("run-old"), "diff = entries after the watermark only");
-        // Watermark past both → empty diff (nothing happened while away).
-        assert_eq!(log.tail_since(9999, 10).await.unwrap(), "");
+        // Time gate: watermark between the two → only the newer.
+        let diff = log.tail_filtered(Some(1500), 10, None).await.unwrap();
+        assert!(diff.contains("run-new") && !diff.contains("run-old"), "since = entries after the watermark");
+        // Watermark past both → empty.
+        assert_eq!(log.tail_filtered(Some(9999), 10, None).await.unwrap(), "");
+        // Tag gate: only chatA's entry, regardless of time.
+        let scoped = log.tail_filtered(None, 10, Some("chatA")).await.unwrap();
+        assert!(scoped.contains("run-old") && !scoped.contains("run-new"), "tag filter keeps only that tag");
+        // Combined: chatB AND newer than 1500 → run-new; chatA AND newer → empty (chatA is old).
+        assert!(log.tail_filtered(Some(1500), 10, Some("chatB")).await.unwrap().contains("run-new"));
+        assert_eq!(log.tail_filtered(Some(1500), 10, Some("chatA")).await.unwrap(), "");
 
         std::fs::remove_dir_all(&dir).ok();
     }

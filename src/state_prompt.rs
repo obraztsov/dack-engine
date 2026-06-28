@@ -65,22 +65,48 @@ fn default_true() -> bool {
     true
 }
 
+fn default_environment() -> usize {
+    10
+}
+
+/// How much runlog to inject, as TWO independent views (the de-bloat for sticky sessions):
+/// - `environment`: the GLOBAL recent tail (last N), FRESH wakes only — broad orientation across all
+///   activity. `0` = off. Dropped on a resume (the session already carries it; it's broad noise there).
+/// - `conversation`: the THIS-conversation view (entries tagged with the wake's `dedup_key`) — the recent
+///   tail on a FRESH wake, the **diff since last wake** on a resume. `0` = off. Needs `tag_key: true` to
+///   have anything tagged to filter.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunlogContext {
+    #[serde(default = "default_environment")]
+    pub environment: usize,
+    #[serde(default)]
+    pub conversation: usize,
+}
+
+impl Default for RunlogContext {
+    fn default() -> Self {
+        Self { environment: 10, conversation: 0 }
+    }
+}
+
 /// What context blocks a state-prompt wants injected (de-bloat knobs; resume-awareness is automatic).
-/// Absent ⇒ both true. `memory` injects the memory tail on a FRESH wake only (never re-sent on a sticky
-/// resume — the session already carries it; the duck `Read`s `memory/` on demand). `runlog` injects the
-/// runlog: the recent tail on a fresh Entry wake, the **diff since last wake** on a resume; `false` = never
-/// (a prompt that doesn't want runlog noise at all).
+/// `memory` injects the memory tail on a FRESH wake only (never re-sent on a sticky resume — the session
+/// already carries it; the duck `Read`s `memory/` on demand). `tag_key` auto-tags this prompt's runlog
+/// entries with the conversation key (`dedup_key`) so the `conversation` view can filter to them. `runlog`
+/// is the two-view config above.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextConfig {
     #[serde(default = "default_true")]
     pub memory: bool,
-    #[serde(default = "default_true")]
-    pub runlog: bool,
+    #[serde(default)]
+    pub tag_key: bool,
+    #[serde(default)]
+    pub runlog: RunlogContext,
 }
 
 impl Default for ContextConfig {
     fn default() -> Self {
-        Self { memory: true, runlog: true }
+        Self { memory: true, tag_key: false, runlog: RunlogContext::default() }
     }
 }
 
@@ -196,7 +222,7 @@ impl StatePrompt {
 /// and `None`. The marker shares the `---` of the frontmatter fence but `split_frontmatter` already
 /// consumed the leading `---\n…\n---\n` and matches the fence as exactly `\n---\n`, so `---resume---`
 /// in the body is never mistaken for it.
-fn split_resume(body: &str) -> (String, Option<String>) {
+pub fn split_resume(body: &str) -> (String, Option<String>) {
     match body.lines().position(|l| l.trim() == "---resume---") {
         Some(i) => {
             let lines: Vec<&str> = body.lines().collect();
@@ -238,16 +264,26 @@ mod tests {
     }
 
     #[test]
-    fn context_config_parses_and_defaults_all_on() {
-        // Absent → default (both on).
+    fn context_config_parses_tag_key_and_runlog_views() {
+        // Absent → defaults: memory on, no tag_key, environment 10, conversation 0.
         let sp = StatePrompt::parse("p", "---\nstate: perceive\n---\nx").unwrap();
         assert!(sp.context.is_none());
         let c = sp.context();
-        assert!(c.memory && c.runlog, "unconfigured = both on");
-        // Declared partial → the named field overrides, the other defaults true.
-        let sp = StatePrompt::parse("p", "---\nstate: perceive\ncontext: { runlog: false }\n---\nx").unwrap();
+        assert!(c.memory && !c.tag_key);
+        assert_eq!((c.runlog.environment, c.runlog.conversation), (10, 0));
+        // Declared → tag_key on + two-view runlog; unset fields keep their defaults.
+        let sp = StatePrompt::parse(
+            "p",
+            "---\nstate: perceive\ncontext: { tag_key: true, runlog: { environment: 40, conversation: 40 } }\n---\nx",
+        )
+        .unwrap();
         let c = sp.context();
-        assert!(c.memory && !c.runlog, "runlog off, memory still defaults on");
+        assert!(c.memory && c.tag_key);
+        assert_eq!((c.runlog.environment, c.runlog.conversation), (40, 40));
+        // Partial runlog → named field overrides, the other defaults.
+        let sp = StatePrompt::parse("p", "---\nstate: perceive\ncontext: { runlog: { conversation: 20 } }\n---\nx").unwrap();
+        let c = sp.context();
+        assert_eq!((c.runlog.environment, c.runlog.conversation), (10, 20));
     }
 
     #[test]

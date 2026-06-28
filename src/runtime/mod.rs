@@ -44,6 +44,26 @@ pub mod openclaude;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SessionId(pub String);
 
+/// Token accounting for one invocation (from the engine's usage report). `input_tokens` +
+/// `cache_read_input_tokens` ≈ the CONTEXT size the model just processed — which, on a sticky resume,
+/// is the whole accumulated session. The harness thresholds on `context_tokens()` to size-evict a
+/// session before it bloats (cost + degradation + confabulation). Extra engine fields are ignored.
+#[derive(Debug, Clone, Copy, Default, serde::Deserialize)]
+pub struct InvokeUsage {
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
+}
+
+impl InvokeUsage {
+    /// The resumed context size (fresh input + cache-read input). Cache-creation/output are excluded —
+    /// they're not "context already in the window".
+    pub fn context_tokens(&self) -> u64 {
+        self.input_tokens.saturating_add(self.cache_read_input_tokens)
+    }
+}
+
 /// A delimited block of context assembled for an invocation (PRD §6.1). The `trusted`
 /// flag drives the *visible* framing: trusted briefing vs untrusted world. Keeping
 /// directive (trusted) and payload (untrusted) as distinct blocks is the §5.3 rule
@@ -150,7 +170,7 @@ pub trait RuntimeClient: Send + Sync {
         &self,
         req: InvocationRequest,
         responder: std::sync::Arc<dyn ActionResponder>,
-    ) -> Result<(AgentOutput, Option<SessionId>)>;
+    ) -> Result<(AgentOutput, Option<SessionId>, Option<InvokeUsage>)>;
 
     /// The guest working dir a containerized worker runs at (e.g. `/workspace`), or `None` if this
     /// runtime has no worker isolation backend (Phase 14). The harness calls this to decide whether a

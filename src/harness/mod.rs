@@ -228,6 +228,8 @@ impl Harness {
             output: None,
             outcome: Outcome::Error(err.to_string()),
             timestamp: stimulus.received_at,
+            // Tag a dispatch-failure entry with its conversation so a chat's resume diff still sees it.
+            tags: stimulus.dedup_key.clone().into_iter().collect(),
         };
         let _ = self.runlog.append(&entry).await;
     }
@@ -593,10 +595,28 @@ impl Harness {
             mounts: Vec::new(),
             allowed_tools: None, // the duck uses the engine default; the wall gates every call.
         };
-        let (out, ran_session) = self.runtime.invoke(req, recorder.clone()).await?;
-        // Persist the engine session id for a sticky prompt, so the next item with the same key resumes it.
-        if let (Some(key), Some(sid)) = (&session_key, &ran_session) {
-            self.sticky_store(key, &sid.0);
+        let (out, ran_session, usage) = self.runtime.invoke(req, recorder.clone()).await?;
+        // Sticky-session bookkeeping. Persist the engine session id so the next item with the same key
+        // resumes it — UNLESS this turn's context has grown past `session_max_context_tokens`, in which
+        // case EVICT (don't store) so the next wake starts FRESH. Caps cost + the bloat that drives
+        // confabulation; a fresh session reconstructs via the conversation runlog view (and, later, recall).
+        if let Some(key) = &session_key {
+            let ctx = usage.map(|u| u.context_tokens()).unwrap_or(0);
+            match self.config.session_max_context_tokens {
+                Some(cap) if ctx > cap => {
+                    self.sessions.lock().unwrap().remove(key);
+                    eprintln!(
+                        "sticky[{key}]: EVICTED — context {}k > cap {}k (next wake fresh)",
+                        ctx / 1000,
+                        cap / 1000
+                    );
+                }
+                _ => {
+                    if let Some(sid) = &ran_session {
+                        self.sticky_store(key, &sid.0);
+                    }
+                }
+            }
         }
         // Taint by ACTUAL access: the trust degradation from the tools this step really called.
         let tool_calls = recorder.take();
@@ -605,8 +625,23 @@ impl Harness {
         // to memory/ are caught by the sweep. Then reconcile + author the runlog.
         self.honor_memory_append(prompt.state, &out).await;
         let reverted = self.reconcile_soul(prompt.state, &stimulus.id.0).await;
+        // Runlog tags: the conversation key (when the prompt opts in via `tag_key`) + any tags the acting
+        // baton carries — so a tagged view can recall this conversation later.
+        let mut tags: Vec<String> = Vec::new();
+        if prompt.context().tag_key {
+            if let Some(k) = &stimulus.dedup_key {
+                tags.push(k.clone());
+            }
+        }
+        if let StepInput::Act(baton) = step {
+            for t in &baton.tags {
+                if !tags.contains(t) {
+                    tags.push(t.clone());
+                }
+            }
+        }
         let runlog_ref = self
-            .write_runlog(prompt.state, stimulus, &out, tool_calls, &reverted, step_seq)
+            .write_runlog(prompt.state, stimulus, &out, tool_calls, &reverted, step_seq, tags)
             .await?;
         Ok((out, runlog_ref, accessed))
     }
@@ -1017,15 +1052,11 @@ impl Harness {
     }
 
     /// The state's context blocks, **resume-aware** (the de-bloat that keeps a sticky session coherent):
-    /// - ENTRY (Perceive): directive (trusted intent) + payload (untrusted world) as SEPARATE blocks
-    ///   (§5.3) — always. Plus, on a FRESH wake only, a memory tail (grounding) + the runlog tail. On a
-    ///   RESUME, memory is DROPPED (the session already carries it; the duck `Read`s `memory/` on demand)
-    ///   and the runlog becomes the small **diff since the session's last wake** (`watermark`).
-    /// - ACT (Express): the digested Baton (never raw bytes) — always. Plus, on a RESUME, the runlog
-    ///   **diff** so the duck knows what it did while away (instead of confabulating it). A fresh Act stays
-    ///   clean (baton only).
-    /// `ctx` (the prompt's `context:` knobs) can suppress memory and/or runlog entirely. An empty runlog
-    /// diff yields no block (no noise). The caller appends orientation (before) + transitions (after).
+    /// - ENTRY (Perceive): the directive (lean `---resume---` half on a resume) + payload as SEPARATE
+    ///   blocks (§5.3). Plus, FRESH only, a memory tail (grounding). Plus the runlog (see `runlog_blocks`).
+    /// - ACT (Express): the digested Baton (never raw bytes). Plus the runlog (resume = conversation diff).
+    /// `ctx` controls memory + the runlog views; memory is never re-sent on a resume (the session holds it;
+    /// the duck `Read`s `memory/` on demand). The caller appends orientation (before) + transitions (after).
     async fn context_blocks(
         &self,
         step: &StepInput,
@@ -1034,14 +1065,17 @@ impl Harness {
         watermark: Option<i64>,
         ctx: &crate::state_prompt::ContextConfig,
     ) -> Vec<ContextBlock> {
+        // The conversation tag this wake belongs to (for the `conversation` runlog view).
+        let tag = stimulus.dedup_key.as_deref();
         let mut out = Vec::new();
         match step {
             StepInput::Entry => {
-                out.push(ContextBlock {
-                    label: "standing-directive".into(),
-                    body: stimulus.directive_body.clone(),
-                    trusted: true,
-                });
+                // Directive (Part C): a stored `---resume---` marker splits it; the lean half rides resumes
+                // so the heavy standing-directive stops repeating every turn.
+                let (fresh_dir, resume_dir) =
+                    crate::state_prompt::split_resume(&stimulus.directive_body);
+                let directive = if is_resume { resume_dir.unwrap_or(fresh_dir) } else { fresh_dir };
+                out.push(ContextBlock { label: "standing-directive".into(), body: directive, trusted: true });
                 out.push(ContextBlock {
                     label: "world-payload".into(),
                     body: stimulus.payload.to_string(),
@@ -1055,40 +1089,56 @@ impl Harness {
                         trusted: true, // the duck's own self-authored notes (not world data).
                     });
                 }
-                if ctx.runlog {
-                    if let Some(b) = self.runlog_block(is_resume, watermark).await {
-                        out.push(b);
-                    }
-                }
+                out.extend(self.runlog_blocks(tag, is_resume, watermark, &ctx.runlog).await);
             }
             StepInput::Act(baton) => {
                 out.push(baton_block(baton));
-                // A resumed Act gets the "while you slept" runlog diff; a fresh Act stays baton-only.
-                if ctx.runlog && is_resume {
-                    if let Some(b) = self.runlog_block(true, watermark).await {
-                        out.push(b);
-                    }
-                }
+                out.extend(self.runlog_blocks(tag, is_resume, watermark, &ctx.runlog).await);
             }
         }
         out
     }
 
-    /// The runlog context block: on a FRESH wake the recent tail (continuity grounding); on a RESUME the
-    /// **diff** since the session's `watermark` (only what happened while it slept). `None` when the diff
-    /// is empty (nothing to say → no noise). Harness-authored one-liners — NO raw payload (the agent opens
-    /// a full entry via `runlog_ref` if it wants it).
-    async fn runlog_block(&self, is_resume: bool, watermark: Option<i64>) -> Option<ContextBlock> {
-        let (label, body) = if is_resume {
-            let since = watermark.unwrap_or(0);
-            ("runlog-since-last-wake", self.runlog.tail_since(since, 20).await.unwrap_or_default())
-        } else {
-            ("runlog-recent", self.runlog.tail(10).await.unwrap_or_default())
-        };
-        if body.trim().is_empty() {
-            return None;
+    /// The runlog context views (harness-authored one-liners — NO raw payload). Two independent channels,
+    /// each emitted only when its count > 0 and its result is non-empty:
+    /// - **environment** (global recent tail): FRESH wakes only — broad orientation across all activity.
+    /// - **conversation** (entries tagged with this wake's `tag` = `dedup_key`): the recent tail on a
+    ///   FRESH wake, the **diff since `watermark`** on a RESUME — so the session sees only its own chat's
+    ///   history (no parallel-chat bloat) and, on a resume, only what happened while it slept.
+    async fn runlog_blocks(
+        &self,
+        tag: Option<&str>,
+        is_resume: bool,
+        watermark: Option<i64>,
+        cfg: &crate::state_prompt::RunlogContext,
+    ) -> Vec<ContextBlock> {
+        let mut out = Vec::new();
+        // Environment: global tail, FRESH only.
+        if cfg.environment > 0 && !is_resume {
+            let body = self.runlog.tail_filtered(None, cfg.environment, None).await.unwrap_or_default();
+            if !body.trim().is_empty() {
+                out.push(ContextBlock { label: "environment-recent".into(), body, trusted: true });
+            }
         }
-        Some(ContextBlock { label: label.into(), body, trusted: true })
+        // Conversation: this-tag view — tail on fresh, diff on resume. Needs a tag to filter against.
+        if cfg.conversation > 0 {
+            if let Some(t) = tag {
+                let (label, since) = if is_resume {
+                    ("conversation-since-last-wake", Some(watermark.unwrap_or(0)))
+                } else {
+                    ("conversation-recent", None)
+                };
+                let body = self
+                    .runlog
+                    .tail_filtered(since, cfg.conversation, Some(t))
+                    .await
+                    .unwrap_or_default();
+                if !body.trim().is_empty() {
+                    out.push(ContextBlock { label: label.into(), body, trusted: true });
+                }
+            }
+        }
+        out
     }
 
     /// A state-prompt's system prompt = **SOUL.md** (the constant self) + the state-prompt's own
@@ -1187,6 +1237,7 @@ impl Harness {
         tool_calls: Vec<ToolCallRecord>,
         reverted: &[String],
         step_seq: usize,
+        tags: Vec<String>,
     ) -> Result<String> {
         let outcome = if reverted.is_empty() {
             Outcome::Ok
@@ -1216,6 +1267,7 @@ impl Harness {
             output: Some(out.clone()),
             outcome,
             timestamp: stimulus.received_at,
+            tags,
         };
         self.runlog.append(&entry).await
     }
@@ -1292,7 +1344,12 @@ fn continuation_stimulus(
         }),
         provenance: None,
         received_at: now,
-        dedup_key: None,
+        // Carry the origin conversation key so a DEFERRED act-state (a) resolves the right sticky
+        // session (`thread_id` ← dedup_key — without this a deferred express bucketed to `thread_id=_`,
+        // a cross-conversation bleed) and (b) tags its runlog entry to the same conversation. Safe:
+        // continuations are enqueued directly (not via `bus.ingest`), and `within_window` filters by
+        // `type`, so a `baton-continuation` never coalesces with a `telegram_message` row.
+        dedup_key: origin.dedup_key.clone(),
         pop_after: None,
         priority,
         status: StimulusStatus::Pending,
@@ -1437,7 +1494,7 @@ async fn run_worker_detached(
         if isolated { "docker" } else { "host" }
     );
     let summary = match runtime.invoke(req, recorder).await {
-        Ok((out, _)) => out
+        Ok((out, _, _)) => out
             .proposal
             .map(|p| p.gist)
             .filter(|g| !g.trim().is_empty())
@@ -1860,6 +1917,8 @@ pub fn build_baton_from_intent(
         runlog_ref,
         // Continuity only — explicitly NOT a safety boundary (PRD §6.4).
         thoughts: out.thought.clone(),
+        // Carry the branch's extra recall tags to the act-state's runlog entry.
+        tags: intent.tags.clone(),
     }
 }
 
@@ -1903,6 +1962,7 @@ fn resolve_scope_override(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::InvokeUsage;
     use crate::model::proposal::{Intent, Proposal, Transition};
     use crate::model::stimulus::{
         Priority, StimulusId, StimulusStatus, StimulusType, TrustTier,
@@ -2106,6 +2166,8 @@ mod tests {
     struct RecordingRuntime {
         seen: std::sync::Mutex<Vec<InvocationRequest>>,
         out: AgentOutput,
+        /// Optional usage to echo back (for size-eviction tests). `None` ⇒ no usage reported.
+        usage: Option<InvokeUsage>,
     }
     #[async_trait::async_trait]
     impl RuntimeClient for RecordingRuntime {
@@ -2113,11 +2175,11 @@ mod tests {
             &self,
             req: InvocationRequest,
             _responder: Arc<dyn ActionResponder>,
-        ) -> Result<(AgentOutput, Option<SessionId>)> {
+        ) -> Result<(AgentOutput, Option<SessionId>, Option<InvokeUsage>)> {
             // Echo back a stable session id so sticky-resume tests can assert the same id recurs.
             let sid = req.session.clone().or_else(|| Some(SessionId("sess-rec".into())));
             self.seen.lock().unwrap().push(req);
-            Ok((self.out.clone(), sid))
+            Ok((self.out.clone(), sid, self.usage))
         }
     }
 
@@ -2140,6 +2202,7 @@ mod tests {
         let runtime = Arc::new(RecordingRuntime {
             seen: std::sync::Mutex::new(Vec::new()),
             out: perceive_output(), // proposes a transition → Express, with a digested gist
+            usage: None,
         });
         let config = Arc::new(DackConfig::from_yaml("operator_did: \"did:x\"").unwrap());
         let queue: Arc<dyn Queue> = Arc::new(InMemoryQueue::new());
@@ -2196,6 +2259,7 @@ mod tests {
         let runtime = Arc::new(RecordingRuntime {
             seen: std::sync::Mutex::new(Vec::new()),
             out: perceive_output(),
+            usage: None,
         });
         let config = Arc::new(DackConfig::from_yaml("operator_did: \"did:x\"").unwrap());
         let queue: Arc<dyn Queue> = Arc::new(InMemoryQueue::new());
@@ -2242,6 +2306,7 @@ mod tests {
         // Perceive surfaces a thought, no structured proposal, but PICKS the express transition.
         let runtime = Arc::new(RecordingRuntime {
             seen: std::sync::Mutex::new(Vec::new()),
+            usage: None,
             out: AgentOutput {
                 thought: "nobody pinged; I'll post my daily musing anyway".into(),
                 memory_append: None,
@@ -2300,6 +2365,7 @@ mod tests {
 
         let runtime = Arc::new(RecordingRuntime {
             seen: std::sync::Mutex::new(Vec::new()),
+            usage: None,
             out: AgentOutput {
                 thought: "I'll settle this on-chain".into(),
                 memory_append: None,
@@ -2359,6 +2425,7 @@ mod tests {
         // The perceive prompt picks `settle` (in its transition set); the clean cycle's ceiling admits it.
         let runtime = Arc::new(RecordingRuntime {
             seen: std::sync::Mutex::new(Vec::new()),
+            usage: None,
             out: AgentOutput {
                 thought: "scanned trending; one looks worth a $1 nibble".into(),
                 memory_append: None,
@@ -2407,11 +2474,11 @@ mod tests {
             &self,
             req: InvocationRequest,
             _responder: Arc<dyn ActionResponder>,
-        ) -> Result<(AgentOutput, Option<SessionId>)> {
+        ) -> Result<(AgentOutput, Option<SessionId>, Option<InvokeUsage>)> {
             let sid = req.session.clone().or_else(|| Some(SessionId("sess-scr".into())));
             self.seen.lock().unwrap().push(req);
             let out = self.outs.lock().unwrap().pop_front().unwrap_or_default();
-            Ok((out, sid))
+            Ok((out, sid, None))
         }
     }
 
@@ -2424,8 +2491,8 @@ mod tests {
             spawn: None,
             transition: Transition::default(),
             batons: vec![
-                BatonIntent { to_prompt: "express".into(), gist: "say hi".into(), priority: None, reply_to: None, reason: String::new() },
-                BatonIntent { to_prompt: "settle".into(), gist: "nibble".into(), priority: None, reply_to: None, reason: String::new() },
+                BatonIntent { to_prompt: "express".into(), gist: "say hi".into(), priority: None, reply_to: None, tags: vec![], reason: String::new() },
+                BatonIntent { to_prompt: "settle".into(), gist: "nibble".into(), priority: None, reply_to: None, tags: vec![], reason: String::new() },
             ],
         }
     }
@@ -2528,8 +2595,8 @@ mod tests {
             spawn: None,
             transition: Transition::default(),
             batons: vec![
-                BatonIntent { to_prompt: "express".into(), gist: "reply now".into(), priority: None, reply_to: None, reason: String::new() },
-                BatonIntent { to_prompt: "settle".into(), gist: "trade later".into(), priority: Some(Priority::Low), reply_to: None, reason: String::new() },
+                BatonIntent { to_prompt: "express".into(), gist: "reply now".into(), priority: None, reply_to: None, tags: vec![], reason: String::new() },
+                BatonIntent { to_prompt: "settle".into(), gist: "trade later".into(), priority: Some(Priority::Low), reply_to: None, tags: vec![], reason: String::new() },
             ],
         };
         let runtime = Arc::new(ScriptedRuntime {
@@ -2649,6 +2716,7 @@ mod tests {
             payload_tier: TrustTier::self_(),
             runlog_ref: "rl".into(),
             thoughts: "t".into(),
+            tags: vec![],
         };
         let cont = continuation_stimulus(
             &poisoned_stimulus(), "settle", &baton, TrustTier::self_(), Priority::Low, 1, 1, 0, None,
@@ -2696,6 +2764,7 @@ mod tests {
             runtime: Arc::new(RecordingRuntime {
                 seen: std::sync::Mutex::new(Vec::new()),
                 out: perceive_output(),
+                usage: None,
             }),
             repo: Arc::new(PlainGitRepo::new(&soul, "did:dack:soul")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
@@ -2757,6 +2826,7 @@ mod tests {
         let runtime = Arc::new(RecordingRuntime {
             seen: std::sync::Mutex::new(Vec::new()),
             out: perceive_output(), // proposes Express → each cycle = Perceive + Express
+            usage: None,
         });
         let harness = Arc::new(Harness {
             config: config.clone(),
@@ -2892,7 +2962,7 @@ mod tests {
             config: config.clone(),
             queue: queue.clone(),
             bus: Arc::new(Bus::new(config.clone(), queue.clone())),
-            runtime: Arc::new(RecordingRuntime { seen: std::sync::Mutex::new(Vec::new()), out: perceive_output() }),
+            runtime: Arc::new(RecordingRuntime { seen: std::sync::Mutex::new(Vec::new()), out: perceive_output() , usage: None }),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
             runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
@@ -2959,7 +3029,7 @@ mod tests {
             transition: Transition { to_prompt: Some("reflect".into()), reason: "reflect".into() },
             batons: vec![],
         };
-        let runtime = Arc::new(RecordingRuntime { seen: std::sync::Mutex::new(Vec::new()), out });
+        let runtime = Arc::new(RecordingRuntime { seen: std::sync::Mutex::new(Vec::new()), out, usage: None });
         // Default lattice (self → reflect) + a 1h reflect rate-limit.
         let config = Arc::new(
             DackConfig::from_yaml("operator_did: \"did:x\"\nreflect_min_interval_secs: 3600\n").unwrap(),
@@ -3023,7 +3093,7 @@ mod tests {
             config: config.clone(),
             queue: queue.clone(),
             bus: Arc::new(Bus::new(config.clone(), queue.clone())),
-            runtime: Arc::new(RecordingRuntime { seen: std::sync::Mutex::new(Vec::new()), out: perceive_output() }),
+            runtime: Arc::new(RecordingRuntime { seen: std::sync::Mutex::new(Vec::new()), out: perceive_output() , usage: None }),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
             runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
@@ -3088,7 +3158,7 @@ mod tests {
             config: config.clone(),
             queue: queue.clone(),
             bus: Arc::new(Bus::new(config.clone(), queue.clone())),
-            runtime: Arc::new(RecordingRuntime { seen: std::sync::Mutex::new(Vec::new()), out: perceive_output() }),
+            runtime: Arc::new(RecordingRuntime { seen: std::sync::Mutex::new(Vec::new()), out: perceive_output() , usage: None }),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
             runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
@@ -3164,7 +3234,7 @@ mod tests {
             config: config.clone(),
             queue: queue.clone(),
             bus: Arc::new(Bus::new(config.clone(), queue.clone())),
-            runtime: Arc::new(RecordingRuntime { seen: std::sync::Mutex::new(Vec::new()), out: perceive_output() }),
+            runtime: Arc::new(RecordingRuntime { seen: std::sync::Mutex::new(Vec::new()), out: perceive_output() , usage: None }),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
             runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
@@ -3231,7 +3301,7 @@ mod tests {
             config: config.clone(),
             queue: queue.clone(),
             bus: Arc::new(Bus::new(config.clone(), queue.clone())),
-            runtime: Arc::new(RecordingRuntime { seen: std::sync::Mutex::new(Vec::new()), out: perceive_output() }),
+            runtime: Arc::new(RecordingRuntime { seen: std::sync::Mutex::new(Vec::new()), out: perceive_output() , usage: None }),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
             runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
@@ -3298,6 +3368,7 @@ mod tests {
             runtime: Arc::new(RecordingRuntime {
                 seen: std::sync::Mutex::new(Vec::new()),
                 out: perceive_output(),
+                usage: None,
             }),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
@@ -3365,6 +3436,7 @@ mod tests {
         let runtime = Arc::new(RecordingRuntime {
             seen: std::sync::Mutex::new(Vec::new()),
             out: perceive_output(),
+            usage: None,
         });
         let harness = Harness {
             config: config.clone(),
@@ -3450,6 +3522,7 @@ mod tests {
         let runtime = Arc::new(RecordingRuntime {
             seen: std::sync::Mutex::new(Vec::new()),
             out: perceive_output(),
+            usage: None,
         });
         let harness = Harness {
             config: config.clone(),
@@ -3470,7 +3543,11 @@ mod tests {
             model: None,
             session: Some(SessionConfig { sticky: true, key: vec!["thread_id".into()] }),
             reply_key: None,
-            context: None,
+            context: Some(crate::state_prompt::ContextConfig {
+                memory: true,
+                tag_key: true,
+                runlog: crate::state_prompt::RunlogContext { environment: 10, conversation: 20 },
+            }),
             body: "FULL-BODY-go".into(),
             resume_body: Some("LEAN-RESUME-only-new".into()),
         };
@@ -3508,14 +3585,80 @@ mod tests {
             "a different thread's fresh item uses the full body again"
         );
 
-        // Resume-aware blocks: memory is grounding on a FRESH wake, DROPPED on a resume; the runlog
-        // appears as the "while you slept" diff once there's prior runlog to diff against.
+        // Resume-aware blocks: memory + the global ENVIRONMENT view are FRESH-only; a RESUME drops both
+        // and instead carries the CONVERSATION diff (what happened in this chat while it slept). (Tag
+        // scoping itself is unit-tested in `runlog::tail_filtered_gates_by_time_and_tag`; FileRunLog here
+        // doesn't filter, so this asserts the BLOCK ASSEMBLY — which label appears when.)
         let has = |i: usize, label: &str| seen[i].blocks.iter().any(|b| b.label == label);
         assert!(has(0, "memory-recent"), "fresh wake carries the memory block (grounding)");
         assert!(!has(1, "memory-recent"), "RESUME drops memory (the session already has it)");
-        assert!(has(1, "runlog-since-last-wake"), "RESUME injects the runlog DIFF block");
-        assert!(!has(1, "runlog-recent"), "a resume uses the diff label, not the fresh tail");
+        assert!(!has(1, "environment-recent"), "RESUME drops the global environment view (fresh-only)");
+        assert!(has(1, "conversation-since-last-wake"), "RESUME injects the conversation DIFF block");
+        assert!(!has(1, "conversation-recent"), "a resume uses the diff label, not the fresh tail");
         assert!(has(2, "memory-recent"), "a different thread's fresh wake carries memory again");
+        assert!(has(2, "environment-recent"), "a fresh wake (with prior runlog) carries the environment view");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Size-eviction: when a sticky invoke's reported context exceeds `session_max_context_tokens`, the
+    /// session is EVICTED (not stored) so the next wake in that thread starts FRESH (no resume).
+    #[tokio::test]
+    async fn oversized_session_is_evicted_so_the_next_wake_is_fresh() {
+        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::queue::InMemoryQueue;
+        use crate::repo::git::PlainGitRepo;
+        use crate::runlog::FileRunLog;
+        use crate::state_prompt::SessionConfig;
+        use std::collections::HashMap;
+
+        let tmp = std::env::temp_dir().join(format!("dack-evict-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        seed_prompts(&tmp);
+        // Cap at 50k tokens; the runtime reports 80k → over the cap.
+        let config = Arc::new(DackConfig::from_yaml("operator_did: \"did:x\"\nsession_max_context_tokens: 50000").unwrap());
+        let queue: Arc<dyn Queue> = Arc::new(InMemoryQueue::new());
+        let runtime = Arc::new(RecordingRuntime {
+            seen: std::sync::Mutex::new(Vec::new()),
+            out: perceive_output(),
+            usage: Some(InvokeUsage { input_tokens: 70_000, cache_read_input_tokens: 10_000 }),
+        });
+        let harness = Harness {
+            config: config.clone(),
+            queue: queue.clone(),
+            bus: Arc::new(Bus::new(config.clone(), queue.clone())),
+            runtime: runtime.clone(),
+            repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
+            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
+            broker: Arc::new(SecretsBroker::new(vec![])),
+            sessions: Default::default(),
+        };
+        let sticky = StatePrompt {
+            id: "twitter/perceive_thread".into(),
+            state: ConsciousnessState::Perceive,
+            mcp: vec![],
+            transitions: vec![],
+            model: None,
+            session: Some(SessionConfig { sticky: true, key: vec!["thread_id".into()] }),
+            reply_key: None,
+            context: None,
+            body: "go".into(),
+            resume_body: None,
+        };
+        let mut item = poisoned_stimulus();
+        item.dedup_key = Some("conv-1".into());
+        let trust = TrustTier::public();
+        harness.run_step(&sticky, &StepInput::Entry, &item, &trust, ConsciousnessState::Express, None, 1).await.unwrap();
+        harness.run_step(&sticky, &StepInput::Entry, &item, &trust, ConsciousnessState::Express, None, 1).await.unwrap();
+
+        let seen = runtime.seen.lock().unwrap();
+        assert!(seen[0].session.is_none(), "first wake is fresh");
+        assert!(
+            seen[1].session.is_none(),
+            "the oversized first session was EVICTED → the second wake is fresh too (no resume)"
+        );
 
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -3554,6 +3697,7 @@ mod tests {
         let runtime = Arc::new(RecordingRuntime {
             seen: std::sync::Mutex::new(Vec::new()),
             out: perceive_output(),
+            usage: None,
         });
         let queue: Arc<dyn Queue> = Arc::new(InMemoryQueue::new());
         let repo: Arc<dyn RepoHost> = Arc::new(PlainGitRepo::new(&tmp, "did:x"));

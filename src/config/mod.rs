@@ -546,6 +546,12 @@ pub struct DackConfig {
     /// Default 1 hour. `0` = never evict (not recommended).
     #[serde(default = "default_session_ttl")]
     pub session_ttl_secs: i64,
+    /// **Sticky-session context-size cap** (tokens): after a resume whose context (input + cache-read
+    /// tokens) exceeds this, the session is EVICTED so the next wake starts fresh — bounding cost and the
+    /// bloat that drives confabulation (a fresh session reconstructs via the conversation runlog view).
+    /// `None` (default) = size-eviction off (only the idle TTL applies). Set it in the operator config.
+    #[serde(default)]
+    pub session_max_context_tokens: Option<u64>,
     /// **Load-shedding cap** (Phase 4): the max PENDING queue depth before the OLDEST `Low`-priority
     /// items are evicted (Normal+ is the protected floor, never shed; every eviction is logged).
     /// Protects a busy duck from a runaway low-priority fan-out backlog. `None` = unbounded.

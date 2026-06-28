@@ -136,6 +136,7 @@ async function runInvoke(inv: any) {
 
   let finalText = ''
   let sessionId: string | null = null
+  let usage: any = null
   for await (const m of query({ prompt: inv.user_prompt, options }) as AsyncIterable<any>) {
     // Capture the engine session id (carried on the SDK messages) → returned for sticky resume.
     if (m?.session_id) sessionId = m.session_id
@@ -148,12 +149,13 @@ async function runInvoke(inv: any) {
       for (const b of m.message.content) if (b.type === 'text') finalText += b.text
     } else if (m?.type === 'result') {
       if (m?.result) finalText ||= m.result
+      usage = m.usage ?? m.modelUsage ?? null
       // Cost telemetry → stderr (inherited by the harness log). Per-invocation = per-state.
       console.error(
         '[bridge:usage]',
         JSON.stringify({
           model: inv.model ?? null,
-          usage: m.usage ?? m.modelUsage ?? null,
+          usage,
           cost_usd: m.total_cost_usd ?? null,
           duration_ms: m.duration_ms ?? null,
           num_turns: m.num_turns ?? null,
@@ -162,6 +164,7 @@ async function runInvoke(inv: any) {
     }
   }
 
-  emit({ kind: 'result', output: parseOutput(finalText, console.error), session_id: sessionId })
+  // `usage` (the resumed-context token counts) rides the result so the harness can size-evict a session.
+  emit({ kind: 'result', output: parseOutput(finalText, console.error), session_id: sessionId, usage })
   process.exit(0)
 }

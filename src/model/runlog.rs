@@ -56,4 +56,9 @@ pub struct RunLogEntry {
     pub output: Option<AgentOutput>,
     pub outcome: Outcome,
     pub timestamp: i64,
+    /// Conversation/topic tags for context-scoped recall: the conversation key (when the prompt opts in
+    /// via `tag_key`) plus any baton-carried tags. A resumed sticky session filters the runlog diff to
+    /// its own tag so parallel chats don't bloat its context. Empty = untagged (only in the global view).
+    #[serde(default)]
+    pub tags: Vec<String>,
 }

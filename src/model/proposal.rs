@@ -106,6 +106,11 @@ pub struct BatonIntent {
     /// `reply_key` (default `message_id`→`id`).
     #[serde(default)]
     pub reply_to: Option<String>,
+    /// Extra context-recall tags for this branch (beyond the auto conversation key the harness adds when
+    /// the prompt sets `tag_key`) — e.g. a topic. Carried onto the runlog entry so a tagged view can
+    /// recall it later. Usually empty; the model rarely needs to set it. `#[serde(default)]` = none.
+    #[serde(default)]
+    pub tags: Vec<String>,
     #[serde(default)]
     pub reason: String,
 }
@@ -161,10 +166,8 @@ impl AgentOutput {
         match &self.transition.to_prompt {
             Some(id) => vec![BatonIntent {
                 to_prompt: id.clone(),
-                gist: String::new(),
-                priority: None,
-                reply_to: None,
                 reason: self.transition.reason.clone(),
+                ..Default::default()
             }],
             None => Vec::new(),
         }

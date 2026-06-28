@@ -43,4 +43,8 @@ pub struct Baton {
     /// thought. Express seeing it aids coherence; it does NOT let Express catch a
     /// laundered conclusion. Carry it; never treat it as a safety boundary.
     pub thoughts: String,
+    /// Context-recall tags this branch carries (from the emitting `BatonIntent.tags`) — written onto the
+    /// Express runlog entry alongside the auto conversation key. Usually empty.
+    #[serde(default)]
+    pub tags: Vec<String>,
 }

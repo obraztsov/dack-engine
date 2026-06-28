@@ -1012,6 +1012,16 @@ impl Harness {
                     // raw payload, read ONLY here for env vars; it never reaches the model.
                     let mut extra_env = std::collections::BTreeMap::new();
                     for (var, field) in &server.scope_env {
+                        // Reserved field `dedup_key` resolves to the Stimulus's conversation key (not a
+                        // payload field) — the platform-agnostic conversation TAG (telegram chat_id /
+                        // twitter conversation_id alike). Lets the recall MCP default to THIS chat
+                        // (`scope_env: { RECALL_TAG: dedup_key }`) without the model supplying an id.
+                        if field == "dedup_key" {
+                            if let Some(k) = &stimulus.dedup_key {
+                                extra_env.insert(var.clone(), k.clone());
+                            }
+                            continue;
+                        }
                         let v = scope_override
                             .and_then(|o| o.get(field))
                             .or_else(|| stimulus.payload.get(field));
@@ -3268,6 +3278,61 @@ mod tests {
         let (s, _) = harness.assemble_mcp_servers(&express, &stim, &TrustTier::self_(), Some(&partial)).await;
         assert_eq!(s["telegram"]["env"]["TELEGRAM_REPLY_TO"], "10");
         assert_eq!(s["telegram"]["env"]["TELEGRAM_REPLY_CHAT"], "7", "chat_id falls back to top-level");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The reserved `scope_env` field `dedup_key` injects the Stimulus's CONVERSATION key (not a payload
+    /// field) — how the recall MCP gets `RECALL_TAG` = this chat. Missing dedup_key → the var is unset.
+    #[tokio::test]
+    async fn scope_env_dedup_key_injects_the_conversation_tag() {
+        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::queue::InMemoryQueue;
+        use crate::repo::git::PlainGitRepo;
+        use crate::runlog::FileRunLog;
+        use std::collections::HashMap;
+
+        let config = Arc::new(
+            DackConfig::from_yaml(
+                "operator_did: \"did:x\"\n\
+                 tier_policy:\n  perceive: { mcp_whitelist: true, import: [recall] }\n\
+                 mcp_servers:\n  \
+                   - name: recall\n    transport: { type: stdio, command: bun, args: [run, r.ts] }\n    tier: read\n    trust: public\n    \
+                     scope_env: { RECALL_TAG: dedup_key }\n",
+            )
+            .unwrap(),
+        );
+        let queue: Arc<dyn Queue> = Arc::new(InMemoryQueue::new());
+        let tmp = std::env::temp_dir().join(format!("dack-recalltag-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).ok();
+        let harness = Harness {
+            config: config.clone(),
+            queue: queue.clone(),
+            bus: Arc::new(Bus::new(config.clone(), queue.clone())),
+            runtime: Arc::new(RecordingRuntime { seen: std::sync::Mutex::new(Vec::new()), out: perceive_output(), usage: None }),
+            repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
+            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
+            broker: Arc::new(SecretsBroker::new(vec![])),
+            sessions: Default::default(),
+        };
+        let perceive = StatePrompt {
+            id: "p".into(), state: ConsciousnessState::Perceive,
+            mcp: vec![McpRef::Import("recall".into())], transitions: vec![], model: None, session: None,
+            reply_key: None, context: None, body: String::new(), resume_body: None,
+        };
+
+        // dedup_key set → RECALL_TAG carries the conversation tag (recall public → cycle stays public).
+        let mut stim = poisoned_stimulus();
+        stim.dedup_key = Some("chat-7".into());
+        let (s, _) = harness.assemble_mcp_servers(&perceive, &stim, &TrustTier::public(), None).await;
+        assert_eq!(s["recall"]["env"]["RECALL_TAG"], "chat-7");
+
+        // No dedup_key → the var is simply unset (recall_conversation will report no tag in scope).
+        let mut bare = poisoned_stimulus();
+        bare.dedup_key = None;
+        let (s, _) = harness.assemble_mcp_servers(&perceive, &bare, &TrustTier::public(), None).await;
+        assert!(s["recall"]["env"].get("RECALL_TAG").is_none(), "no conversation key → RECALL_TAG unset");
 
         std::fs::remove_dir_all(&tmp).ok();
     }

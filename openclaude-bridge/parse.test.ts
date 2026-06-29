@@ -11,7 +11,7 @@ test('multi-object (the live bitconnect drop) keeps the real transition via late
   // obj1 = gist only (NO transition); obj2 = the complete decision WITH the transition. Before the
   // fix this fell back to to_prompt=null → the Telegram reply silently never sent.
   const text =
-    '{"thought":"vibe","memory_append":null,"proposal":{"intent":"reply","gist":"BITCONNEEEECT"}},' +
+    '{"thought":"vibe","tag_notes":null,"proposal":{"intent":"reply","gist":"BITCONNEEEECT"}},' +
     '{"thought":"vibe2","proposal":{"intent":"reply","gist":"BITCONNEEEECT"},"spawn":null,' +
     '"transition":{"to_prompt":"telegram/express","reason":"match energy"}}'
   const logs: string[] = []

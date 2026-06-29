@@ -48,6 +48,9 @@ impl RepoHost for PlainGitRepo {
     async fn revert_file(&self, path: &RepoPath) -> Result<CommitId> {
         self.core.revert_file(path).await
     }
+    async fn remove_file(&self, path: &RepoPath, commit: &CommitMeta) -> Result<CommitId> {
+        self.core.remove(path, &commit.message, &commit.author_did).await
+    }
     async fn status(&self) -> Result<Vec<RepoChange>> {
         self.core.status_porcelain().await
     }

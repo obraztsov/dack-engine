@@ -60,6 +60,12 @@ pub trait RepoHost: Send + Sync {
     /// a run that fails to start because a skill/stimulus file is malformed.
     async fn revert_file(&self, path: &RepoPath) -> Result<CommitId>;
 
+    /// Delete a tracked file and commit the removal (harness-authored). Used by runlog retention to
+    /// age off old day-files. Default: unsupported (only the git-backed repos used for runlogs override).
+    async fn remove_file(&self, _path: &RepoPath, _commit: &CommitMeta) -> Result<CommitId> {
+        Err(crate::error::DackError::NotImplemented("remove_file"))
+    }
+
     /// The soul working-tree delta vs HEAD (untracked included) — what a run *actually*
     /// changed, for the post-run sweep + tripwire. Empty = clean (PRD §7.5, invariant I13).
     async fn status(&self) -> Result<Vec<RepoChange>>;

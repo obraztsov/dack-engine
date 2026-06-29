@@ -55,7 +55,8 @@ const emit = (obj: unknown) => process.stdout.write(JSON.stringify(obj) + '\n')
 const OUTPUT_INSTRUCTION =
   'When you have finished perceiving and taking any permitted actions, your FINAL message ' +
   'MUST be ONLY a single JSON object (no prose, no markdown fence) with this shape: ' +
-  '{"thought": string, "memory_append": string|null, ' +
+  '{"thought": string, ' +
+  '"tag_notes": [{"tag": string, "note": string}]|null, ' +
   '"spawn": {"agent": string, "brief": string}|null, ' +
   '"batons": [{"to_prompt": string, "gist": string, "priority": "low"|"normal"|"high"|"urgent"|null}]}. ' +
   '"batons" is your fan-out: ONE element to take a single next step, SEVERAL to do several things at ' +

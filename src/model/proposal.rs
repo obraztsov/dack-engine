@@ -128,16 +128,27 @@ pub struct SpawnRequest {
     pub brief: String,
 }
 
+/// A "sticky note" on a conversation tag — a short observation appended to the short-term tag-notes
+/// catalogue. The model returns just `{ tag, note }`; the HARNESS stamps `trust` (= the writing cycle's
+/// taint, unfakeable provenance) and the `timestamp` on append.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TagNote {
+    pub tag: String,
+    pub note: String,
+}
+
 /// The full agent return value (PRD §6.2).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentOutput {
     /// Internal reasoning — **logged, never published** (Eliza-style "thought").
     /// Rides the Baton for continuity but is NOT a safety boundary (PRD §6.4).
     pub thought: String,
-    /// Optional line to append to memory. Honored only in Express/Reflect; a write
-    /// tool call in Perceive is denied by construction (PRD §4.1, §6.2).
+    /// Tag-notes: per-conversation "sticky notes" appended to the SHORT-TERM tag-notes catalogue
+    /// (`runlogs/tag-notes.ndjson`). Replaces the old `memory_append` — long-term `memory/` is written
+    /// only by org+ digest jobs / reflect. Honored only for org+ (`memory_write_min_trust`)
+    /// Express/Reflect cycles; dropped otherwise. `None` (the common case) = no note this cycle.
     #[serde(default)]
-    pub memory_append: Option<String>,
+    pub tag_notes: Option<Vec<TagNote>>,
     #[serde(default)]
     pub proposal: Option<Proposal>,
     /// Optional worker delegation (Phase 10). Honored only from Express; launched async, returns as

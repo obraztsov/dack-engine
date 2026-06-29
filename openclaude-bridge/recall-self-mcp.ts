@@ -20,6 +20,7 @@ import {
   clamp,
   listRecentTags,
   loadEntries,
+  readTagNotes,
   recentActivity,
   recentDates,
   renderThoughtLog,
@@ -74,6 +75,21 @@ server.registerTool(
   async ({ days, limit }: { days?: number; limit?: number }) => {
     const entries = loadEntries(RUNLOG_DIR, recentDates(RUNLOG_DIR, clamp(days, 7, 60)))
     return asText({ ok: true, tags: listRecentTags(entries, clamp(limit, 20, 100)) })
+  },
+)
+
+server.registerTool(
+  'read_tag_notes',
+  {
+    description:
+      'Read your tag-notes catalogue — the latest "sticky note" per conversation (who they are, open ' +
+      'threads, what to remember), newest first, each with its subject trust + when. This is your quick ' +
+      "orientation on a chat before you reply, and the digest's working set. `tag` reads one chat; " +
+      '`min_trust` (self|org|public) floors out lower-trust subjects.',
+    inputSchema: { tag: z.string().optional(), min_trust: z.string().optional() },
+  },
+  async ({ tag, min_trust }: { tag?: string; min_trust?: string }) => {
+    return asText({ ok: true, notes: readTagNotes(RUNLOG_DIR, { tag, minTrust: min_trust }) })
   },
 )
 

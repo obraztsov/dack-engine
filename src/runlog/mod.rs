@@ -40,6 +40,26 @@ pub trait RunLogWriter: Send + Sync {
         max_entries: usize,
         tag: Option<&str>,
     ) -> Result<String>;
+
+    /// Append a "sticky note" to the SHORT-TERM tag-notes catalogue (`tag-notes.ndjson` in the runlog
+    /// dir): one JSON line `{tag, note, trust, timestamp}`, kept to the last `max` lines. Append-only +
+    /// harness-authored (the agent can't write the runlog dir directly). Default: no-op (test writers).
+    async fn append_tag_note(
+        &self,
+        _tag: &str,
+        _note: &str,
+        _trust: &str,
+        _timestamp: i64,
+        _max: usize,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Retention: keep only the most recent `keep_days` `<date>.md` files, deleting older ones (so
+    /// short-term memory ages off). Returns the count deleted. Default: no-op.
+    async fn prune_old_days(&self, _keep_days: u64) -> Result<usize> {
+        Ok(0)
+    }
 }
 
 /// Collapse consecutive identical lines (a cheap de-bloat: a runlog tail is often N identical
@@ -226,6 +246,75 @@ impl RunLogWriter for DailyFileRunLog {
             .into_owned();
         Ok(filter_headings(&text, since, max_entries, tag))
     }
+
+    async fn append_tag_note(
+        &self,
+        tag: &str,
+        note: &str,
+        trust: &str,
+        timestamp: i64,
+        max: usize,
+    ) -> Result<()> {
+        let path = RepoPath("tag-notes.ndjson".into());
+        let existing =
+            String::from_utf8_lossy(&self.repo.read_file(&path).await.unwrap_or_default()).into_owned();
+        let mut lines: Vec<String> =
+            existing.lines().filter(|l| !l.trim().is_empty()).map(String::from).collect();
+        // One JSON object per line; serde escapes so a newline/backtick in the note can't break the format.
+        let line = serde_json::json!({
+            "tag": tag, "note": note, "trust": trust, "timestamp": timestamp
+        })
+        .to_string();
+        lines.push(line);
+        // Cap: keep only the most recent `max` (the reader dedups to latest-per-tag anyway).
+        if max > 0 && lines.len() > max {
+            lines = lines.split_off(lines.len() - max);
+        }
+        let content = format!("{}\n", lines.join("\n"));
+        self.repo
+            .write_file(
+                &path,
+                content.as_bytes(),
+                &CommitMeta {
+                    message: format!("tag-note: {tag}"),
+                    author_did: self.author_did.clone(),
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn prune_old_days(&self, keep_days: u64) -> Result<usize> {
+        if keep_days == 0 {
+            return Ok(0); // 0 = retention disabled (keep everything).
+        }
+        // The runlog repo is rooted AT `<soul>/runlogs/`, so list its root for `<date>.md` files.
+        let entries = self.repo.list_dir(&RepoPath(String::new()), 1).await.unwrap_or_default();
+        let mut days: Vec<String> = entries
+            .iter()
+            .filter_map(|p| p.0.strip_suffix(".md").map(str::to_string))
+            .filter(|d| d.len() == 10 && d.as_bytes()[4] == b'-') // YYYY-MM-DD only (not tag-notes.ndjson)
+            .collect();
+        days.sort();
+        let drop = days.len().saturating_sub(keep_days as usize);
+        for d in &days[..drop] {
+            let path = RepoPath(format!("{d}.md"));
+            if let Err(e) = self
+                .repo
+                .remove_file(
+                    &path,
+                    &CommitMeta {
+                        message: format!("runlog retention: drop {d}.md (> {keep_days}d)"),
+                        author_did: self.author_did.clone(),
+                    },
+                )
+                .await
+            {
+                tracing::warn!("runlog retention: drop {d}.md failed: {e}");
+            }
+        }
+        Ok(drop)
+    }
 }
 
 /// Minimal local-file writer (Phase 4) — appends a compact one-line record to
@@ -368,6 +457,58 @@ mod tests {
         // ...and the runlog was actually committed (clean tree).
         let status = Command::new("git").arg("-C").arg(&dir).args(["status", "--porcelain"]).output().await.unwrap();
         assert!(String::from_utf8_lossy(&status.stdout).trim().is_empty(), "runlog committed");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn tag_notes_append_caps_and_retention_drops_old_day_files() {
+        use crate::repo::git::PlainGitRepo;
+        use crate::repo::{CommitMeta, RepoHost, RepoPath};
+        use tokio::process::Command;
+
+        let dir = std::env::temp_dir().join(format!("dack-tagnotes-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.name", "s"],
+            vec!["config", "user.email", "s@d"],
+        ] {
+            Command::new("git").arg("-C").arg(&dir).args(&args).output().await.unwrap();
+        }
+        let repo = std::sync::Arc::new(PlainGitRepo::new(&dir, "did:dack:soul"));
+        let log = DailyFileRunLog::new(repo.clone(), "did:dack:soul");
+
+        // Append 5 notes with a cap of 3 → only the last 3 lines survive, newest last.
+        for i in 1..=5 {
+            log.append_tag_note(&format!("chat-{i}"), &format!("note {i}"), "public", 100 + i, 3).await.unwrap();
+        }
+        let ndjson = String::from_utf8_lossy(
+            &repo.read_file(&RepoPath("tag-notes.ndjson".into())).await.unwrap(),
+        )
+        .into_owned();
+        let lines: Vec<&str> = ndjson.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 3, "capped to the last 3");
+        assert!(lines[2].contains("\"tag\":\"chat-5\"") && lines[2].contains("\"timestamp\":105"));
+        assert!(!ndjson.contains("chat-1") && !ndjson.contains("chat-2"), "oldest trimmed");
+
+        // Retention: seed 4 day-files; keep 2 → the 2 oldest are dropped.
+        for d in ["2026-06-01", "2026-06-02", "2026-06-03", "2026-06-04"] {
+            repo.write_file(
+                &RepoPath(format!("{d}.md")),
+                b"# runlog\n",
+                &CommitMeta { message: format!("seed {d}"), author_did: "did:dack:soul".into() },
+            )
+            .await
+            .unwrap();
+        }
+        let dropped = log.prune_old_days(2).await.unwrap();
+        assert_eq!(dropped, 2, "kept 2 of 4 day-files");
+        assert!(!dir.join("2026-06-01.md").exists() && !dir.join("2026-06-02.md").exists());
+        assert!(dir.join("2026-06-03.md").exists() && dir.join("2026-06-04.md").exists());
+        // The tag-notes catalogue is NOT a day-file → never pruned.
+        assert!(dir.join("tag-notes.ndjson").exists(), "catalogue survives retention");
 
         std::fs::remove_dir_all(&dir).ok();
     }

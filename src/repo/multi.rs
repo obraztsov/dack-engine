@@ -175,6 +175,13 @@ impl RepoHost for MultiRemoteRepo {
         }
         r
     }
+    async fn remove_file(&self, path: &RepoPath, commit: &CommitMeta) -> Result<CommitId> {
+        let r = self.core.remove(path, &commit.message, &commit.author_did).await;
+        if r.is_ok() {
+            self.dirty.store(true, Ordering::Relaxed);
+        }
+        r
+    }
     async fn status(&self) -> Result<Vec<RepoChange>> {
         self.core.status_porcelain().await
     }

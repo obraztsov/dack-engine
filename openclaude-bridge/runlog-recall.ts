@@ -279,3 +279,42 @@ export function recentActivity(dir: string, days: number, minTrust?: string): En
   const entries = loadEntries(dir, recentDates(dir, days)).filter((e) => e.thought || e.sent.length)
   return atLeastTrust(entries, minTrust)
 }
+
+/** One sticky note from the tag-notes catalogue (`tag-notes.ndjson`). `trust` is the SUBJECT
+ * conversation's origin trust; `timestamp` is unix seconds (harness-stamped on write). */
+export interface TagNoteRec {
+  tag: string
+  note: string
+  trust: string
+  timestamp: number
+}
+
+/** Read the tag-notes catalogue → the LATEST note per tag (a per-conversation "sticky note"), newest
+ * first. Optional `tag` / `minTrust` filters. The file is append-only + capped by the harness, so we
+ * dedup here (highest timestamp per tag wins). Degrades to [] if the file is missing. */
+export function readTagNotes(dir: string, opts: { tag?: string; minTrust?: string } = {}): TagNoteRec[] {
+  let raw: string
+  try {
+    raw = readFileSync(`${dir}/tag-notes.ndjson`, 'utf8')
+  } catch {
+    return []
+  }
+  const latest = new Map<string, TagNoteRec>()
+  for (const line of raw.split('\n')) {
+    const l = line.trim()
+    if (!l) continue
+    try {
+      const r: any = JSON.parse(l)
+      if (!r?.tag || !r?.note) continue
+      const rec: TagNoteRec = { tag: String(r.tag), note: String(r.note), trust: String(r.trust ?? ''), timestamp: Number(r.timestamp ?? 0) }
+      const cur = latest.get(rec.tag)
+      if (!cur || rec.timestamp >= cur.timestamp) latest.set(rec.tag, rec)
+    } catch {
+      /* skip a malformed line */
+    }
+  }
+  let out = [...latest.values()]
+  if (opts.tag) out = out.filter((r) => r.tag === opts.tag)
+  if (opts.minTrust) out = out.filter((r) => trustRank(r.trust) >= trustRank(opts.minTrust!))
+  return out.sort((a, b) => b.timestamp - a.timestamp)
+}

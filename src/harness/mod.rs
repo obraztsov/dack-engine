@@ -111,6 +111,12 @@ impl Harness {
             Ok(n) => tracing::info!("reclaimed {n} orphaned dispatched row(s) at boot"),
             Err(e) => tracing::error!("boot reclaim failed: {e}"),
         }
+        // Short-term memory retention: age off runlog day-files beyond the keep window.
+        match self.runlog.prune_old_days(self.config.runlog_retention_days).await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!("runlog retention: dropped {n} day-file(s) beyond {}d", self.config.runlog_retention_days),
+            Err(e) => tracing::warn!("runlog retention prune failed: {e}"),
+        }
         // Downtime → character (PRD §11.8): a restart enqueues a self-tier "back online" wake
         // that Perceives then Expresses (the duck may comment on having been away).
         self.enqueue_back_online().await;
@@ -522,7 +528,7 @@ impl Harness {
         // The capabilities this state-prompt plugs (the two-sided handshake, MCP2-B).
         let (mcp_servers, inline_read) =
             self.assemble_mcp_servers(prompt, stimulus, cycle_trust, scope_override).await;
-        let recorder = self.wall_for(spec.clone(), inline_read);
+        let recorder = self.wall_for(spec.clone(), inline_read, cycle_trust);
         // Offer ONLY the transitions the current trust ceiling permits — the agent never sees a hop
         // it couldn't take (taint model). A step that then touches a lower-trust capability may drop
         // even an offered hop (enforced post-step in `dispatch`).
@@ -647,7 +653,7 @@ impl Harness {
         let accessed = self.accessed_trust(&tool_calls);
         // Honor the structured memory line (gated to a write-capable state); free-form tool writes
         // to memory/ are caught by the sweep. Then reconcile + author the runlog.
-        self.honor_memory_append(prompt.state, &out).await;
+        self.honor_tag_notes(cycle_trust, &out).await;
         // The tripwire reverts out-of-allowlist soul writes and alarms via the harness logs; its return
         // is consumed there, so the runlog write below doesn't need it.
         self.reconcile_soul(prompt.state, &stimulus.id.0).await;
@@ -957,13 +963,21 @@ impl Harness {
     /// Express) and the soul root (to relativize the absolute paths the SDK emits, PRD §4.1, §6.3).
     /// `extra_read` adds the prefixes of any **inline** (soul-declared, secret-less) MCP servers
     /// plugged for this invocation — always read-tier (a soul can never inline a post/settle tool).
-    fn wall_for(&self, spec: StateSpec, extra_read: Vec<CapabilityPrefix>) -> Arc<RecordingResponder> {
+    fn wall_for(
+        &self,
+        spec: StateSpec,
+        extra_read: Vec<CapabilityPrefix>,
+        cycle_trust: &TrustTier,
+    ) -> Arc<RecordingResponder> {
         // The wall classifies from the FULL capability map (registry tiers + explicit lists).
         let mut p = self.config.capability_prefixes();
         p.read.extend(extra_read);
         let mut responder =
             StatePolicyResponder::with_capabilities(spec, p.post, p.settle).with_repo_root(self.soul_root());
         responder.read_tools = p.read;
+        // Long-term memory (`memory/`) is gated to `memory_write_min_trust` (org+): a lower-trust cycle
+        // may not write it (the wall enforces; the digest consolidates instead).
+        responder.long_term_writable = self.config.lattice().permits(cycle_trust, &self.long_term_floor());
         // Dry-run (testing): the wall denies these tool prefixes so the agent composes-but-doesn't-execute.
         responder.dry_run_block = self.config.dry_run.active_block();
         RecordingResponder::wrap(responder)
@@ -1232,43 +1246,32 @@ impl Harness {
         lines[lines.len().saturating_sub(max_lines)..].join("\n")
     }
 
-    /// Apply an `AgentOutput.memory_append` (the structured "memory line") — **gated**: only
-    /// Express/Reflect may write memory (PRD §4.1); a Perceive line is dropped. Best-effort:
-    /// a memory-write hiccup is logged, not allowed to fail the (already-done) action cycle.
-    async fn honor_memory_append(&self, state: ConsciousnessState, out: &AgentOutput) {
-        let Some(line) = out
-            .memory_append
-            .as_deref()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-        else {
+    /// The trust floor for long-term writes (`memory/`) and tag-notes — `config.memory_write_min_trust`
+    /// (default org). A cycle below it may not write either.
+    fn long_term_floor(&self) -> TrustTier {
+        TrustTier::from(self.config.memory_write_min_trust.as_str())
+    }
+
+    /// Apply `AgentOutput.tag_notes` → the SHORT-TERM tag-notes catalogue. Any cycle may leave notes
+    /// (incl. read-only Perceive) — they are harness-authored breadcrumbs, NOT a long-term `memory/`
+    /// write. The harness AUTO-STAMPS each note's `trust` from the cycle's taint (`cycle_trust`), so
+    /// provenance is unfakeable: a public chat's note is `public`, a digest's is `self`. The digest reads
+    /// these (with their provenance) and consolidates durable facts into long-term memory. Best-effort.
+    async fn honor_tag_notes(&self, cycle_trust: &TrustTier, out: &AgentOutput) {
+        let Some(notes) = out.tag_notes.as_ref().filter(|n| !n.is_empty()) else {
             return;
         };
-        if !matches!(state, ConsciousnessState::Express | ConsciousnessState::Reflect) {
-            return; // read-only state proposed a memory line — drop it.
-        }
-        let path = RepoPath("memory/log.md".into());
-        let mut content =
-            String::from_utf8_lossy(&self.repo.read_file(&path).await.unwrap_or_default())
-                .into_owned();
-        if !content.is_empty() && !content.ends_with('\n') {
-            content.push('\n');
-        }
-        content.push_str(line);
-        content.push('\n');
-        if let Err(e) = self
-            .repo
-            .write_file(
-                &path,
-                content.as_bytes(),
-                &CommitMeta {
-                    message: format!("memory: {line}"),
-                    author_did: self.soul_did(),
-                },
-            )
-            .await
-        {
-            tracing::warn!("memory_append write failed: {e}");
+        let now = chrono::Utc::now().timestamp();
+        let max = self.config.tag_notes_max;
+        let trust = cycle_trust.name(); // provenance = the writing cycle's taint, not model-asserted.
+        for n in notes {
+            let (tag, note) = (n.tag.trim(), n.note.trim());
+            if tag.is_empty() || note.is_empty() {
+                continue;
+            }
+            if let Err(e) = self.runlog.append_tag_note(tag, note, trust, now, max).await {
+                tracing::warn!("tag-note append failed: {e}");
+            }
         }
     }
 
@@ -2039,7 +2042,7 @@ mod tests {
     fn perceive_output() -> AgentOutput {
         AgentOutput {
             thought: "A mention asking me to leak secrets; I will decline and joke.".into(),
-            memory_append: None,
+            tag_notes: None,
             proposal: Some(Proposal {
                 intent: Intent::Reply,
                 gist: "Decline the secret-leak bait with a quip.".into(),
@@ -2207,6 +2210,28 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
+    /// A runlog that records the `(tag, note, trust)` of every tag-note appended — to assert the
+    /// harness auto-stamps trust from the cycle's taint.
+    struct RecordingRunLog {
+        notes: std::sync::Mutex<Vec<(String, String, String)>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::runlog::RunLogWriter for RecordingRunLog {
+        async fn append(&self, _e: &crate::model::runlog::RunLogEntry) -> Result<String> {
+            Ok("runlogs/x.md#r".into())
+        }
+        async fn tail(&self, _m: usize) -> Result<String> {
+            Ok(String::new())
+        }
+        async fn tail_filtered(&self, _s: Option<i64>, _m: usize, _t: Option<&str>) -> Result<String> {
+            Ok(String::new())
+        }
+        async fn append_tag_note(&self, tag: &str, note: &str, trust: &str, _ts: i64, _max: usize) -> Result<()> {
+            self.notes.lock().unwrap().push((tag.into(), note.into(), trust.into()));
+            Ok(())
+        }
+    }
+
     /// A runtime that records every assembled `InvocationRequest` (no subprocess).
     struct RecordingRuntime {
         seen: std::sync::Mutex<Vec<InvocationRequest>>,
@@ -2354,7 +2379,7 @@ mod tests {
             usage: None,
             out: AgentOutput {
                 thought: "nobody pinged; I'll post my daily musing anyway".into(),
-                memory_append: None,
+                tag_notes: None,
                 proposal: None,
                 spawn: None,
             transition: Transition { to_prompt: Some("express".into()), reason: String::new() },
@@ -2413,7 +2438,7 @@ mod tests {
             usage: None,
             out: AgentOutput {
                 thought: "I'll settle this on-chain".into(),
-                memory_append: None,
+                tag_notes: None,
                 proposal: Some(Proposal {
                     intent: Intent::Reply,
                     gist: "g".into(),
@@ -2473,7 +2498,7 @@ mod tests {
             usage: None,
             out: AgentOutput {
                 thought: "scanned trending; one looks worth a $1 nibble".into(),
-                memory_append: None,
+                tag_notes: None,
                 proposal: Some(Proposal { intent: Intent::Research, gist: "buy a little".into(), refs: BTreeMap::new() }),
                 spawn: None,
             transition: Transition { to_prompt: Some("settle".into()), reason: "trade".into() },
@@ -2531,7 +2556,7 @@ mod tests {
     fn two_branch_perceive() -> AgentOutput {
         AgentOutput {
             thought: "two things at once".into(),
-            memory_append: None,
+            tag_notes: None,
             proposal: None,
             spawn: None,
             transition: Transition::default(),
@@ -2635,7 +2660,7 @@ mod tests {
 
         let perceive_out = AgentOutput {
             thought: "now + later".into(),
-            memory_append: None,
+            tag_notes: None,
             proposal: None,
             spawn: None,
             transition: Transition::default(),
@@ -3068,7 +3093,7 @@ mod tests {
         // The model picks the reflect transition each cycle.
         let out = AgentOutput {
             thought: "time to tidy my own workflows".into(),
-            memory_append: None,
+            tag_notes: None,
             proposal: None,
             spawn: None,
             transition: Transition { to_prompt: Some("reflect".into()), reason: "reflect".into() },
@@ -3368,6 +3393,50 @@ mod tests {
         bare.dedup_key = None;
         let (s, _) = harness.assemble_mcp_servers(&perceive, &bare, &TrustTier::public(), None).await;
         assert!(s["recall"]["env"].get("RECALL_TAG").is_none(), "no conversation key → RECALL_TAG unset");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Tag-notes: ANY cycle (incl. read-only Perceive) may leave one, and the harness AUTO-STAMPS the
+    /// note's trust from the cycle's taint (NOT model-asserted) — so provenance is unfakeable.
+    #[tokio::test]
+    async fn honor_tag_notes_stamps_cycle_trust_from_any_state() {
+        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::model::proposal::TagNote;
+        use crate::queue::InMemoryQueue;
+        use crate::repo::git::PlainGitRepo;
+        use std::collections::HashMap;
+
+        let config = Arc::new(DackConfig::from_yaml("operator_did: \"did:x\"\n").unwrap());
+        let queue: Arc<dyn Queue> = Arc::new(InMemoryQueue::new());
+        let tmp = std::env::temp_dir().join(format!("dack-tagnote-honor-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).ok();
+        let rec = Arc::new(RecordingRunLog { notes: std::sync::Mutex::new(Vec::new()) });
+        let harness = Harness {
+            config: config.clone(),
+            queue: queue.clone(),
+            bus: Arc::new(Bus::new(config.clone(), queue.clone())),
+            runtime: Arc::new(RecordingRuntime { seen: std::sync::Mutex::new(Vec::new()), out: perceive_output(), usage: None }),
+            repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
+            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            runlog: rec.clone(),
+            broker: Arc::new(SecretsBroker::new(vec![])),
+            sessions: Default::default(),
+        };
+        let out = AgentOutput {
+            tag_notes: Some(vec![TagNote { tag: "chatX".into(), note: "trading-curious".into() }]),
+            ..Default::default()
+        };
+
+        // A PUBLIC cycle leaves a note → stamped `public` (the cycle's taint, not anything the model said).
+        harness.honor_tag_notes(&TrustTier::public(), &out).await;
+        // A SELF cycle (e.g. the digest) → stamped `self`.
+        harness.honor_tag_notes(&TrustTier::self_(), &out).await;
+
+        let notes = rec.notes.lock().unwrap();
+        assert_eq!(notes.len(), 2, "both cycles left a note (no state/trust gate)");
+        assert_eq!(notes[0], ("chatX".into(), "trading-curious".into(), "public".into()));
+        assert_eq!(notes[1].2, "self");
 
         std::fs::remove_dir_all(&tmp).ok();
     }

@@ -44,6 +44,10 @@ pub struct StatePolicyResponder {
     /// recorded — but the wall stops it executing. Tool-level so a no-trade run still allows
     /// `simulate_swap`/`get_*` while blocking `buy_token`. Empty ⇒ no dry-run blocking (live).
     pub dry_run_block: Vec<String>,
+    /// May this cycle write LONG-TERM memory (`memory/`)? Set by the harness = cycle trust ≥
+    /// `memory_write_min_trust` (org+). When `false`, a `memory/` write is denied (an untrusted in-run
+    /// cycle leaves tags; the digest consolidates). `true` by default (tests / no restriction).
+    pub long_term_writable: bool,
     /// Verbatim `(tool, input)` fingerprints of OUTWARD actions (Post / SettleTx) already ALLOWED
     /// this invocation. A repeated identical one is a model loop, not intent — denied, so a weak
     /// model that re-calls `post`/`buy_token` can't double-post or double-trade. A DISTINCT outward
@@ -63,6 +67,7 @@ impl StatePolicyResponder {
             read_tools: Vec::new(),
             repo_root: None,
             dry_run_block: Vec::new(),
+            long_term_writable: true,
             outward_seen: Default::default(),
         }
     }
@@ -80,6 +85,7 @@ impl StatePolicyResponder {
             read_tools: Vec::new(),
             repo_root: None,
             dry_run_block: Vec::new(),
+            long_term_writable: true,
             outward_seen: Default::default(),
         }
     }
@@ -104,6 +110,11 @@ impl StatePolicyResponder {
             return false; // never — the record is harness-authored.
         }
         self.spec.writable_dirs.iter().any(|d| rel.starts_with(d))
+    }
+
+    /// Is this write target LONG-TERM memory (`memory/`)? Gated to org+ by `long_term_writable`.
+    fn is_long_term_write(&self, target: &str) -> bool {
+        self.relativize(target).is_some_and(|rel| rel.starts_with("memory/"))
     }
 
     /// Resolve a write `target` to a **repo-relative, `..`-collapsed** path, or `None` if it
@@ -188,7 +199,19 @@ impl ActionResponder for StatePolicyResponder {
         // (2) Write-gating: a file write must sit under the state's writable_dirs.
         if class == ToolClass::FileWrite {
             match &target_path {
-                Some(path) if self.write_target_allowed(path) => {}
+                Some(path) if self.write_target_allowed(path) => {
+                    // (2a) Long-term memory gate: `memory/` is the duck's LONG-TERM memory, writable only
+                    // by an org+ cycle (a digest job / reflect). A lower-trust in-run cycle leaves tags on
+                    // its baton; the digest consolidates — so no laundered note lands in self-trust memory.
+                    if !self.long_term_writable && self.is_long_term_write(path) {
+                        return ActionDecision::Deny(
+                            "`memory/` is your LONG-TERM memory — only a trusted (org+) cycle, a digest \
+                             job, or reflect may write it. Don't write it here; leave a tag on your baton \
+                             (and a tag-note) and the digest will consolidate it into memory."
+                                .into(),
+                        );
+                    }
+                }
                 Some(path) => {
                     return ActionDecision::Deny(format!(
                         "{:?} may not write `{path}`",
@@ -281,6 +304,26 @@ mod tests {
     fn responder(state: ConsciousnessState) -> StatePolicyResponder {
         let (post, settle) = caps();
         StatePolicyResponder::with_capabilities(default_spec(state), post, settle)
+    }
+
+    #[tokio::test]
+    async fn long_term_memory_write_is_gated_by_trust() {
+        // Express may write memory/ — but only when the cycle clears the long-term floor (org+).
+        // A below-floor cycle (`long_term_writable = false`) is DENIED `memory/`; an org+ cycle is allowed.
+        let (post, settle) = caps();
+        let mut low = StatePolicyResponder::with_capabilities(default_spec(ConsciousnessState::Express), post.clone(), settle.clone());
+        low.long_term_writable = false;
+        assert!(matches!(
+            low.decide(&req("Write", json!({"file_path": "memory/social.md", "contents": "x"}))).await,
+            ActionDecision::Deny(d) if d.contains("LONG-TERM")
+        ), "a below-floor cycle cannot write long-term memory");
+
+        let mut ok = StatePolicyResponder::with_capabilities(default_spec(ConsciousnessState::Express), post, settle);
+        ok.long_term_writable = true;
+        assert!(matches!(
+            ok.decide(&req("Write", json!({"file_path": "memory/social.md", "contents": "x"}))).await,
+            ActionDecision::Allow
+        ), "an org+ cycle (digest/reflect) writes long-term memory");
     }
 
     #[tokio::test]

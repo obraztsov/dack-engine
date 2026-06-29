@@ -120,6 +120,15 @@ impl GitCore {
             .await
     }
 
+    /// Delete a tracked file and commit the removal (harness-authored). Used by runlog retention to
+    /// age off old day-files. A no-op (returns HEAD) if the path isn't tracked/present.
+    pub async fn remove(&self, path: &RepoPath, message: &str, author: &str) -> Result<CommitId> {
+        if self.git(&["rm", "-f", "--", &path.0]).await.is_err() {
+            return self.head().await; // not tracked / already gone — nothing to do.
+        }
+        self.commit_path(&path.0, message, author).await
+    }
+
     /// List files under `path` (filesystem walk, `.git` excluded) to `max_depth` relative
     /// to `path` — used by the `stimuli/` walker (depth ≤ 2, PRD §5.1) and memory `ls`.
     pub async fn list_dir(&self, path: &RepoPath, max_depth: usize) -> Result<Vec<RepoPath>> {

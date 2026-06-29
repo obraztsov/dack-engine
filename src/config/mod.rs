@@ -165,6 +165,16 @@ fn default_reaches() -> ConsciousnessState {
     ConsciousnessState::Express
 }
 
+fn default_memory_write_min_trust() -> String {
+    "org".into()
+}
+fn default_tag_notes_max() -> usize {
+    200
+}
+fn default_runlog_retention_days() -> u64 {
+    10
+}
+
 fn default_reflect_interval() -> i64 {
     86_400 // one day — a sane self-modification cadence; the operator may loosen or `0` to disable.
 }
@@ -580,6 +590,19 @@ pub struct DackConfig {
     /// Operational logging (the `tracing` subscriber): level + format. Default `info`/`auto`.
     #[serde(default)]
     pub log: LogConfig,
+    /// **Long-term memory** model. `memory/` is gated to this trust tier or above — a cycle below it may
+    /// NOT write `memory/` (no laundered note from an untrusted in-run cycle; consolidation goes through
+    /// org+ digest jobs / reflect). Tag-notes (short-term) share this floor. Default `org`.
+    #[serde(default = "default_memory_write_min_trust")]
+    pub memory_write_min_trust: String,
+    /// Cap on the tag-notes catalogue (`runlogs/tag-notes.ndjson`): keep only the last N notes (the read
+    /// tool dedups to latest-per-tag anyway). Default 200.
+    #[serde(default = "default_tag_notes_max")]
+    pub tag_notes_max: usize,
+    /// Short-term memory retention: keep only the last N `runlogs/<date>.md` day-files (older deleted on
+    /// boot + day-rollover) — bounds the repo and what the recall MCPs can scan. Default 10.
+    #[serde(default = "default_runlog_retention_days")]
+    pub runlog_retention_days: u64,
     /// **Load-shedding cap** (Phase 4): the max PENDING queue depth before the OLDEST `Low`-priority
     /// items are evicted (Normal+ is the protected floor, never shed; every eviction is logged).
     /// Protects a busy duck from a runaway low-priority fan-out backlog. `None` = unbounded.

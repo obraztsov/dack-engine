@@ -14,6 +14,7 @@ import {
   loadEntries,
   renderThoughtLog,
   atLeastTrust,
+  readTagNotes,
 } from './runlog-recall'
 
 // A fixture runlog in the exact format `src/runlog/mod.rs::render` emits: two chats interleaved
@@ -183,6 +184,28 @@ test('atLeastTrust floors out lower-trust chats', () => {
   expect(org.some((e) => e.tags.includes('chatB'))).toBe(false)
   // no floor → keeps everything.
   expect(atLeastTrust(es, undefined).length).toBe(es.length)
+})
+
+test('readTagNotes dedups to the latest note per tag, filters by tag + min_trust, newest first', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'recall-notes-'))
+  const lines = [
+    { tag: 'chatA', note: 'old A', trust: 'org', timestamp: 100 },
+    { tag: 'chatB', note: 'B note', trust: 'public', timestamp: 150 },
+    { tag: 'chatA', note: 'NEW A', trust: 'org', timestamp: 200 }, // supersedes old A
+    '', // blank line tolerated
+    'not json', // malformed line skipped
+  ]
+  writeFileSync(join(dir, 'tag-notes.ndjson'), lines.map((l) => (typeof l === 'string' ? l : JSON.stringify(l))).join('\n'))
+
+  const all = readTagNotes(dir)
+  expect(all.map((r) => r.tag)).toEqual(['chatA', 'chatB']) // chatA newest (ts 200) first
+  expect(all.find((r) => r.tag === 'chatA')!.note).toBe('NEW A') // latest-per-tag
+
+  expect(readTagNotes(dir, { tag: 'chatB' }).map((r) => r.note)).toEqual(['B note'])
+  // min_trust org → drops chatB (public).
+  expect(readTagNotes(dir, { minTrust: 'org' }).map((r) => r.tag)).toEqual(['chatA'])
+  // missing file → clean empty.
+  expect(readTagNotes('/no/such/dir')).toEqual([])
 })
 
 test('missing day / dir degrades cleanly (empty, not a throw)', () => {

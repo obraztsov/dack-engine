@@ -10,9 +10,9 @@ soul/
 ├── prompts/           # state-prompts: one markdown file per step of a cycle
 ├── stimuli/           # duties: what wakes the agent (cron / webhook + sensor)
 ├── agents/            # worker definitions the agent may delegate to
-├── memory/            # the agent's durable notes (writable in Express+)
+├── memory/            # long-term memory (durable notes; trust-gated writes)
 ├── skills/            # reference material / scripts the agent can read
-└── runlogs/           # the append-only "syslog" the harness writes
+└── runlogs/           # short-term memory: the append-only log the harness writes
 ```
 
 ## `SOUL.md`
@@ -43,7 +43,15 @@ Return a structured result:
 - thought: your reasoning (logged, never published)
 - batons: [ { to_prompt, gist, priority? } ]   # your fan-out: 0, 1, or several branches
 - spawn: { agent, brief } | null               # optional: delegate a job to a worker
+- tag_notes: [ { tag, note } ]                  # optional short-term "sticky notes" (below)
 ```
+
+`tag_notes` are short notes the agent leaves about a thread as it goes — `{ tag, note }`, e.g.
+`{ tag: "chat:42", note: "asked me to track the launch" }`. They are part of **short-term** memory: the
+harness appends them to the runlog catalogue and **stamps each with the writing cycle's trust** (the agent
+does not — and cannot — set it), so a public chat's note is provably `public`. Any state may leave one,
+including Perceive. The agent retrieves them later through the recall tools; they never become long-term
+memory except through a digest.
 
 `batons` is the fan-out: **one** element takes a single next step (the common case), **several** do
 several things at once — each its own digested gist + destination, each gated independently by the
@@ -120,10 +128,34 @@ Definitions for delegated subagents the agent may spawn from an act state. See
 
 ## Memory & skills
 
-`memory/` is the agent's durable scratch space — writable in Express and above, soul-protected
-otherwise. Keep an `INDEX.md` the agent can scan. `skills/` holds reference material and read-only
-scripts the agent can consult. Both are part of the firebreak-protected soul: a non-Reflect cycle can
-write `memory/` but never `skills/` or the prompts.
+The agent has **two** memories (see [concepts](concepts.md#memory-short-term-vs-long-term)):
+
+- **Short-term — the runlog.** Append-only, retention-bounded (`runlog_retention_days`), harness-written;
+  the agent never reads or writes the files. It reaches its own history through **recall** MCP servers,
+  which a state-prompt requests like any capability and which the soul template wires up:
+  - `recall` returns the verbatim transcript (others' words included) and **taints** the cycle `public`.
+  - `recall-self` returns only the agent's own past thoughts, gists, and tag-notes — the trusted side of
+    the firebreak — so it does **not** taint. A cycle that needs to stay trusted (to write memory or act)
+    uses this one.
+  - Both also expose discovery tools (list days, list tags, search) so a fresh session can reorient.
+
+- **Long-term — `memory/`.** The agent's durable notes (an `INDEX.md` the agent can scan helps it find
+  them). Writing `memory/` is **trust-gated**: only a cycle at or above `memory_write_min_trust` (default
+  `org`) may write it — an untrusted in-run cycle can leave a short-term tag-note but cannot launder into
+  long-term memory. It is still soul-protected against `skills/`/prompts edits outside Reflect.
+
+`skills/` holds reference material and read-only scripts the agent can consult — part of the
+firebreak-protected soul, writable only in Reflect.
+
+### The digest pattern (short-term → long-term)
+
+The only path from conversation activity into long-term memory is a **digest**: a scheduled cron duty that
+runs at `self` trust (`directive_tier: self`, pure-cron so no untrusted payload) with a two-prompt cycle —
+a Perceive step that reads short-term memory via `recall-self` (staying clean), then a distill step that
+consolidates the durable parts into `memory/` and optionally surfaces suggestions to the operator over
+`telegram-send`. The template ships `activity-digest` and `twitter-digest` as working examples. Because the
+perceive side never touches `recall` (the tainting one), the whole cycle keeps the trust needed to write
+memory — the trust boundary stays intact and `memory/` stays single-writer-class.
 
 ## Self-modification (Reflect)
 

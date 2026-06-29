@@ -84,6 +84,29 @@ everyone, and an authorized proactive send that's gated by trust. See
 [capabilities](capabilities.md#locking-a-capability-to-per-cycle-data-scope_env) for the `scope_env`
 and `min_trust` mechanisms.
 
+## The bundled Twitter/X integration
+
+X is reached as MCP capabilities rather than a long-running module — inbound is a polling sensor, egress
+is a pair of MCP servers, and the same trust split applies.
+
+- **Inbound** — a duty's fetch script (`stimuli/*/STIMULUS.md`) polls mentions / a thread and emits a
+  stimulus. Incoming tweets seed `public`, so reading them taints a cycle and it can only *reply*, never
+  trade or self-edit on the strength of a stranger's tweet. In Perceive the agent can also pull X context
+  on demand via the read server.
+- **Egress — write (`twitter-mcp.ts`)** — exposes `post`, `reply`, and the deliberate amplification tools
+  `retweet` / `unretweet` / `quote_tweet`. These are **Post**-class (Express only) and the amplification
+  tools are listed in `dry_run.block`, so they are previewed (logged, not sent) until the operator clears a
+  specific action — amplification is meant to be rare and considered.
+- **Egress — read (`twitter-read-mcp.ts`)** — `get_followers` / `get_following` / `get_liking_users` and
+  timeline reads. A `public` capability: useful for context but it taints, so a digest that calls it cannot
+  then write long-term memory in the same cycle.
+
+**There is deliberately no follow tool.** Following is a stronger social signal (and an account-risk
+surface) that stays a human decision: the `twitter-digest` job, when it spots an account worth following,
+*suggests* it to the operator over Telegram (`telegram-send`), and the operator follows manually. See
+[concepts](concepts.md#memory-short-term-vs-long-term) for the digest pattern and
+[capabilities](capabilities.md) for the trust classes.
+
 ## Coalescing a busy channel
 
 A high-volume channel (a group with read-everything enabled) can flood the single-flight loop. A duty

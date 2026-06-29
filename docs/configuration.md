@@ -234,6 +234,26 @@ commit author; you authenticate the push with an SSH deploy key (no `auth` neede
 | `db_path` | string | `dack.sqlite` | The embedded SQLite queue path (ephemeral — losing it loses only the queue). |
 | `webhook_addr` | string | `127.0.0.1:8787` | The localhost bind for the webhook listener. Nothing is public without a proxy. |
 | `invoke_timeout_secs` | int | `300` | Wall-clock budget for one consciousness invocation incl. the wall round-trips. A hung LLM/bridge elapses here → a logged error → the loop continues. |
+| `session_max_context_tokens` | int \| null | `null` | Evict a sticky engine session once its model context exceeds this many tokens (the next wake starts fresh) — bounds context bloat. `null` = off (only the idle TTL applies). |
+| `memory_write_min_trust` | string | `org` | Trust floor for writing **long-term `memory/`**. A cycle below this tier is denied the write (it can still leave a short-term tag-note). Keeps untrusted in-run cycles from laundering into long-term memory; the digest jobs run at `self` and clear it. |
+| `tag_notes_max` | int | `200` | Cap on the short-term **tag-notes** catalogue (`runlogs/tag-notes.ndjson`): only the last N notes are kept. |
+| `runlog_retention_days` | int | `10` | **Short-term memory retention**: keep only the last N `runlogs/<date>.md` day-files; older ones are deleted on boot and day-rollover. Also bounds how far back the recall tools can scan. |
+
+### `log` — structured logging
+
+Operational logging via the `tracing` framework, written to **stdout** (so `docker logs` / an operator
+backend can capture it). Distinct from the runlog (which is the agent's own memory). `RUST_LOG` overrides
+`level` for per-module control (e.g. `RUST_LOG=dack::harness=debug`).
+
+```yaml
+log:
+  level: info     # trace | debug | info | warn | error
+  format: auto    # auto (pretty TEXT on a TTY, JSON when piped/containerized) | text | json
+```
+
+Each cycle's log lines carry a correlation span (`cycle{stim=…}`), and every model call emits a latency
+line (`elapsed_ms`, token counts) — so a run is traceable end-to-end, and ready for the upcoming
+concurrent scheduler.
 
 ### `dry_run`
 

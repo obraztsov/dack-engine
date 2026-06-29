@@ -31,10 +31,20 @@ queue, not the agent (its identity and memory live in the soul repo).
 
 ## Observing a run
 
-The **runlog** (`<soul>/runlogs/<date>.md`) is the durable record of every cycle: the model's thought,
-each tool it called with the wall's verdict (allow / deny / dry-run), the transition it took, and the
-raw stimulus (clearly marked as untrusted). `dack log --follow` tails it. Because it's committed to the
-soul repo, the agent's full operational history is attributable to it and inspectable after the fact.
+There are two distinct streams, for two audiences:
+
+- **The runlog** (`<soul>/runlogs/<date>.md`) is the *agent's* record of every cycle: the model's thought,
+  each tool it called with the wall's verdict (allow / deny / dry-run), the transition it took, and the
+  raw stimulus (clearly marked as untrusted). It's the agent's short-term memory, append-only and
+  retention-bounded (`runlog_retention_days`), and the agent reaches it via its recall tools rather than
+  reading the files. `dack log --follow` tails today's.
+- **The operational log** (stdout, via the `tracing` framework — configured by `log` in
+  [configuration](configuration.md#log--structured-logging)) is the *operator's* stream: boot, scheduling
+  decisions, every model call's latency + token usage, soul pushes, tripwire reverts, errors. On a TTY it's
+  pretty text; piped or containerized it's **JSON** (one object per line) for `docker logs` / a log
+  backend. Every line carries a `cycle{stim=…}` correlation span. Set `RUST_LOG` (e.g.
+  `RUST_LOG=dack::harness=debug`) for per-module verbosity. Levels: `trace` (context-assembly internals) ·
+  `debug` (decisions) · `info` (lifecycle) · `warn`/`error` (failures).
 
 `dack status` gives the at-a-glance view: is it alive, how deep is the queue, what was the last run.
 

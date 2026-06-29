@@ -55,7 +55,8 @@ Full walkthrough: **[docs/getting-started.md](docs/getting-started.md)**.
 | [Operations](docs/operations.md) | Daemon lifecycle, signed soul repos, identities |
 | [Secrets & sandbox](docs/secrets-and-sandbox.md) | The secret + isolation model |
 
-Design rationale and history live in [docs/internal/](docs/internal/).
+Design rationale lives inline in the code's module doc comments (`src/`) and across the
+[docs/](docs/) tree.
 
 ## Layout
 

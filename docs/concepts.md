@@ -32,9 +32,10 @@ The harness classifies every tool the model calls into a **tool class**, and eac
 only in certain states:
 
 - **Read** — file reads, search, web fetch, MCP resource reads. Safe in every state.
-- **FileWrite** — the single Write/Edit tool. The *path* decides what it touches: `memory/` is
-  writable in Express/Settle; the soul's own directories (`prompts/`, `skills/`, sensors) are writable
-  only in Reflect.
+- **FileWrite** — the single Write/Edit tool. The *path* decides what it touches: `memory/`
+  (long-term memory) is writable in Express/Settle but only by a sufficiently-trusted cycle (see
+  [Memory](#memory-short-term-vs-long-term) below); the soul's own directories (`prompts/`, `skills/`,
+  sensors) are writable only in Reflect. The harness-authored `runlogs/` are never agent-writable.
 - **Post** — a reversible capability MCP tool (e.g. `mcp__twitter__post`). Express only.
 - **SettleTx** — an irreversible capability MCP tool. Settle only.
 - **Shell** — raw Bash/REPL. Denied in every consciousness state (it would bypass the path gate). Real
@@ -90,6 +91,37 @@ post, a trade, or a self-edit; at most it can shape a gist that the model itself
 
 The same firebreak applies to delegated work: a worker's result re-enters the agent as a new,
 untrusted stimulus (`public`), to be judged like any other input — never as a trusted continuation.
+
+## Memory: short-term vs long-term
+
+The agent has two memories, mirroring a mind:
+
+- **Short-term — the runlog.** The harness writes one append-only record per cycle to `runlogs/<date>.md`
+  (a separate, private store). It ages off (a configurable retention window, e.g. ~10 days). The agent
+  never reads or writes these files directly — it reaches them only through **recall** tools (so a
+  fresh or context-evicted session can reconstruct what just happened). Alongside the entries is a
+  **tag-notes catalogue**: short "sticky notes" the agent leaves about a conversation as it goes
+  (`{tag, note}`), which the harness stamps with the writing cycle's **trust** (unfakeable provenance —
+  a public chat's note is `public`, a trusted cycle's is `self`).
+
+- **Long-term — `memory/`.** Durable knowledge: who people are, lasting context, the agent's own notes
+  to itself. It is **trust-gated**: only a cycle at or above `memory_write_min_trust` (default `org`)
+  may write `memory/`. An untrusted in-run cycle therefore cannot launder a note into long-term memory;
+  it can only leave a short-term, trust-stamped tag-note.
+
+Two recall surfaces let the model navigate its own history, and the *choice between them is a trust
+decision the model makes*:
+
+- **`recall`** returns the verbatim transcript (incl. others' words). Reading it taints the cycle
+  `public` — raw untrusted text crossing back in.
+- **`recall-self`** returns only the agent's *own* post-firebreak output (its thoughts + what it said,
+  plus the tag-notes), never the raw incoming text. Because that's the trusted side of the firebreak,
+  reading it does **not** taint the cycle — a trusted job can review its past and still act.
+
+**Digest jobs** bridge the two: a scheduled, self-trust cycle reads short-term memory via `recall-self`
+(staying clean) and consolidates the durable parts into long-term `memory/`. This is the only path by
+which conversation activity becomes long-term memory, which keeps the trust boundary intact and makes
+`memory/` a single-writer-class resource.
 
 ## Where the boundaries live
 

@@ -54,6 +54,13 @@ If you mislabel a public-world server as `trust: self`, a cycle that reads it wo
 trade or self-edit off untrusted data — the exact failure the taint model exists to prevent. A
 soul-inlined MCP is not in the registry, so it always taints `public`.
 
+The same data can be exposed at two labels on purpose. The recall surface ships as a pair: `recall`
+(`trust: public`) returns the verbatim transcript including others' words, so reading it taints; while
+`recall-self` (`trust: self`) returns only the agent's *own* post-firebreak thoughts and tag-notes, which
+are the trusted side of the firebreak and so don't taint. A digest job calls `recall-self` to review its
+history and *still* write long-term memory; calling `recall` in the same cycle would degrade it to
+`public` and forfeit that. The label is the contract — choosing which server to call is a trust decision.
+
 ## Authorization (`min_trust`)
 
 Set `min_trust` to require a floor of caller trust. The server is only assembled for a cycle whose

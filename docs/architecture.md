@@ -86,6 +86,31 @@ reverts any change to the soul made outside a Reflect cycle, so self-modificatio
 See [authoring souls](authoring-souls.md) for the bundle layout and [operations](operations.md) for the
 signing/identity setup.
 
+## Memory & digests
+
+The agent has two memories (see [concepts](concepts.md#memory-short-term-vs-long-term) for the model):
+
+- **Short-term** is the **runlog** (`src/runlog/`) — one append-only record per cycle, plus a tag-notes
+  catalogue, kept in the soul under `runlogs/` and retention-bounded (`runlog_retention_days`). The agent
+  never reads those files directly; it reaches them through two **recall** MCP servers — `recall` (verbatim
+  transcript, taints the cycle `public`) and `recall-self` (only the agent's own post-firebreak thoughts +
+  tag-notes, does **not** taint). The recall surface (`openclaude-bridge/runlog-recall*.ts`) also exposes
+  discovery tools (list days, list tags, search) so a fresh or context-evicted session can reorient.
+- **Long-term** is `memory/` in the soul — durable knowledge, **trust-gated** to `memory_write_min_trust`
+  (default `org`) at the path gate.
+
+The bridge between them is a **digest** — a scheduled, `self`-trust cron cycle (e.g. `activity-digest`,
+`twitter-digest`) that perceives short-term memory via `recall-self` (staying clean) and distills the
+durable parts into `memory/`, optionally surfacing suggestions to the operator over Telegram. Digests are
+the *only* path by which conversation activity becomes long-term memory, keeping `memory/` single-writer.
+
+## Observability
+
+Operational logging is structured (`tracing` → stdout, configured by `log`): each cycle is a correlation
+span, every model call emits a latency + token-usage line, and lifecycle/scheduling/error events stream as
+pretty text on a TTY or JSON when containerized. This is distinct from the runlog (the agent's memory); see
+[operations](operations.md#observing-a-run).
+
 ## Module map
 
 | Module | Responsibility |

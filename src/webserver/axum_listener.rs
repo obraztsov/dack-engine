@@ -1,7 +1,7 @@
-//! `axum` webhook listener (PRD §2, §5.1) — the inbound HTTP surface for `webhook`-triggered
+//! `axum` webhook listener — the inbound HTTP surface for `webhook`-triggered
 //! duties, bound **localhost-only**. A matched `POST <path>` emits a [`FiredTrigger`] (the
 //! request body as `public`-tier payload) onto the shared channel the harness drains; the
-//! body is **data, never a script** (PRD §5.3), so a webhook can wake a duty but cannot
+//! body is **data, never a script**, so a webhook can wake a duty but cannot
 //! introduce one. The route table hot-reloads from the registry via [`set_routes`].
 
 use std::collections::HashMap;

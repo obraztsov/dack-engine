@@ -1,11 +1,11 @@
-//! SQLite-backed single-flight queue (PRD §5.6, §9.3) — the v1 durable store for the
+//! SQLite-backed single-flight queue — the v1 durable store for the
 //! ephemeral stimulus/dedup queue. `bundled` SQLite compiles in-tree (no system libsqlite),
 //! keeping the box dependency-light. Losing this DB loses only the queue, never the soul
-//! (that lives on Gitlawb, PRD §2).
+//! (that lives on Gitlawb).
 //!
 //! Threading: `rusqlite::Connection` is `Send` but `!Sync`, so a `Mutex<Connection>` is
 //! `Send + Sync`. The queries are sub-millisecond and the harness is single-flight
-//! (PRD §9.2), so taking the lock and doing synchronous SQLite work inside the async
+//! so taking the lock and doing synchronous SQLite work inside the async
 //! methods (never holding the lock across an `.await`) is correct and simple.
 
 use std::sync::Mutex;
@@ -44,7 +44,7 @@ CREATE TABLE IF NOT EXISTS stimulus (
 CREATE INDEX IF NOT EXISTS idx_stimulus_dedup        ON stimulus(type, dedup_key);
 CREATE INDEX IF NOT EXISTS idx_stimulus_status_rank  ON stimulus(status, priority_rank, received_at);
 
--- Cross-poll dedup watermarks (PRD §10.2): one row per duty cursor key.
+-- Cross-poll dedup watermarks: one row per duty cursor key.
 CREATE TABLE IF NOT EXISTS cursor (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -159,7 +159,7 @@ fn raw_to_stimulus(r: RawRow) -> Result<Stimulus> {
         priority: enum_from_db(&r.priority)?,
         status: enum_from_db(&r.status)?,
         directive_body: r.directive_body,
-        entry: r.entry, // a plain state-prompt id (MCP2-B), stored verbatim.
+        entry: r.entry, // a plain state-prompt id, stored verbatim.
     })
 }
 

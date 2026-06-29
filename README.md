@@ -61,9 +61,10 @@ Design rationale and history live in [docs/internal/](docs/internal/).
 
 - `src/` — the harness crate (Rust).
 - `openclaude-bridge/` — the TypeScript runtime bridge + bundled channel/capability adapters (Bun).
-- `soul-template/` — a starting template for the agent's durable bundle (copy it; in production it's a
-  separate, signed repo).
 - `dack.config.example.yaml` — the operator control plane.
+
+A starting template for the agent's durable bundle provided separately (copy it into a soul directory;
+in production it's a separate, signed repo).
 
 ## Status
 

@@ -8,7 +8,7 @@
 //! (consciousness substrate) is rented from OpenClaude over **stdio** — a child Node bridge
 //! running its SDK ([`runtime`]); the harness is the dumb, deterministic subconscious around it.
 //!
-//! ## The load-bearing invariants (architecture §1, DAC-context §4) — preserve these
+//! ## The load-bearing invariants — preserve these
 //! 1. **Intelligence lives in exactly one layer.** Sources and the bus are dumb; only
 //!    the consciousness states ([`state`]) run a model. Never put an LLM in the plumbing.
 //! 2. **Filters on cognition: no. Boundaries on irreversibility: yes.** The irreversibility
@@ -28,7 +28,7 @@
 //! - [`bus`] / [`queue`] / [`sources`] / [`webserver`] — the dumb stimulus pipeline
 //! - [`runtime`]  — the OpenClaude stdio-bridge seam + the `action_required` wall (taint-gated Settle)
 //! - [`identity`] / [`repo`] — the swappable seams (Gitlawb v1; corp later). Memory has **no**
-//!   Rust seam — the agent reaches it through the path-gated file tools (`docs/VERIFICATION.md`).
+//!   Rust seam — the agent reaches it through the path-gated file tools.
 //! - [`secrets`] / [`runlog`] — harness-owned plumbing stores
 //! - [`harness`]  — the actor-scheduler that wires it all together
 

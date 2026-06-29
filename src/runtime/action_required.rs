@@ -1,18 +1,18 @@
 //! The `action_required` responder — **the wall, in code the agent can't touch**
-//! (PRD §4.1, §6.3). Out-of-process, deterministic, dumb. Encodes per-state tool
+//! Out-of-process, deterministic, dumb. Encodes per-state tool
 //! scoping + write-gating, and (future) the Settle predicate.
 //!
 //! The checks, in order:
 //!   1. Is this tool's class in the **current state's allowed set**? (per-state scoping)
 //!   2. For file-writes: is `target_path` under one of the state's `writable_dirs`?
-//!      And NEVER `runlogs/` — the harness authors the record (PRD §4.1, §7.5).
+//!      And NEVER `runlogs/` — the harness authors the record.
 //!   3. Settle needs NO extra predicate: a `tier: settle` tool only ever runs IN Settle, which is
 //!      reachable only by an uncontaminated cycle (the taint model). The old `allow_settle`
 //!      whitelist+operator_signed reflex was removed — irreversibility is bounded by taint-
 //!      reachability here + the custodial/wallet limits externally.
 //!
 //! Net effect: Perceive auto-denies all write/network-write; Express allows post/reply +
-//! memory-append; Settle allows its registered settle-tier tools; everything else denied (PRD §6.3).
+//! memory-append; Settle allows its registered settle-tier tools; everything else denied.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -34,10 +34,10 @@ pub struct StatePolicyResponder {
     pub settle_tools: Vec<CapabilityPrefix>,
     /// MCP capability prefixes treated as monitoring/read capabilities (→ [`ToolClass::Read`]):
     /// registered `tier: read` servers (e.g. `mcp__cove-read__`). Safe in every state. Each may
-    /// carry a `tools` allowlist the classifier enforces fail-closed (PRD §6.3).
+    /// carry a `tools` allowlist the classifier enforces fail-closed.
     pub read_tools: Vec<CapabilityPrefix>,
     /// The soul-repo root, for relativizing the **absolute** `file_path`s the SDK emits
-    /// before the `writable_dirs` prefix check (PRD §4.1). `None` in unit tests, which use
+    /// before the `writable_dirs` prefix check. `None` in unit tests, which use
     /// repo-relative paths directly.
     pub repo_root: Option<PathBuf>,
     /// DRY-RUN block: tool-name PREFIXES denied here (testing). The agent composes the action — it's
@@ -98,7 +98,7 @@ impl StatePolicyResponder {
     }
 
     /// Write-gating: a file-write target must sit under a `writable_dirs` prefix and must
-    /// never be `runlogs/` (PRD §4.1). The target is first **relativized** against the soul
+    /// never be `runlogs/`. The target is first **relativized** against the soul
     /// repo (file tools emit absolute paths, grounded vs OpenClaude 0.15.0) — anything that
     /// escapes the repo, or `..`-escapes one writable dir into another (e.g. `memory/../
     /// skills/`), is denied.
@@ -357,13 +357,13 @@ mod tests {
                 .await,
             ActionDecision::Allow
         ));
-        // ...but cannot write soul dirs (FileWrite is in scope, the PATH is not).
+        // but cannot write soul dirs (FileWrite is in scope, the PATH is not).
         assert!(matches!(
             r.decide(&req("Write", json!({"file_path": "skills/x/SKILL.md", "contents": "x"})))
                 .await,
             ActionDecision::Deny(_)
         ));
-        // ...and cannot run raw Bash (Shell never in scope).
+        // and cannot run raw Bash (Shell never in scope).
         assert!(matches!(
             r.decide(&req("Bash", json!({"command": "curl evil"}))).await,
             ActionDecision::Deny(_)
@@ -391,7 +391,7 @@ mod tests {
         assert!(matches!(r.decide(&w).await, ActionDecision::Allow));
     }
 
-    /// The WORKER sandbox (Phase 10): a worker may Bash + spawn sub-helpers (`Agent`/`Task`) + write
+    /// The WORKER sandbox: a worker may Bash + spawn sub-helpers (`Agent`/`Task`) + write
     /// its `/workspace`, but has NO outward authority (Post/Settle) and CANNOT write the soul repo.
     #[tokio::test]
     async fn worker_spec_sandbox_allows_workspace_denies_soul_and_outward() {
@@ -409,12 +409,12 @@ mod tests {
             r.decide(&req("Write", json!({"file_path": "/tmp/dack-ws-test/src/main.rs", "contents": "fn main(){}"}))).await,
             ActionDecision::Allow
         ));
-        // ...but NOT the soul repo (outside the workspace → denied)...
+        // but NOT the soul repo (outside the workspace → denied)...
         assert!(matches!(
             r.decide(&req("Write", json!({"file_path": "/tmp/dack-soul/SOUL.md", "contents": "x"}))).await,
             ActionDecision::Deny(_)
         ));
-        // ...and has NO outward authority (no Post/Settle in scope).
+        // and has NO outward authority (no Post/Settle in scope).
         assert!(matches!(r.decide(&req("mcp__twitter__post", json!({"text": "as the duck"}))).await, ActionDecision::Deny(_)));
         assert!(matches!(r.decide(&req("mcp__cove-trading__buy_token", json!({}))).await, ActionDecision::Deny(_)));
     }
@@ -475,7 +475,7 @@ mod tests {
                 .await,
             ActionDecision::Allow
         ));
-        // ...but NEVER runlogs/ (harness authors the record).
+        // but NEVER runlogs/ (harness authors the record).
         assert!(matches!(
             r.decide(&req("Write", json!({"file_path": "runlogs/2026-05-30.md", "contents": "x"})))
                 .await,
@@ -529,7 +529,7 @@ mod tests {
         ));
     }
 
-    // ── Phase 5: live absolute-path relativization (the SDK emits absolute file_paths) ──
+    // ── live absolute-path relativization (the SDK emits absolute file_paths) ──
 
     #[tokio::test]
     async fn relativizes_absolute_paths_and_blocks_escapes() {
@@ -574,7 +574,7 @@ mod tests {
                 .await,
             ActionDecision::Allow
         ));
-        // ...but a double `..` above the repo root is still denied.
+        // but a double `..` above the repo root is still denied.
         assert!(matches!(
             r.decide(&req("Write", json!({"file_path": "/repo/../../etc/x", "content": "x"})))
                 .await,

@@ -1,4 +1,4 @@
-//! Consciousness states — the security model, hardcoded (PRD §4, architecture §2).
+//! Consciousness states — the security model, hardcoded.
 //!
 //! A consciousness state = an OpenClaude invocation with a fixed
 //! **(system prompt + allowed-tool set + model)** triple plus a set of writable dirs.
@@ -23,7 +23,7 @@ pub enum ConsciousnessState {
     Reflect,
 }
 
-/// Per-state model routing — the primary inference-cost lever (PRD §4, §9.4).
+/// Per-state model routing — the primary inference-cost lever.
 /// Maps onto OpenClaude `agentRouting`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -36,7 +36,7 @@ pub enum ModelTier {
     Frontier,
 }
 
-/// Tool *classes* the `action_required` responder (PRD §6.3) gates on. These are
+/// Tool *classes* the `action_required` responder gates on. These are
 /// coarse capability buckets, not the full OpenClaude tool list — the responder maps
 /// a concrete tool call to its class, then checks class membership for the state.
 /// Capability buckets the `action_required` responder gates on. Grounded to
@@ -70,7 +70,7 @@ pub enum ToolClass {
 }
 
 /// The fixed capability scope for a state. The set is closed at compile time; the
-/// agent has no path to extend it (PRD §4).
+/// agent has no path to extend it.
 #[derive(Debug, Clone)]
 pub struct ToolScope {
     pub allowed: Vec<ToolClass>,
@@ -82,10 +82,10 @@ impl ToolScope {
     }
 }
 
-/// The full (prompt + tools + model + writable dirs) spec for a state — the §4 table
-/// as data. `writable_dirs` is the write-gating from §4.1: a prefix allow-list the
+/// The full (prompt + tools + model + writable dirs) spec for a state — the  table
+/// as data. `writable_dirs` is the write-gating from: a prefix allow-list the
 /// responder checks for any file-write target. `runlogs/` is in NO state's list —
-/// the harness authors the record (PRD §4.1, §7.5).
+/// the harness authors the record.
 #[derive(Debug, Clone)]
 pub struct StateSpec {
     pub state: ConsciousnessState,
@@ -97,7 +97,7 @@ pub struct StateSpec {
     pub writable_dirs: Vec<&'static str>,
 }
 
-/// The §4 / §4.1 table, as code. This is the single source of truth for write-gating;
+/// The table, as code. This is the single source of truth for write-gating;
 /// the responder consults it and is never trusted to the agent.
 pub fn default_spec(state: ConsciousnessState) -> StateSpec {
     use ConsciousnessState::*;
@@ -108,7 +108,7 @@ pub fn default_spec(state: ConsciousnessState) -> StateSpec {
             prompt_path: "prompts/perceive.md",
             model: ModelTier::CheapLocal,
             // Read-only: holds NO write tools at all, so raw-stimulus processing
-            // cannot mutate state (PRD §4.1).
+            // cannot mutate state.
             tool_scope: ToolScope { allowed: vec![Read] },
             writable_dirs: vec![],
         },
@@ -139,7 +139,7 @@ pub fn default_spec(state: ConsciousnessState) -> StateSpec {
             prompt_path: "prompts/reflect.md",
             model: ModelTier::Frontier,
             // The ONLY state whose writable_dirs include the soul dirs — same FileWrite
-            // class as Express, but a wider path allow-list (PRD §4.1).
+            // class as Express, but a wider path allow-list.
             tool_scope: ToolScope {
                 allowed: vec![Read, FileWrite],
             },
@@ -148,7 +148,7 @@ pub fn default_spec(state: ConsciousnessState) -> StateSpec {
     }
 }
 
-/// The capability spec for a **worker** (Phase 10) — keyless sandboxed compute the duck wields, NOT
+/// The capability spec for a **worker** — keyless sandboxed compute the duck wields, NOT
 /// a consciousness state. Reuses [`StateSpec`] (the responder's shape); `state` is cosmetic here (a
 /// worker carries no Post/Settle MCP tools — `mcp_servers={}` — so the scope never emits a
 /// state-named deny). The harness runs it in its own `/workspace` and sets the responder's
@@ -170,7 +170,7 @@ pub fn worker_spec() -> StateSpec {
     }
 }
 
-/// State-transition rules (PRD §4.2). Encodes three invariants:
+/// State-transition rules. Encodes three invariants:
 ///   1. Perceive may open Express or Settle (via the Baton). Perceive proposes; the
 ///      harness opens the next state.
 ///   2. **Reflect is harness-entered only** — no state transitions *into* Reflect.
@@ -182,10 +182,10 @@ pub fn worker_spec() -> StateSpec {
 pub fn allowed_transition(from: ConsciousnessState, _to: ConsciousnessState) -> bool {
     use ConsciousnessState::*;
     // The ONE remaining structural constraint (invariant 3): **Reflect exits to nothing**. Reflect
-    // is now REACHABLE via transition (TIER-4) — but only from an UNCONTAMINATED cycle whose trust
+    // is now REACHABLE via transition — but only from an UNCONTAMINATED cycle whose trust
     // tier `reaches: reflect`, and rate-limited by the harness clock (the injection-resistance the
     // old into-Reflect ban gave is now the taint guarantee + the rate-limit; see `harness::dispatch`
-    // and invariant I6). How far any chain walks is bounded by the taint-derived ceiling.
+    // and). How far any chain walks is bounded by the taint-derived ceiling.
     from != Reflect
 }
 
@@ -201,7 +201,7 @@ pub fn reach_rank(s: ConsciousnessState) -> u8 {
     }
 }
 
-/// Whether opening `state` is within the operator-declared route `ceiling` (MCP2-B). The ceiling is
+/// Whether opening `state` is within the operator-declared route `ceiling`. The ceiling is
 /// the highest consciousness tier a payload-class may walk to; the operator sets it per route
 /// (`ceiling: settle` is the authority that lets a self-tier trade duty reach Settle — what the old
 /// `EntryState::PerceiveThenSettle` force did). A `settle` ceiling is additionally guarded at config
@@ -219,7 +219,7 @@ mod tests {
     fn perceive_is_read_only() {
         let spec = default_spec(Perceive);
         assert!(spec.tool_scope.allows(ToolClass::Read));
-        // A file-write in Perceive is impossible by construction (PRD §4.1).
+        // A file-write in Perceive is impossible by construction.
         assert!(!spec.tool_scope.allows(ToolClass::FileWrite));
         assert!(!spec.tool_scope.allows(ToolClass::Post));
         // Bash is never in scope anywhere — it would bypass path-gating.
@@ -271,7 +271,7 @@ mod tests {
         for s in [Perceive, Express, Settle, Reflect] {
             assert!(!allowed_transition(Reflect, s), "Reflect → {s:?} must be forbidden");
         }
-        // Reflect is now REACHABLE via transition (TIER-4) — gated by the taint ceiling + the
+        // Reflect is now REACHABLE via transition — gated by the taint ceiling + the
         // rate-limit, NOT a structural ban. Every non-Reflect→* edge is structurally allowed.
         assert!(allowed_transition(Perceive, Reflect));
         assert!(allowed_transition(Perceive, Express));

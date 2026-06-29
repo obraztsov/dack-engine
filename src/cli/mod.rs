@@ -1,4 +1,4 @@
-//! Operator CLI (PRD §8.3) — the v1 operator interface (NOT a web dashboard; §8.1).
+//! Operator CLI — the v1 operator interface (NOT a web dashboard; ).
 //! The operator's real needs are few and map to a CLI + a tailable log.
 //!
 //! `dack say` is the operator→agent channel: it writes a `Stimulus` row with
@@ -37,7 +37,7 @@ use crate::webserver::{AxumWebhookListener, WebhookListener};
 #[derive(Parser, Debug)]
 #[command(name = "dack", about = "DACK actor-scheduler harness")]
 pub struct Cli {
-    /// Path to the operator config (PRD §8.2).
+    /// Path to the operator config.
     #[arg(long, default_value = "dack.config.yaml")]
     pub config: String,
 
@@ -64,16 +64,16 @@ pub enum Command {
     Resume,
     /// Stop processes (hard).
     Kill,
-    /// Force a Reflect run now (an explicit operator override of the scheduled cadence, PRD §4.2).
+    /// Force a Reflect run now (an explicit operator override of the scheduled cadence).
     ReflectNow,
     /// Commit external/hand edits to the soul tree (memory/prompts/stimuli) as the operator, so
-    /// the daemon's per-run integrity tripwire doesn't revert them (PRD §7.5, §8.3).
+    /// the daemon's per-run integrity tripwire doesn't revert them.
     Reconcile,
 }
 
 /// Dispatch a parsed CLI command. `run`/`status`/`log` are the daemon + read surfaces; `say`/
 /// `pause`/`resume`/`reflect-now`/`reconcile` are the operator controls that act on the shared
-/// SQLite queue (cursor flags + injected stimuli) the running daemon observes (PRD §8.3).
+/// SQLite queue (cursor flags + injected stimuli) the running daemon observes.
 pub async fn dispatch(cli: Cli) -> Result<()> {
     // Structured logging for EVERY command (so an operator command like `reconcile` shows its push
     // results, not just the long-running `run`). Best-effort config load for the level/format; a bad
@@ -88,7 +88,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         Command::Pause => set_paused(&cli.config, true).await,
         Command::Resume => set_paused(&cli.config, false).await,
         // The hard stop is SIGTERM (graceful drain) — `systemctl stop dack` / Ctrl-C. A pidfile
-        // kill buys nothing over the signal the daemon already drains on cleanly (PRD §11.8).
+        // kill buys nothing over the signal the daemon already drains on cleanly.
         Command::Kill => Err(DackError::NotImplemented(
             "dack kill — use SIGTERM (systemctl stop / Ctrl-C) for a graceful drain",
         )),
@@ -97,7 +97,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
     }
 }
 
-/// `dack log` (PRD §8.3) — the "agent syslog": print today's runlog, and with `--follow` stream
+/// `dack log` — the "agent syslog": print today's runlog, and with `--follow` stream
 /// new entries as the duck writes them (naive size-poll; the runlog is append-only).
 async fn log_cmd(config_path: &str, follow: bool) -> Result<()> {
     use std::io::Write;
@@ -120,11 +120,11 @@ async fn log_cmd(config_path: &str, follow: bool) -> Result<()> {
     Ok(())
 }
 
-/// `dack say` (PRD §8.3) — the operator→agent channel. Signs the instruction with the operator
+/// `dack say` — the operator→agent channel. Signs the instruction with the operator
 /// key and enqueues it as an `operator_signed`-CLAIMING stimulus; the running daemon VERIFIES the
-/// signature at dispatch (invariant I18) before honoring the tier — a self-asserted label is never
+/// signature at dispatch before honoring the tier — a self-asserted label is never
 /// trusted. The operator key signs HERE; the daemon needs only the public operator DID to verify,
-/// so the soul/operator private keys never have to meet (PRD §3.3, §7.2).
+/// so the soul/operator private keys never have to meet.
 async fn say(config_path: &str, instruction: String) -> Result<()> {
     let config = DackConfig::load(config_path)?;
     let identity = GitlawbIdentity::resolve("gl", config.identity_dirs()).await?;
@@ -162,7 +162,7 @@ async fn say(config_path: &str, instruction: String) -> Result<()> {
     Ok(())
 }
 
-/// `dack pause` / `dack resume` (PRD §8.3) — the soft kill-switch. A shared flag in the queue
+/// `dack pause` / `dack resume` — the soft kill-switch. A shared flag in the queue
 /// `cursor` table (the daemon and the CLI open the same SQLite); the consciousness loop checks it
 /// at each cycle boundary and idles while set. An in-flight dispatch always finishes first.
 async fn set_paused(config_path: &str, paused: bool) -> Result<()> {
@@ -177,7 +177,7 @@ async fn set_paused(config_path: &str, paused: bool) -> Result<()> {
     Ok(())
 }
 
-/// `dack reflect-now` (PRD §4.2, §8.3) — force a Reflect run now, an explicit operator override of
+/// `dack reflect-now` — force a Reflect run now, an explicit operator override of
 /// the scheduled cadence. Enqueues the same harness-entered Reflect stimulus the nightly schedule
 /// would; entry-Reflect is not rate-limited (the rate-limit guards the *cadence*, which the operator
 /// is deliberately overriding here). The running daemon picks it up single-flight.
@@ -365,7 +365,7 @@ fn remote_label(url: &str) -> String {
     url.to_string()
 }
 
-/// `dack reconcile` (PRD §7.5, §8.3) — commit external/hand edits to the soul tree
+/// `dack reconcile` — commit external/hand edits to the soul tree
 /// (memory/prompts/stimuli) so the daemon's per-run integrity tripwire (`reconcile_soul`, which
 /// reverts anything outside the running state's writable dirs) doesn't clobber them. Commits are
 /// authored as the **operator DID** (the human shaping the soul, distinct from the duck's Soul-DID
@@ -403,9 +403,9 @@ async fn reconcile(config_path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Boot the ingestion pipeline (Phase 3): cron + webhook → sensor → bus → SQLite queue,
+/// Boot the ingestion pipeline: cron + webhook → sensor → bus → SQLite queue,
 /// with `stimuli/` hot-reload. The consciousness consumer (queue → runtime → wall) lands in
-/// Phase 4; until then `run` keeps the duck's senses live and the queue filling.
+/// until then `run` keeps the duck's senses live and the queue filling.
 async fn run(config_path: &str) -> Result<()> {
     let config = Arc::new(DackConfig::load(config_path)?);
     // (Structured logging was already brought up in `dispatch` from this same config.)
@@ -424,7 +424,7 @@ async fn run(config_path: &str) -> Result<()> {
     // otherwise break under subprocess cwd changes). Falls back to as-written if it doesn't exist.
     let repo_root = std::fs::canonicalize(&config.soul_repo)
         .unwrap_or_else(|_| PathBuf::from(&config.soul_repo));
-    // Boot GC: reclaim stale worker workspaces (Phase 14) left by crashes / old runs.
+    // Boot GC: reclaim stale worker workspaces left by crashes / old runs.
     sweep_stale_workspaces(&repo_root);
 
     let queue: Arc<dyn Queue> = Arc::new(SqliteQueue::open(&config.db_path)?);
@@ -459,15 +459,15 @@ async fn run(config_path: &str) -> Result<()> {
     let _watcher =
         spawn_stimuli_watcher(repo_root.clone(), registry.clone(), cron.clone(), webhook.clone())?;
 
-    // ── Consciousness loop (Phase 4): pop the queue → invoke states → the wall ──
+    // ── Consciousness loop: pop the queue → invoke states → the wall ──
     // Shares the queue with ingestion (senses write, cognition reads). The runtime spawns
     // the bun bridge per invocation; if it's unreachable, dispatch errors are logged and the
-    // loop stays up (logging-not-rollback). repo/identity are wired but inert until Phase 5/6.
+    // loop stays up (logging-not-rollback).
     // The runtime extensibility point: only openclaude+opengateway is wired; any other engine or
     // connector is a clear `NotImplemented` (the config slot exists, the adapter doesn't yet).
     let runtime: Arc<dyn RuntimeClient> = build_runtime(&config)?;
     // Identity: resolve the configured `gl` role dirs. The Soul dir signs soul commits + the
-    // `gitlawb://` push; its key never enters agent env (PRD §3.3, §7.2).
+    // `gitlawb://` push; its key never enters agent env.
     let identity: Arc<dyn IdentityProvider> =
         Arc::new(GitlawbIdentity::resolve("gl", config.identity_dirs()).await?);
     let soul_did = identity
@@ -514,7 +514,7 @@ async fn run(config_path: &str) -> Result<()> {
     });
     // Graceful shutdown: SIGTERM/SIGINT flips the watch; the consciousness loop finishes its
     // in-flight dispatch, then exits (no zombie `dispatched` row). systemd restarts on crash;
-    // the next boot reclaims orphans + posts "back online" (PRD §11.8).
+    // the next boot reclaims orphans + posts "back online".
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -535,7 +535,7 @@ async fn run(config_path: &str) -> Result<()> {
         }
     });
     tracing::info!("consciousness loop up (queue → Perceive → wall → Express).");
-    // The scheduled Reflect ticker (PRD §4.2): enqueues a harness-entered Reflect at `reflect_schedule`
+    // The scheduled Reflect ticker: enqueues a harness-entered Reflect at `reflect_schedule`
     // (no-op if unset). Harness-owned so it survives `stimuli/` hot-reloads. `dack reflect-now` is the
     // out-of-band manual trigger of the same run.
     tokio::spawn({
@@ -608,7 +608,7 @@ fn build_runtime(config: &DackConfig) -> Result<Arc<dyn RuntimeClient>> {
         rt.connector.model_via_openai_env(),
         std::time::Duration::from_secs(config.invoke_timeout_secs),
     );
-    // Phase 14: a Docker backend for delegated workers (OS isolation) when `worker_sandbox.enabled`.
+    // a Docker backend for delegated workers (OS isolation) when `worker_sandbox.enabled`.
     let worker = build_worker_backend(config)?;
     Ok(Arc::new(client.with_worker(worker)))
 }
@@ -702,7 +702,7 @@ fn sweep_stale_workspaces(soul_root: &std::path::Path) {
 
 /// Env forwarded into the runtime bridge: `PATH`/`HOME` + the provider/capability names the
 /// operator listed (`runtime.env` + `forwarded_env`). Values come from the harness env; the
-/// soul key is never among them (PRD §7.2).
+/// soul key is never among them.
 fn bridge_env(config: &DackConfig) -> HashMap<String, String> {
     let mut env = HashMap::new();
     for key in ["PATH", "HOME"] {
@@ -718,8 +718,8 @@ fn bridge_env(config: &DackConfig) -> HashMap<String, String> {
     env
 }
 
-/// `dack status` (PRD §8.3) — Phase 3 slice: queue depth + duty registration health. The
-/// alive/last-run/current-state fields fill in with the watchdog (Phase 7).
+/// `dack status` — slice: queue depth + duty registration health. The
+/// alive/last-run/current-state fields fill in with the watchdog.
 async fn status(config_path: &str) -> Result<()> {
     let config = DackConfig::load(config_path)?;
     let depth = SqliteQueue::open(&config.db_path)?.depth().await?;

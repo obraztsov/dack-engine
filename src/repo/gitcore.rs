@@ -3,7 +3,7 @@
 //! Grounded against `gl` 0.3.8: Gitlawb has **no `repo commit`/`push`** — commits and
 //! pushes go through plain `git`, and the `git-remote-gitlawb` helper signs the ref-update
 //! on a `gitlawb://` remote. So `GitlawbRepo` and `PlainGitRepo` share *this* core and
-//! differ only in the remote URL + push-signing identity (PRD §3.5 made literal: the
+//! differ only in the remote URL + push-signing identity (made literal: the
 //! bundle is just a git repo).
 //!
 //! The duck "authors its own commits" via per-commit `git -c user.name=<DID>` — the commit
@@ -99,7 +99,7 @@ impl GitCore {
         self.commit_path(&path.0, &commit.message, &commit.author_did).await
     }
 
-    /// Revert one file to its prior committed version — the ONE rollback case (PRD §7.5):
+    /// Revert one file to its prior committed version — the ONE rollback case:
     /// a malformed skill/stimulus that broke a run. If the file has earlier history, check
     /// out the parent version; if it was only ever introduced once, remove it. The revert
     /// is itself committed (harness-authored).
@@ -130,7 +130,7 @@ impl GitCore {
     }
 
     /// List files under `path` (filesystem walk, `.git` excluded) to `max_depth` relative
-    /// to `path` — used by the `stimuli/` walker (depth ≤ 2, PRD §5.1) and memory `ls`.
+    /// to `path` — used by the `stimuli/` walker (depth ≤ 2) and memory `ls`.
     pub async fn list_dir(&self, path: &RepoPath, max_depth: usize) -> Result<Vec<RepoPath>> {
         let root = self.workdir.join(&path.0);
         let mut out = Vec::new();
@@ -182,7 +182,7 @@ impl GitCore {
 
     /// The working-tree delta vs HEAD (untracked files included), as porcelain entries.
     /// `--porcelain=v1 -z`-free parse: each line is `XY <path>`; renames (`R`) report the
-    /// destination. Empty result = clean tree (PRD §7.5, invariant I13).
+    /// destination. Empty result = clean tree.
     pub async fn status_porcelain(&self) -> Result<Vec<RepoChange>> {
         let out = self
             .git(&["status", "--porcelain", "--untracked-files=all"])

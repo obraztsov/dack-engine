@@ -1,5 +1,5 @@
-//! Runtime seam (PRD §5, §6) — the OpenClaude substrate, rented not rebuilt (architecture
-//! §5). **Engine = consciousness substrate; this harness = the client/approver = the
+//! Runtime seam — the OpenClaude substrate, rented not rebuilt (architecture
+//! **Engine = consciousness substrate; this harness = the client/approver = the
 //! actor-scheduler.** Transport is **NDJSON over stdio** to a child Node bridge
 //! ([`openclaude::OpenClaudeClient`] drives `openclaude-bridge/bridge.ts`); the operator/actor
 //! split becomes a *process boundary*, not a convention. (OpenClaude also ships a gRPC server —
@@ -8,13 +8,13 @@
 //! The two load-bearing pieces:
 //!   - [`RuntimeClient`] — invoke a consciousness state with an assembled context and
 //!     a per-state allowed-tool set; returns the agent's structured [`AgentOutput`].
-//!   - [`ActionResponder`] — **the wall** (PRD §6.3). Every tool call routes through the SDK's
+//!   - [`ActionResponder`] — **the wall**. Every tool call routes through the SDK's
 //!     `canUseTool(name, input, {toolUseID})` callback, which the bridge relays to this
 //!     out-of-process responder for a y/n decision before the tool runs. The agent can't touch it.
 //!
-//! Phase 0 verified (`docs/VERIFICATION.md` G1): `canUseTool` fires for *all* tool classes
-//! (bash, file-write, network, MCP, subagent) with no bypass. The approval channel is the
-//! child's stdin/stdout — a pipe binds nothing, so there is no socket to impersonate.
+//! verified: `canUseTool` fires for *all* tool classes (bash, file-write, network, MCP, subagent)
+//! with no bypass. The approval channel is the child's stdin/stdout — a pipe binds nothing,
+//! so there is no socket to impersonate.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -30,7 +30,7 @@ pub mod classify;
 pub mod claude_cli;
 pub mod openclaude;
 
-/// An engine session handle (OpenClaude `Query.sessionId`, PRD §6 / vision). Reusing a
+/// An engine session handle (OpenClaude `Query.sessionId` / vision). Reusing a
 /// session preserves context across wakes — cheaper, more coherent ("reads the room"),
 /// and the substrate for coalescing tweets one-by-one within one context and periodic
 /// compaction.
@@ -38,7 +38,7 @@ pub mod openclaude;
 /// **Firebreak guardrail (non-negotiable):** a session may be reused only *within a
 /// trust-homogeneous lane*. The Perceive→Express/Settle boundary MUST be a fresh session
 /// — never hand Express the session that ingested untrusted payload, or the raw bytes
-/// leak across the firebreak (PRD §6.4). Same-state self-authored wakes (e.g. a Perceive
+/// leak across the firebreak. Same-state self-authored wakes (e.g. a Perceive
 /// heartbeat lane, or an Express posting lane) may share a session; a public-payload
 /// Perceive run feeding Express may not.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -64,9 +64,9 @@ impl InvokeUsage {
     }
 }
 
-/// A delimited block of context assembled for an invocation (PRD §6.1). The `trusted`
+/// A delimited block of context assembled for an invocation. The `trusted`
 /// flag drives the *visible* framing: trusted briefing vs untrusted world. Keeping
-/// directive (trusted) and payload (untrusted) as distinct blocks is the §5.3 rule
+/// directive (trusted) and payload (untrusted) as distinct blocks is the rule
 /// carried into context assembly.
 #[derive(Debug, Clone)]
 pub struct ContextBlock {
@@ -75,7 +75,7 @@ pub struct ContextBlock {
     pub trusted: bool,
 }
 
-/// Everything needed to run one consciousness state (PRD §6.1).
+/// Everything needed to run one consciousness state.
 #[derive(Debug, Clone)]
 pub struct InvocationRequest {
     pub spec: StateSpec,
@@ -92,14 +92,14 @@ pub struct InvocationRequest {
     pub session: Option<SessionId>,
     /// The agent's working directory — the **soul repo** — so its `Read`/`Write`/`Glob` tools
     /// operate on `memory/`, `skills/`, … and emit absolute paths under it that the wall
-    /// relativizes (PRD §7.4). `None` = the bridge's own cwd (tests / pure-text runs).
+    /// relativizes. `None` = the bridge's own cwd (tests / pure-text runs).
     pub workdir: Option<PathBuf>,
     /// Per-invocation secret env, **materialized by the harness** for the act phase (the
     /// skills the agent calls read it, e.g. `X_BEARER_TOKEN` to post). Operator-gated via the
     /// route's `secrets:`; **empty for Perceive** (the read-only state holds no act creds).
     /// Overlaid on the bridge's static env at spawn.
     pub secret_env: BTreeMap<String, String>,
-    /// Resolved MCP **capability** servers for this invocation (PRD §6.3), keyed by server name,
+    /// Resolved MCP **capability** servers for this invocation, keyed by server name,
     /// each an SDK-shaped config (`{type:"http",url,headers}` or `{type:"stdio",command,args,env}`)
     /// with the auth token **already injected** by the harness into headers/env — so the token
     /// reaches the server but NEVER the agent's context. The harness picks these per state (the
@@ -109,17 +109,17 @@ pub struct InvocationRequest {
     /// prompt (operator `tier_policy` default, or a soul `model:` where override is allowed). `None`
     /// ⇒ the runtime client's configured `config.model`. The bridge maps it to `options.model`.
     pub model: Option<String>,
-    /// **Sub-agent definitions** (Phase 10) the engine may spawn via the `Task` tool, keyed by name
+    /// **Sub-agent definitions** the engine may spawn via the `Task` tool, keyed by name
     /// → an SDK `options.agents` value ([`crate::agent_def::AgentDef::to_options_value`]). EMPTY for
     /// the duck's consciousness states (no `Task` target); a **worker** invocation registers its
     /// sub-helpers here so it can delegate plan/research/QA in-session. The bridge sets `options.agents`.
     pub agents: std::collections::BTreeMap<String, serde_json::Value>,
-    /// **OS-isolate this invocation** (Phase 14): run the bridge in the runtime's worker sandbox
+    /// **OS-isolate this invocation**: run the bridge in the runtime's worker sandbox
     /// (Docker) instead of on the host. Set ONLY for delegated workers; the duck's states leave it
     /// `false` (the duck is never containerized). No-op if the runtime has no worker backend
     /// configured (falls back to host) — see `runtime.worker_sandbox`.
     pub isolate: bool,
-    /// **Extra read-only mounts** for an isolated worker (Phase 14): the agent def's resolved
+    /// **Extra read-only mounts** for an isolated worker: the agent def's resolved
     /// `volumes:` (host soul-subdir → guest path), all read-only. The writable `/workspace` is NOT
     /// here — it's derived from `workdir`. Empty for the duck.
     pub mounts: Vec<crate::sandbox::Mount>,
@@ -173,7 +173,7 @@ pub trait RuntimeClient: Send + Sync {
     ) -> Result<(AgentOutput, Option<SessionId>, Option<InvokeUsage>)>;
 
     /// The guest working dir a containerized worker runs at (e.g. `/workspace`), or `None` if this
-    /// runtime has no worker isolation backend (Phase 14). The harness calls this to decide whether a
+    /// runtime has no worker isolation backend. The harness calls this to decide whether a
     /// `docker`-isolation worker will ACTUALLY be containerized — so it can root the worker's wall at
     /// the matching path (the guest `/workspace` when isolated, the host workspace when falling back).
     /// Default `None` (mocks / host-only runtimes).

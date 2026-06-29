@@ -1,5 +1,5 @@
 //! In-memory single-flight queue — scaffold backing for [`Queue`] so the harness loop
-//! runs before the SQLite impl exists (Phase 3 swaps in `rusqlite`). Concurrency = 1
+//! runs before the SQLite impl exists (swaps in `rusqlite`). Concurrency = 1
 //! is enforced by the harness loop, not here; this just orders by priority.
 
 use async_trait::async_trait;

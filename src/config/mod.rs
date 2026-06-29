@@ -1,10 +1,10 @@
-//! Operator config (PRD §8.2) — the non-LLM authority surface.
+//! Operator config — the non-LLM authority surface.
 //!
 //! A rich YAML the operator owns and the harness reads (hot-reloadable). Holds the trust lattice
 //! (the taint model), the MCP registry + per-tier policy, secrets-provider refs, the reflect
 //! rate-limit, forwarded-env *names*, secret *references* (never values), and the trusted operator
 //! DID. The agent may *read* select fields (it should know it can be killed) but can **never
-//! write** this — it is operator writer-of-record (PRD §7.1).
+//! write** this — it is operator writer-of-record.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -15,7 +15,7 @@ use crate::error::{DackError, Result};
 use crate::model::stimulus::TrustTier;
 use crate::state::ConsciousnessState;
 
-/// Coalescing policy — both an economics knob and a character decision (architecture §3).
+/// Coalescing policy — both an economics knob and a character decision.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoalescePolicy {
     pub mode: CoalesceMode,
@@ -70,12 +70,12 @@ pub enum CoalesceMode {
     None,
 }
 
-// The `(payload_tier, type)` routing table is GONE (TIER-4). The transition ceiling is now derived
+// The `(payload_tier, type)` routing table is GONE. The transition ceiling is now derived
 // from the taint model (`TrustLattice::reaches`); `priority` + `coalesce` live in the stimulus
 // frontmatter; the `entry` state-prompt is the stimulus's own `entry:`. Capability grants are the
 // `tier_policy` handshake. Nothing remains to route by an agent-self-assigned `type`.
 
-/// Per-consciousness-tier MCP policy (MCP2-B, invariant I16) — the OPERATOR's half of the
+/// Per-consciousness-tier MCP policy — the OPERATOR's half of the
 /// capability handshake. A state-prompt's `mcp:` requests are admitted only by this policy:
 /// - `import`: the operator-registered `mcp_servers` a state-prompt at this tier may import by name
 ///   (its token is injected server-side, never the agent context). The allowlist of secret-bearing
@@ -214,7 +214,7 @@ impl TrustLattice {
             b.clone()
         }
     }
-    /// The AUTHORIZATION check (Phase 12): does a cycle at trust `cycle` clear a capability's
+    /// The AUTHORIZATION check: does a cycle at trust `cycle` clear a capability's
     /// `min_trust`? True iff `cycle` ranks `>=` `min`. Unknown names rank 0 (fail-safe — an unknown
     /// cycle tier clears only rank-0 `min`; an unknown `min` is rank 0 so it gates nothing extra).
     pub fn permits(&self, cycle: &TrustTier, min: &TrustTier) -> bool {
@@ -271,7 +271,7 @@ fn default_self_trust() -> TrustTier {
     TrustTier::self_()
 }
 
-/// Capability tier of an MCP server (PRD §4, §6.3) — maps its tools to a `ToolClass` and the
+/// Capability tier of an MCP server — maps its tools to a `ToolClass` and the
 /// states that may reach them. The OPERATOR declares it; the agent can never change it (it would
 /// be self-granting authority). This is the single source of truth the wall classifies from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -319,7 +319,7 @@ pub struct McpAuth {
     pub env: Option<String>,
 }
 
-/// An operator-declared MCP **capability server** (PRD §6.3). The registry is OPERATOR authority:
+/// An operator-declared MCP **capability server**. The registry is OPERATOR authority:
 /// adding cove.trade, the next tool, … is a config entry — never a harness/bridge code change.
 /// `tier` + the wall gate what its tools may do and which state reaches them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -332,7 +332,7 @@ pub struct McpServerConfig {
     pub tier: CapabilityTier,
     /// Optional tool **allowlist** (bare names, e.g. `get_balance`). When non-empty, ONLY these
     /// tools are permitted from this server: the wall denies any other tool under its
-    /// `mcp__<name>__` prefix **fail-closed** (PRD §6.3). This is how a single endpoint that
+    /// `mcp__<name>__` prefix **fail-closed**. This is how a single endpoint that
     /// exposes its full surface to every token (cove serves all 37 tools on the read-only token)
     /// is held to a read-only subset under `cove-read`, with the trade tools reachable only via
     /// the `cove-trading` (settle-tier) sibling. Empty = expose everything the server provides.
@@ -346,7 +346,7 @@ pub struct McpServerConfig {
     /// so it taints **public** at access time (a soul can never self-grant trust).
     #[serde(default = "default_self_trust")]
     pub trust: TrustTier,
-    /// **Minimum caller trust** to use this server — the AUTHORIZATION axis (Phase 12), distinct from
+    /// **Minimum caller trust** to use this server — the AUTHORIZATION axis, distinct from
     /// `tier` (which STATE/class) and `trust` (the taint label of its DATA). The server is assembled
     /// for a cycle ONLY if the cycle's CURRENT (post-taint) trust ranks `>=` this tier in the lattice.
     /// `None` (default) = no trust gate (any cycle clearing the tier/state checks). Gating on the
@@ -356,7 +356,7 @@ pub struct McpServerConfig {
     /// operator cycle — *unless* that cycle then reads a public link and degrades below `org`.
     #[serde(default)]
     pub min_trust: Option<TrustTier>,
-    /// **Payload-scoped env** (Phase 12) — `{ ENV_VAR: payload_field }`. At assembly the harness reads
+    /// **Payload-scoped env** — `{ ENV_VAR: payload_field }`. At assembly the harness reads
     /// each `payload_field` from the waking stimulus and injects it into THIS server's env (next to the
     /// token), so the capability is locked to per-cycle data the MODEL never supplies. e.g. telegram
     /// `reply` is scoped `{ TELEGRAM_REPLY_CHAT: chat_id, TELEGRAM_REPLY_TO: message_id }` → it can only
@@ -375,7 +375,7 @@ pub struct McpServerConfig {
 
 /// Which agent runtime drives the consciousness loop — the [`crate::runtime::RuntimeClient`] impl
 /// and how it is spawned, with the engine's own config inline (tagged by `type`). The seam
-/// (PRD §3.4): v1 (Gitlawb/OpenClaude) vs a corp wiring differ only here + in construction.
+///: v1 (Gitlawb/OpenClaude) vs a corp wiring differ only here + in construction.
 /// **Only `openclaude` is wired**; `claude-code` (the Claude Code CLI/SDK directly, for corporate
 /// prod) is the documented next variant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -486,7 +486,7 @@ pub struct RuntimeConfig {
     /// YAML). The connector's own creds (above) are applied on top. **Soul key never listed.**
     #[serde(default = "default_runtime_env")]
     pub env: Vec<String>,
-    /// **OS isolation for delegated workers** (Phase 14). When enabled, an async worker
+    /// **OS isolation for delegated workers**. When enabled, an async worker
     /// ([`crate::harness`] `run_worker_detached`) runs its bridge inside a Docker container — the
     /// workspace bind-mounted rw, declared agent `volumes:` ro, everything else out of reach — so a
     /// worker's Bash/tools cannot touch the host. The duck itself is **never** containerized.
@@ -494,7 +494,7 @@ pub struct RuntimeConfig {
     pub worker_sandbox: WorkerSandboxConfig,
 }
 
-/// Docker isolation policy for delegated workers (Phase 14). Plain operator config; the CLI turns it
+/// Docker isolation policy for delegated workers. Plain operator config; the CLI turns it
 /// into an [`crate::sandbox::IsolationPolicy`] + [`crate::sandbox::DockerSandbox`]. The worker's
 /// network is always **Full** (its bridge must egress to the model gateway — an egress-allowlist proxy
 /// is future hardening, so `network` is not an operator knob that could fail-closed by mistake).
@@ -550,29 +550,29 @@ impl DryRunConfig {
     }
 }
 
-/// `dack.config.yaml` (PRD §8.2). Hot-reloadable.
+/// `dack.config.yaml`. Hot-reloadable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DackConfig {
-    /// The trusted operator DID — provenance check for `operator_signed` (PRD §5.7).
+    /// The trusted operator DID — provenance check for `operator_signed`.
     pub operator_did: String,
     /// The operator-configured **trust lattice** (the taint/IFC model). Ranked low→high; each tier
     /// declares the max state it `reaches`. Omit to use the safe default
     /// (`public→express < self→reflect < operator_signed→reflect`).
     #[serde(default = "default_trust_tiers")]
     pub trust_tiers: Vec<TrustTierDef>,
-    /// **Operator-signed sensor scripts** (the taint seed, TIER-3): `sha256(source-hex) → trust`.
+    /// **Operator-signed sensor scripts** (the taint seed,): `sha256(source-hex) → trust`.
     /// A sensor whose source hashes to a listed entry seeds its cycle at that tier; an unsigned (or
     /// since-edited) script seeds `public`. This is operator code-review-as-signing — the agent
     /// authors a sensor, the operator reviews the EXACT bytes and signs the hash.
     #[serde(default)]
     pub signed_scripts: BTreeMap<String, TrustTier>,
-    /// **Per-webhook trust** (TIER-3): a registered webhook path → the tier its payload is trusted
+    /// **Per-webhook trust**: a registered webhook path → the tier its payload is trusted
     /// at (e.g. an operator Telegram channel → `self`). An unlisted path seeds `public`.
     #[serde(default)]
     pub webhooks: BTreeMap<String, TrustTier>,
-    /// **Reflect rate-limit** (TIER-4): the minimum seconds between self-modification (Reflect) runs,
+    /// **Reflect rate-limit**: the minimum seconds between self-modification (Reflect) runs,
     /// enforced by the harness clock for BOTH the scheduled Reflect and any transition-reached one —
-    /// the rate-limit half of the I6 guarantee (the taint ceiling is the other half). `0` disables.
+    /// the rate-limit half of the guarantee (the taint ceiling is the other half). `0` disables.
     /// Default 1 day.
     #[serde(default = "default_reflect_interval")]
     pub reflect_min_interval_secs: i64,
@@ -603,54 +603,54 @@ pub struct DackConfig {
     /// boot + day-rollover) — bounds the repo and what the recall MCPs can scan. Default 10.
     #[serde(default = "default_runlog_retention_days")]
     pub runlog_retention_days: u64,
-    /// **Load-shedding cap** (Phase 4): the max PENDING queue depth before the OLDEST `Low`-priority
+    /// **Load-shedding cap**: the max PENDING queue depth before the OLDEST `Low`-priority
     /// items are evicted (Normal+ is the protected floor, never shed; every eviction is logged).
     /// Protects a busy duck from a runaway low-priority fan-out backlog. `None` = unbounded.
     #[serde(default = "default_queue_max_depth")]
     pub queue_max_depth: Option<usize>,
-    /// **Baton TTL** (Phase 4, seconds): a deferred baton continuation older than this is EXPIRED
+    /// **Baton TTL** (seconds): a deferred baton continuation older than this is EXPIRED
     /// (dropped + logged) at dispatch instead of acting on a stale context — the world moved on while
     /// it waited behind higher-priority work. `None` (default) = a continuation never expires by age.
     #[serde(default)]
     pub baton_ttl_secs: Option<u64>,
     /// The state-prompt id harness-synthesized stimuli enter at (operator `dack say`, the
-    /// boot back-online ping) — duties that carry no `entry:` of their own (MCP2-B). Defaults to
+    /// boot back-online ping) — duties that carry no `entry:` of their own (). Defaults to
     /// the flat `perceive` prompt.
     #[serde(default = "default_entry_prompt")]
     pub default_entry: String,
-    /// Per-consciousness-tier MCP policy (MCP2-B, invariant I16) — the operator's half of the
+    /// Per-consciousness-tier MCP policy — the operator's half of the
     /// capability handshake (which servers a state-prompt at each tier may import, and whether it
     /// may self-plug public read MCPs). An unconfigured tier defaults to locked + empty (nothing
     /// grantable). Keyed by `perceive`/`express`/`settle`/`reflect`.
     #[serde(default)]
     pub tier_policy: BTreeMap<ConsciousnessState, TierPolicy>,
     /// Names listed here are injected into the agent + sensor env. Reserved for
-    /// recoverable/non-catastrophic values (API keys, handle, limits) — PRD §7.2.
+    /// recoverable/non-catastrophic values (API keys, handle, limits) —
     #[serde(default)]
     pub forwarded_env: Vec<String>,
     /// References only — values live in a separate secret store the YAML never inlines
     /// (so config is inspectable without exposing keys). The Soul DID key is here as a
-    /// `file://` ref and is **never** forwarded to the agent (PRD §7.2, §8.2).
+    /// `file://` ref and is **never** forwarded to the agent.
     #[serde(default)]
     pub secrets: BTreeMap<String, String>,
     /// **Secrets providers** — trusted, harness-owned scripts that materialize a short-lived
     /// token env on demand (fetch + validity-check + rotate-only-when-needed). A duty/skill
     /// references a provider by `name` in its `secrets:` list; the harness runs the provider
     /// command and injects its JSON output. Adding a new secret (X, cove.trade, …) is a YAML
-    /// entry + a script — **never a harness change** (PRD §7.2; `docs/SECRETS-AND-SANDBOX.md`).
+    /// entry + a script — **never a harness change** (`docs/secrets-and-sandbox.md`).
     #[serde(default)]
     pub secrets_providers: Vec<SecretsProviderConfig>,
-    /// Cron schedule for the harness-entered Reflect run (PRD §4.2). `None` = manual
+    /// Cron schedule for the harness-entered Reflect run. `None` = manual
     /// (`dack reflect-now`) only.
     #[serde(default)]
     pub reflect_schedule: Option<String>,
     /// Path to the soul repo / actor bundle on the box (holds `stimuli/`, `SOUL.md`, …).
     #[serde(default = "default_soul_repo")]
     pub soul_repo: String,
-    /// Embedded SQLite queue path (ephemeral; PRD §9.3). Losing it loses only the queue.
+    /// Embedded SQLite queue path (ephemeral;). Losing it loses only the queue.
     #[serde(default = "default_db_path")]
     pub db_path: String,
-    /// Localhost bind for the webhook listener (PRD §2 — nothing public without a proxy).
+    /// Localhost bind for the webhook listener ( — nothing public without a proxy).
     #[serde(default = "default_webhook_addr")]
     pub webhook_addr: String,
     /// The **runtime** extensibility point — engine (which agent runtime) + connector (how it
@@ -663,12 +663,12 @@ pub struct DackConfig {
     #[serde(default)]
     pub dry_run: DryRunConfig,
     /// `gl` identity **directories** per role (each holds `identity.pem` + `ucan.json`). The
-    /// Soul dir signs soul commits/pushes and **never enters agent env** (PRD §3.3, §7.2).
+    /// Soul dir signs soul commits/pushes and **never enters agent env**.
     #[serde(default)]
     pub identities: IdentityDirs,
     /// The soul repo's signed push remote, e.g. `gitlawb://<soul-did>/dack-soul`. When set
     /// (with `identities.soul`), the harness uses the Gitlawb repo-host (signed `gitlawb://`
-    /// push); otherwise plain-git degraded mode (PRD §3.5). `None` = local-only / offline.
+    /// push); otherwise plain-git degraded mode. `None` = local-only / offline.
     #[serde(default)]
     pub soul_remote: Option<String>,
     /// The gitlawb node the legacy single-`soul_remote` signed push targets (`GITLAWB_NODE`).
@@ -692,7 +692,7 @@ pub struct DackConfig {
     #[serde(default)]
     pub runlog_remote: Option<SoulRemote>,
     /// Wall-clock budget (seconds) for one consciousness invocation, incl. the wall round-trips.
-    /// A hung LLM/bridge elapses here rather than freezing the single-flight loop (PRD §11.8).
+    /// A hung LLM/bridge elapses here rather than freezing the single-flight loop.
     #[serde(default = "default_invoke_timeout_secs")]
     pub invoke_timeout_secs: u64,
     /// MCP tool-name **prefixes** the wall treats as REVERSIBLE capabilities → `ToolClass::Post`
@@ -704,7 +704,7 @@ pub struct DackConfig {
     /// as Post and run in Express). Settle is reachable only by an uncontaminated cycle (taint).
     #[serde(default = "default_settle_tools")]
     pub settle_tools: Vec<String>,
-    /// **MCP capability registry** (PRD §6.3) — operator-declared servers the duck can use in its
+    /// **MCP capability registry** — operator-declared servers the duck can use in its
     /// act phases. Each server's `tier` derives the wall's classification (so declaring a server
     /// `tier: settle` makes its tools Settle-only); routes grant them via `capabilities:`. Adding
     /// a new tool (cove.trade, …) is an entry here + a token — never a harness/bridge code change.
@@ -721,7 +721,7 @@ pub struct DackConfig {
     pub modules: Vec<ModuleConfig>,
 }
 
-/// One harness-supervised long-running side process (PRD: the "modules" supervisor). Declarative:
+/// One harness-supervised long-running side process (the "modules" supervisor). Declarative:
 /// the harness spawns `command` in the repo root with `env` + the materialized `secrets:` env, and
 /// keeps it alive (restart-on-exit, exponential backoff) until shutdown. Adding a channel/companion
 /// is a config entry + its script — never a harness change.
@@ -767,7 +767,7 @@ impl CapabilityPrefix {
     }
 }
 
-/// The wall's capability tool-prefix classification (PRD §6.3), derived from the MCP registry
+/// The wall's capability tool-prefix classification, derived from the MCP registry
 /// tiers merged with the explicit `post_tools`/`settle_tools`. Single source of truth.
 #[derive(Debug, Clone, Default)]
 pub struct CapabilityPrefixes {
@@ -779,7 +779,7 @@ pub struct CapabilityPrefixes {
     pub settle: Vec<CapabilityPrefix>,
 }
 
-/// `gl` identity directories per liability-boundary role (PRD §3.3). Each is a path to a dir
+/// `gl` identity directories per liability-boundary role. Each is a path to a dir
 /// holding `identity.pem` (+ `ucan.json`). All optional: unset roles are simply absent (the
 /// harness falls back where it can). The Soul key is harness-only — never forwarded.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -919,7 +919,7 @@ impl DackConfig {
         TrustLattice { tiers: self.trust_tiers.clone() }
     }
 
-    /// The trust seed for a sensor SCRIPT (TIER-3): the tier the operator signed its `sha256(source)`
+    /// The trust seed for a sensor SCRIPT: the tier the operator signed its `sha256(source)`
     /// at, else `public` (an unsigned or since-edited script is untrusted code).
     pub fn script_trust(&self, source: &[u8]) -> TrustTier {
         self.signed_scripts
@@ -928,7 +928,7 @@ impl DackConfig {
             .unwrap_or_else(TrustTier::public)
     }
 
-    /// The trust seed for a webhook `path` (TIER-3): the operator-registered tier, else `public`.
+    /// The trust seed for a webhook `path`: the operator-registered tier, else `public`.
     pub fn webhook_trust(&self, path: &str) -> TrustTier {
         self.webhooks.get(path).cloned().unwrap_or_else(TrustTier::public)
     }
@@ -942,7 +942,7 @@ impl DackConfig {
             .unwrap_or_else(TrustTier::self_)
     }
 
-    /// The wall's capability prefix→class map (PRD §6.3): registry tiers (`mcp__<name>__`) merged
+    /// The wall's capability prefix→class map: registry tiers (`mcp__<name>__`) merged
     /// with the explicit `post_tools`/`settle_tools`. The single source of truth the responder
     /// classifies from — so declaring a server `tier: settle` is what makes its tools Settle-only.
     pub fn capability_prefixes(&self) -> CapabilityPrefixes {
@@ -965,7 +965,7 @@ impl DackConfig {
         p
     }
 
-    /// Startup safety check (PRD §6.3): a settle (irreversible) capability prefix must NEVER be a
+    /// Startup safety check: a settle (irreversible) capability prefix must NEVER be a
     /// prefix-of / prefixed-by a reversible (post) or read prefix — else a settle tool could
     /// classify as `Post`/`Read` and run outside Settle. Checks the FULL derived map (registry +
     /// explicit lists). Called once at boot; a violation is a hard config error.
@@ -986,7 +986,7 @@ impl DackConfig {
         Ok(())
     }
 
-    /// The MCP [`TierPolicy`] for a consciousness `state` (MCP2-B) — the operator's half of the
+    /// The MCP [`TierPolicy`] for a consciousness `state` — the operator's half of the
     /// capability handshake. An unconfigured tier returns the safe default (locked, nothing
     /// grantable). Borrowed from the map when present, else a static default.
     pub fn tier_policy_for(&self, state: ConsciousnessState) -> std::borrow::Cow<'_, TierPolicy> {
@@ -1186,7 +1186,7 @@ secrets:
         assert_eq!(l.reaches(&TrustTier::public()), ConsciousnessState::Express);
         assert_eq!(l.reaches(&TrustTier::from("org")), ConsciousnessState::Settle);
         assert_eq!(l.reaches(&TrustTier::self_()), ConsciousnessState::Reflect);
-        // AUTHORIZATION (Phase 12 `min_trust`): a cycle clears a requirement iff it ranks >= it.
+        // AUTHORIZATION (`min_trust`): a cycle clears a requirement iff it ranks >= it.
         assert!(l.permits(&TrustTier::from("org"), &TrustTier::from("org")), "org clears min_trust:org");
         assert!(l.permits(&TrustTier::self_(), &TrustTier::from("org")), "a higher tier clears min_trust:org");
         assert!(!l.permits(&TrustTier::public(), &TrustTier::from("org")), "a lower tier does NOT clear min_trust:org");

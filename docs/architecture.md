@@ -107,5 +107,5 @@ signing/identity setup.
 | `src/webserver/` | the localhost webhook listener |
 | `src/model/` | the core domain types (Stimulus, Baton, proposal, runlog) |
 
-For the design rationale behind these choices, see [docs/internal/](internal/) (the original PRD and
-architecture notes).
+The design rationale behind these choices is documented inline — in the module-level doc comments
+throughout `src/` and in the rest of this `docs/` tree.

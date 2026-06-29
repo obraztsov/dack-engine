@@ -7,7 +7,7 @@
  * dropped those: it fell back to a null transition, a SILENT cycle-terminate (observed live as a
  * Telegram reply that never sent). This module is tolerant — it pulls every top-level object out,
  * and when there are several it merges them later-wins so the real `transition` survives, logging
- * it loudly. Acting on each object as its own intent-baton is Phase 1; this phase only stops the
+ * it loudly. Acting on each object as its own intent-baton is this phase only stops the
  * silent drop.
  */
 

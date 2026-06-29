@@ -1,5 +1,5 @@
 //! Subprocess sensor runner — the real implementation of the [`SensorRunner`] contract
-//! (PRD §5.2). Spawns the executable with a cleared env (read-scoped: only the declared
+//! Spawns the executable with a cleared env (read-scoped: only the declared
 //! env is injected), writes the trigger payload to stdin, enforces a timeout
 //! (`kill_on_drop`), and parses stdout as newline-delimited JSON.
 
@@ -54,7 +54,7 @@ impl SensorRunner for SubprocessSensor {
         timeout: Duration,
     ) -> Result<Vec<SensorCandidate>> {
         // `clear_env: true` enforces "inject only the read-scoped env the sensor declares"
-        // (PRD §5.2). The caller includes PATH/interpreter vars in `env` when needed.
+        // The caller includes PATH/interpreter vars in `env` when needed.
         let spec = ProcessSpec {
             command: vec![exe.to_string_lossy().into_owned()],
             cwd: exe

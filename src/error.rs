@@ -1,5 +1,5 @@
 //! Crate-wide error type. One enum, `?`-friendly across every module so the
-//! harness can bubble failures into a RunLog entry (logging-not-rollback, PRD §7.5)
+//! harness can bubble failures into a RunLog entry (logging-not-rollback)
 //! rather than crashing the single-flight loop.
 
 use thiserror::Error;
@@ -15,35 +15,35 @@ pub enum DackError {
     #[error("yaml: {0}")]
     Yaml(#[from] serde_yaml::Error),
 
-    /// Malformed config / control plane (PRD §8.2).
+    /// Malformed config / control plane.
     #[error("config: {0}")]
     Config(String),
 
-    /// A sensor violated the contract (PRD §5.2) or exited non-zero.
+    /// A sensor violated the contract or exited non-zero.
     #[error("sensor: {0}")]
     Sensor(String),
 
-    /// The OpenClaude gRPC runtime seam (PRD §6).
+    /// The OpenClaude gRPC runtime seam.
     #[error("runtime: {0}")]
     Runtime(String),
 
-    /// Repo-host adapter (Gitlawb / plain-git fallback, PRD §3.4).
+    /// Repo-host adapter (Gitlawb / plain-git fallback).
     #[error("repo: {0}")]
     Repo(String),
 
-    /// Identity-provider adapter (DID signing, PRD §3.3).
+    /// Identity-provider adapter (DID signing).
     #[error("identity: {0}")]
     Identity(String),
 
-    /// A stimulus definition under `stimuli/` could not be parsed/registered (PRD §5.1).
+    /// A stimulus definition under `stimuli/` could not be parsed/registered.
     #[error("stimulus: {0}")]
     Stimulus(String),
 
-    /// The embedded SQLite queue / durable store (PRD §5.6, §9.3).
+    /// The embedded SQLite queue / durable store.
     #[error("queue: {0}")]
     Queue(String),
 
-    /// The `action_required` responder rejected a tool call (PRD §6.3) — this is
+    /// The `action_required` responder rejected a tool call — this is
     /// a *normal* outcome (the wall doing its job), surfaced as an error only when
     /// a caller treated a denial as fatal.
     #[error("denied by responder: {0}")]

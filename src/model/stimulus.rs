@@ -1,13 +1,13 @@
-//! The `Stimulus` — inert event data until a consciousness state reasons about it
-//! (architecture §3, PRD §5.6). This is the spine: a new source is just a new way
+//! The `Stimulus` — inert event data until a consciousness state reasons about it.
+//! This is the spine: a new source is just a new way
 //! to mint one of these envelopes, and no envelope can *act* until digested behind
-//! the firebreak. The harness is the sole writer-of-record (PRD §7.1); the agent
+//! the firebreak. The harness is the sole writer-of-record; the agent
 //! never sees the queue and never assigns its own tiers.
 
 use serde::{Deserialize, Serialize};
 
 
-/// Provenance-derived trust tier (PRD §5.7). Assigned *deterministically by the
+/// Provenance-derived trust tier. Assigned *deterministically by the
 /// source*, never by the model. The tier does not decide what the agent thinks
 /// (cognition is sovereign); it decides — as a dumb edge rule in the bus — which
 /// consciousness state a stimulus may route *toward*.
@@ -32,7 +32,7 @@ impl TrustTier {
         Self("self".into())
     }
     /// An RFC 9421 signature from the operator DID — the top tier (`dack say`). The only tier that
-    /// the top tier (`dack say`); by default its cycles `reach` the whole ladder (PRD §5.7).
+    /// the top tier (`dack say`); by default its cycles `reach` the whole ladder.
     pub fn operator() -> Self {
         Self("operator_signed".into())
     }
@@ -49,7 +49,7 @@ impl From<&str> for TrustTier {
 
 /// Open vocabulary of stimulus types ("mention", "clarity_post", "scheduled_post",
 /// "token_launch", …). A newtype rather than an enum so a Reflect-authored duty can
-/// introduce a new type without a harness recompile (PRD §5).
+/// introduce a new type without a harness recompile.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct StimulusType(pub String);
 
@@ -75,7 +75,7 @@ impl std::fmt::Display for StimulusId {
     }
 }
 
-/// Lifecycle of a row in the SQLite queue (PRD §5.6).
+/// Lifecycle of a row in the SQLite queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StimulusStatus {
@@ -86,7 +86,7 @@ pub enum StimulusStatus {
     Failed,
 }
 
-/// Semantic priority → numeric (PRD §5.6 "prioritize"). The agent may *influence*
+/// Semantic priority → numeric ("prioritize"). The agent may *influence*
 /// priority (via the duty it authors in Reflect) but never sets it directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -109,8 +109,8 @@ impl Priority {
     }
 }
 
-/// The `Stimulus` row (PRD §5.6). Carries **two independent trust levels** kept
-/// separate end-to-end (PRD §5.3): the *directive* (the standing duty's `.md`,
+/// The `Stimulus` row. Carries **two independent trust levels** kept
+/// separate end-to-end: the *directive* (the standing duty's `.md`,
 /// trusted intent) and the *payload* (the sensor's view of the world, usually
 /// untrusted). Conflating them would let a malicious tweet inherit the directive's
 /// trust — so they are distinct fields, never merged.
@@ -144,7 +144,7 @@ pub struct Stimulus {
     /// The trusted directive text (the `.md` body) carried alongside the untrusted
     /// payload. Delimited as trusted-briefing when assembled into Perceive context.
     pub directive_body: String,
-    /// The **entry state-prompt id** this cycle opens at (MCP2-B) — the stimulus's own frontmatter
+    /// The **entry state-prompt id** this cycle opens at — the stimulus's own frontmatter
     /// `entry:` (e.g. `twitter/perceive_mention`), or the operator `default_entry` for synthesized
     /// stimuli. Dispatch resolves `prompts/<entry>.md`, runs it, then walks its `transitions`
     /// (each hop ceiling-clamped; the firebreak holds across every hop).

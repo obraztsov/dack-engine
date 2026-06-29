@@ -1,4 +1,4 @@
-//! Secret store + the two-tier env/secret separation (PRD §7.2, §8.2).
+//! Secret store + the two-tier env/secret separation.
 //!
 //! The test for where a secret lives is NOT "sensitive or not" — it is **"if this
 //! leaked, can I rotate it / is the loss recoverable?"**
@@ -27,7 +27,7 @@ pub trait SecretStore: Send + Sync {
     fn resolve(&self, reference: &str) -> Result<Vec<u8>>;
 }
 
-/// Build the env map forwarded into the agent + sensor processes (PRD §8.2). Reads the
+/// Build the env map forwarded into the agent + sensor processes. Reads the
 /// **names** in `forwarded_env` from the harness process env. The Soul DID key is never
 /// in this set — it is a `secrets:` reference, resolved only via [`SecretStore`].
 pub fn forwarded_env(config: &DackConfig) -> HashMap<String, String> {

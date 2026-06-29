@@ -1,5 +1,5 @@
-//! OpenClaude runtime adapter (PRD §5, §6) — v1 [`RuntimeClient`], grounded against
-//! OpenClaude 0.15.0 (`docs/VERIFICATION.md`).
+//! OpenClaude runtime adapter — v1 [`RuntimeClient`], grounded against
+//! OpenClaude 0.15.0.
 //!
 //! **Decision: public SDK, no fork; transport = NDJSON over stdio to a thin TS bridge.**
 //! OpenClaude is Node-side, so a small `bridge.ts` runs the SDK `query()` and this Rust
@@ -8,11 +8,11 @@
 //! `result` carrying the structured [`AgentOutput`] (the SDK has no public JSON-schema output,
 //! so the bridge instructs the model to make its FINAL message a JSON object and parses it —
 //! provider-agnostic, unlike an MCP `submit` tool which perturbed provider routing;
-//! live-verified Phase 4, `docs/VERIFICATION.md`).
+//! live-verified).
 //!
 //! Why stdio, not gRPC: no `protoc`/`tonic`/ports, and a pipe to a child is *more* confined
 //! than a localhost socket (nothing binds, nothing impersonable). The approval channel
-//! (PRD §6.3) is the child's stdin/stdout — local by construction.
+//! is the child's stdin/stdout — local by construction.
 //!
 //! The client is parameterized by its spawn `command`, so it drives the real `bun run
 //! bridge.ts` in production and a mock script in tests (same protocol, no network).
@@ -35,7 +35,7 @@ use crate::model::proposal::AgentOutput;
 use crate::sandbox::{ExecKind, HostSandbox, IsolationPolicy, Mount, ProcessSpec, Sandbox};
 
 /// Tools we deny at the engine boundary too (defense-in-depth over the wall, which already
-/// denies the `Shell` class in every state — `docs/VERIFICATION.md` "Memory access model").
+/// denies the `Shell` class in every state).
 /// Raw shell bypasses path-gating, so it never belongs in a duck state.
 const ALWAYS_DISALLOWED: &[&str] = &["Bash", "PowerShell", "REPL", "KillShell"];
 
@@ -75,7 +75,7 @@ enum ToBridge<'a> {
         resume: Option<&'a str>,
         /// Resolved MCP capability servers (SDK-shaped, tokens injected) → `options.mcpServers`.
         mcp_servers: &'a std::collections::BTreeMap<String, serde_json::Value>,
-        /// Sub-agent defs the engine may `Task`-spawn (Phase 10) → `options.agents`. Empty for the
+        /// Sub-agent defs the engine may `Task`-spawn → `options.agents`. Empty for the
         /// duck's states; a worker registers its sub-helpers here.
         agents: &'a std::collections::BTreeMap<String, serde_json::Value>,
     },
@@ -122,7 +122,7 @@ pub struct OpenClaudeClient {
     /// Env **overlaid** on the inherited process env for the bridge (provider key/base-URL +
     /// `forwarded_env`). We inherit rather than clear because the engine's auth context can
     /// live in ambient env the SDK requires; the soul key is never in env regardless
-    /// (PRD §7.2 — it is a `file://` secret ref).
+    /// (it is a `file://` secret ref).
     pub env: HashMap<String, String>,
     /// Model id passed to the SDK (e.g. `mimo-v2.5-pro`); `None` = bridge/provider default.
     pub model: Option<String>,
@@ -136,17 +136,17 @@ pub struct OpenClaudeClient {
     /// memory/skill writes land while the rest of the box stays out of reach.
     pub sandbox: Arc<dyn Sandbox>,
     pub policy: IsolationPolicy,
-    /// **Worker isolation backend** (Phase 14). `None` ⇒ delegated workers run on the host (today's
+    /// **Worker isolation backend**. `None` ⇒ delegated workers run on the host (today's
     /// behavior). `Some` ⇒ a `req.isolate` invocation runs the bridge in this backend (Docker),
     /// guest-relative. The duck (`isolate:false`) NEVER touches it. Built from `runtime.worker_sandbox`.
     pub worker: Option<WorkerBackend>,
     /// Wall-clock budget for one whole invocation (incl. the wall round-trips). A hung LLM/bridge
     /// would otherwise freeze the single-flight loop forever; on elapse `invoke` returns a
-    /// `Runtime` error (dispatch logs + continues) and `kill_on_drop` reaps the child (PRD §11.8).
+    /// `Runtime` error (dispatch logs + continues) and `kill_on_drop` reaps the child.
     pub timeout: Duration,
 }
 
-/// The container backend for delegated workers (Phase 14): the [`Sandbox`] (Docker), the
+/// The container backend for delegated workers: the [`Sandbox`] (Docker), the
 /// [`IsolationPolicy`] (image/net/caps), the in-IMAGE bridge `command`, and the guest `cwd`
 /// (`/workspace`) the workspace is bind-mounted at. Cloned per-invocation; cheap (Arcs + small vecs).
 #[derive(Clone)]
@@ -203,7 +203,7 @@ impl OpenClaudeClient {
             .collect()
     }
 
-    /// Render context blocks into one user turn with **visible trust framing** (PRD §5.3):
+    /// Render context blocks into one user turn with **visible trust framing**:
     /// the trusted directive and the untrusted world data are fenced and labelled so the
     /// model (and any reviewer) can see which is which. Framing lives here, in the harness.
     fn render_blocks(blocks: &[super::ContextBlock]) -> String {
@@ -259,7 +259,7 @@ impl RuntimeClient for OpenClaudeClient {
         let (openai_model_env, options_model) =
             resolve_model_env(self.model_via_env, req.model.as_deref(), self.model.as_deref());
 
-        // Phase 14: a delegated worker (`req.isolate`) with a configured backend runs the bridge in a
+        // a delegated worker (`req.isolate`) with a configured backend runs the bridge in a
         // CONTAINER, everything GUEST-relative — the workspace is bind-mounted at the guest cwd,
         // `DACK_BRIDGE_CWD` IS that guest cwd, and the caller set the wall's repo_root to the SAME guest
         // path (the SDK inside the container emits container-absolute paths; the three must agree or
@@ -365,7 +365,7 @@ impl RuntimeClient for OpenClaudeClient {
 
         // The whole exchange (send → permission round-trips → result) runs under ONE wall-clock
         // budget. A hung LLM/bridge turn elapses here instead of freezing the single-flight loop
-        // forever; on return the child is reaped by `kill_on_drop` (PRD §11.8).
+        // forever; on return the child is reaped by `kill_on_drop`.
         let drive = async {
             write_line(&mut stdin, &invoke).await?;
             loop {
@@ -587,7 +587,7 @@ mod tests {
         assert_eq!(out.proposal.unwrap().gist, "g");
     }
 
-    // ── Phase 14: Docker-isolated workers ────────────────────────────────────────────────
+    // ── Docker-isolated workers ────────────────────────────────────────────────
 
     /// Records the [`ProcessSpec`] it's handed, then runs a fixed mock bridge so the NDJSON protocol
     /// completes — lets us assert the spec the runtime builds WITHOUT a real Docker daemon (it ignores
@@ -700,7 +700,7 @@ mod tests {
     }
 
     /// Back-compat guard: `isolate:false` (the duck) takes the host path — host command, host==guest
-    /// mount, the FULL ambient env, no container name. Unchanged from before Phase 14.
+    /// mount, the FULL ambient env, no container name. Unchanged from before .
     #[tokio::test]
     async fn host_invoke_keeps_full_env_and_host_mount() {
         let (client, rec) = recording_client("hspec", true); // worker present, but isolate:false

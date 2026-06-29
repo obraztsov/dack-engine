@@ -1,10 +1,10 @@
-//! Sources — architecture §3 Layer 1 (dumb, pluggable, untrusted). Each source is a
+//! Sources — Layer 1 (dumb, pluggable, untrusted). Each source is a
 //! small deterministic adapter that turns a trigger into a sensor invocation. **Zero
-//! reasoning in any source** (architecture §1). Adding a capability = adding a source.
+//! reasoning in any source**. Adding a capability = adding a source.
 //!
-//! v1 sources (PRD §11 step 4): `cron` (timer) and `webhook` (HTTP). The Twitter
+//! v1 sources: `cron` (timer) and `webhook` (HTTP). The Twitter
 //! mention poller is a `cron`-triggered duty whose sensor polls; the push path is the
-//! same duty with its trigger flipped to `webhook` (PRD §10.2).
+//! same duty with its trigger flipped to `webhook`.
 
 use crate::error::Result;
 
@@ -18,12 +18,12 @@ pub struct FiredTrigger {
     pub payload: Vec<u8>,
 }
 
-/// Schedules cron-triggered duties (PRD §5.1 "a cron trigger (re)schedules a timer").
+/// Schedules cron-triggered duties ("a cron trigger (re)schedules a timer").
 /// v1 impl: [`cron::CronWheel`], a `tokio` timer wheel that emits `FiredTrigger`s onto a
 /// channel and re-times itself on `reschedule` (hot-reload).
 #[async_trait::async_trait]
 pub trait CronScheduler: Send + Sync {
-    /// (Re)load the schedule from the current registry (hot-reload, PRD §5.1).
+    /// (Re)load the schedule from the current registry (hot-reload).
     async fn reschedule(&self, crons: &[(String, String)]) -> Result<()>;
 }
 

@@ -1,8 +1,8 @@
-//! The ingestion pipeline (PRD §5.5 steps 1–5; architecture §3 layers 1–2) — the **dumb,
-//! pre-conscious half** of the harness: sources → sensor → bus → queue. A fired trigger
-//! runs the duty's sensor (or, for a pure-cron self-prompt, synthesizes one candidate),
-//! and the bus normalizes/coalesces/enqueues. **No reasoning here** (architecture §1); the
-//! consciousness loop that *pops* the queue and invokes the runtime is Phase 4 (held).
+//! The ingestion pipeline — the **dumb, pre-conscious half** of the harness:
+//! sources → sensor → bus → queue. A fired trigger runs the duty's sensor
+//! (or, for a pure-cron self-prompt, synthesizes one candidate),
+//! and the bus normalizes/coalesces/enqueues. **No reasoning here**; the
+//! consciousness loop that *pops* the queue and invokes the runtime is (held).
 //!
 //! Everything an attacker-influenced byte touches in this file is **data** (sensor stdout,
 //! webhook body), never an instruction — the firebreak sits downstream, at Perceive.
@@ -26,11 +26,11 @@ use crate::sources::{CronScheduler, FiredTrigger};
 use crate::stimuli::Registry;
 use crate::webserver::WebhookListener;
 
-/// Per-sensor wall-clock budget (PRD §5.2 "bounded by `timeout`").
+/// Per-sensor wall-clock budget ("bounded by `timeout`").
 const SENSOR_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Owns the ingestion seams. The `registry` is behind an `RwLock` so the hot-reload watcher
-/// can swap it under a running drain loop without a restart (PRD §5.1).
+/// can swap it under a running drain loop without a restart.
 pub struct Ingestor {
     pub repo_root: PathBuf,
     pub config: Arc<DackConfig>,
@@ -61,12 +61,12 @@ impl Ingestor {
             Some(exe) => {
                 // Base read-scoped env + the short-lived token env the duty's declared
                 // providers materialize (the harness runs those trusted scripts; the sensor
-                // only ever sees the resulting bearer — PRD §7.2).
+                // only ever sees the resulting bearer).
                 let mut env = self.sensor_env();
                 for (k, v) in self.broker.env_for(&def.frontmatter.secrets).await? {
                     env.insert(k, v);
                 }
-                // Cross-poll dedup (PRD §10.2): inject the stored watermark so the sensor fetches
+                // Cross-poll dedup: inject the stored watermark so the sensor fetches
                 // ONLY items newer than what we've already seen (e.g. X `since_id`). Absent on the
                 // first poll. Single-flight makes this read-then-advance race-free.
                 if let Some(cur) = &def.frontmatter.cursor {
@@ -82,8 +82,8 @@ impl Ingestor {
             }
             // No sensor: a pure-cron self-prompt (empty payload — the trusted directive body IS the
             // content, attached by the bus) OR a webhook whose POSTED BODY is the payload directly
-            // (the channel adapter already normalized it; the body is DATA, never a script — PRD
-            // §5.3). The tier is the source's (webhook → `webhook_trust(path)`, set in `payload_seed`).
+            // (the channel adapter already normalized it; the body is DATA, never a script).
+            // The tier is the source's (webhook → `webhook_trust(path)`, set in `payload_seed`).
             None => {
                 let payload = match &def.frontmatter.trigger {
                     crate::stimuli::Trigger::Webhook { .. } => {
@@ -114,15 +114,15 @@ impl Ingestor {
             }
         }
 
-        // The cycle's PAYLOAD trust seed (TIER-3): derived from the SOURCE (a signed sensor script
+        // The cycle's PAYLOAD trust seed: derived from the SOURCE (a signed sensor script
         // met with its sensor-secret tiers, a registered webhook tier, or a pure-cron `self`). The
         // bus clamps each candidate's tier down to it (a sensor may only LOWER trust).
         let payload_seed = self.payload_seed(&def).await;
         self.bus.ingest(&def, candidates, now, payload_seed).await
     }
 
-    /// Derive a duty's payload trust seed from its source (TIER-3, invariant I18 — provenance seeds
-    /// trust, never agent-asserted frontmatter):
+    /// Derive a duty's payload trust seed from its source — provenance seeds
+    /// trust, never agent-asserted frontmatter:
     /// - a sensor SCRIPT → `config.script_trust(sha256(source))` (operator-signed, else `public`),
     ///   met with each declared sensor-secret's trust (so a script signed `self` that fetches via a
     ///   `public` secret seeds `public` — code-integrity and data-trust met together);
@@ -154,7 +154,7 @@ impl Ingestor {
     }
 
     /// Drain the unified `FiredTrigger` channel forever. A failed duty is a logged line,
-    /// never a crash of the loop (logging-not-rollback, PRD §7.5).
+    /// never a crash of the loop (logging-not-rollback).
     pub async fn run(self: Arc<Self>, mut rx: mpsc::Receiver<FiredTrigger>) {
         while let Some(fired) = rx.recv().await {
             let def_id = fired.def_id.clone();
@@ -164,9 +164,9 @@ impl Ingestor {
         }
     }
 
-    /// The read-scoped env injected into sensors (PRD §5.2): only `PATH` (so interpreters
+    /// The read-scoped env injected into sensors: only `PATH` (so interpreters
     /// resolve) plus the operator's explicitly `forwarded_env` names. **No soul key** — that
-    /// is never forwarded (PRD §7.2). A name with no value in the harness env is skipped.
+    /// is never forwarded. A name with no value in the harness env is skipped.
     fn sensor_env(&self) -> HashMap<String, String> {
         let mut env = HashMap::new();
         if let Ok(path) = std::env::var("PATH") {
@@ -181,7 +181,7 @@ impl Ingestor {
     }
 }
 
-/// The max value of `field` across `candidates` — the new cross-poll dedup watermark (PRD §10.2),
+/// The max value of `field` across `candidates` — the new cross-poll dedup watermark,
 /// or `None` if no candidate carries it. Numeric when both compare as integers (Twitter snowflake
 /// ids), else lexical — so a monotonic id advances correctly without assuming a value type.
 fn watermark(candidates: &[SensorCandidate], field: &str) -> Option<String> {
@@ -207,7 +207,7 @@ fn cursor_gt(a: &str, b: &str) -> bool {
     }
 }
 
-/// Reload the registry from `stimuli/` and re-push cron/webhook routes (PRD §5.1 hot-reload).
+/// Reload the registry from `stimuli/` and re-push cron/webhook routes ( hot-reload).
 /// The deterministic core the file-watcher calls; also directly testable.
 pub async fn reload(
     repo_root: &PathBuf,
@@ -270,7 +270,7 @@ mod tests {
         }
     }
 
-    /// PRD §11.4 acceptance: *a cron hook runs a script and registers a deduped stimulus row.*
+    /// acceptance: *a cron hook runs a script and registers a deduped stimulus row.*
     /// We drive `process` directly (the cron wheel's firing is proven in `sources::cron`),
     /// so the assertion is deterministic: a real sensor script emits two same-keyed
     /// candidates, and the batch policy folds them into **one** queued row.
@@ -338,7 +338,7 @@ mod tests {
         assert_eq!(watermark(&[c("1")], "nope"), None);
     }
 
-    /// PRD §10.2: the harness fetches the stored watermark, injects it into the sensor env, and
+    /// the harness fetches the stored watermark, injects it into the sensor env, and
     /// advances it from the discovered candidates — so a poll never re-surfaces a handled item.
     #[tokio::test]
     async fn cursor_dedup_injects_and_advances_watermark() {

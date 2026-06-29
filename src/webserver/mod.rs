@@ -1,11 +1,11 @@
-//! Webhook listener (PRD §2, §5.1) — the inbound HTTP surface for `webhook`-triggered
+//! Webhook listener — the inbound HTTP surface for `webhook`-triggered
 //! duties. A POST matching a duty's `trigger.path` causes the harness to run that duty's
 //! sensor with the request body on stdin, then feed the bus.
 //!
 //! v1 impl: [`axum_listener::AxumWebhookListener`], bound **localhost-only** alongside the
 //! gRPC client (the box exposes nothing public except what a reverse proxy chooses to). A
 //! matched POST emits a `FiredTrigger` onto the shared channel the harness drains; the body
-//! is always `public`-tier payload — data only, never a script (PRD §5.3).
+//! is always `public`-tier payload — data only, never a script.
 
 use crate::error::Result;
 

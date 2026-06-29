@@ -1,5 +1,5 @@
 /**
- * Telegram INGRESS adapter (Phase 12.3) — the operator-owned, grammY-driven inbound side.
+ * Telegram INGRESS adapter — the operator-owned, grammY-driven inbound side.
  *
  * It is NOT part of the Rust harness and the harness never parses Telegram. It long-polls the bot,
  * decides each message's TRUST by *who sent it* (its own config — chat/user → a harness webhook PATH),

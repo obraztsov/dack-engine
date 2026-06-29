@@ -1,10 +1,10 @@
-//! The Stimulus Bus (architecture §3 layer 2, PRD §5.6) — **dumb, central, no LLM.**
+//! The Stimulus Bus (layer 2) — **dumb, central, no LLM.**
 //! Intelligence is quarantined in the consciousness layer; a reasoning collector here
-//! would be an unguarded injection surface upstream of the firebreak (architecture §1).
+//! would be an unguarded injection surface upstream of the firebreak.
 //!
 //! Pipeline: normalize → classify → prioritize → coalesce → **serialize (single-flight)**
 //! → enqueue. The agent influences priority and authors its own duty-stimuli (in
-//! Reflect); it never edits the routing table or assigns tiers (PRD §5.6).
+//! Reflect); it never edits the routing table or assigns tiers.
 
 use std::sync::Arc;
 
@@ -28,11 +28,11 @@ impl Bus {
     }
 
     /// Normalize sensor candidates from one duty firing into `Stimulus` rows and enqueue
-    /// them (PRD §5.5 steps 4–5), applying the duty's coalescing policy. `received_at` is
+    /// them, applying the duty's coalescing policy. `received_at` is
     /// supplied by the caller (the harness stamps wall-clock time) so the bus stays
     /// deterministic and testable. Returns the ids of *newly enqueued* rows (a candidate
     /// folded into an existing batch row mints no new wake).
-    /// `payload_seed` is the cycle's PAYLOAD trust seed (TIER-3) — derived by the [`Ingestor`] from
+    /// `payload_seed` is the cycle's PAYLOAD trust seed — derived by the [`Ingestor`] from
     /// the source (signed-script hash / webhook tier / pure-cron `self`), met with the sensor
     /// secrets. Each candidate's tier is clamped DOWN to it (a sensor may only lower trust).
     pub async fn ingest(
@@ -54,20 +54,20 @@ impl Bus {
             } = c;
             // The source assigns the tier; a sensor may only *LOWER* it. A candidate claiming a tier
             // above the source-derived `payload_seed` is clamped down (the taint `meet`) — closing a
-            // trust-tier escalation primitive (arbitrary Reflect-authored sensor code, PRD §5.7).
+            // trust-tier escalation primitive (arbitrary Reflect-authored sensor code).
             let lattice = self.config.lattice();
             let payload_tier = match cand_tier {
                 Some(c) => lattice.meet(&c, &payload_seed),
                 None => payload_seed.clone(),
             };
-            // Priority is the duty's own frontmatter hint (TIER-4 — the routing table is gone).
+            // Priority is the duty's own frontmatter hint (the routing table is gone).
             let priority = fm.priority.unwrap_or(Priority::Low);
-            // Entry **state-prompt** (MCP2-B): the duty's own frontmatter `entry:` (a state-prompt
+            // Entry **state-prompt** (): the duty's own frontmatter `entry:` (a state-prompt
             // id like `twitter/perceive_mention`). The path the chain then walks is soul-owned; the
             // operator route only supplies the *ceiling* (read at dispatch), not the entry.
             let entry = fm.entry.clone();
 
-            // Coalescing (PRD §5.6). `None` → always a fresh wake; `Latest` → supersede
+            // Coalescing. `None` → always a fresh wake; `Latest` → supersede
             // prior pending rows for this key and enqueue the newest; `Batch` → fold the
             // payload into the oldest pending accumulator row within the window (no new wake).
             let mut folded = false;
@@ -119,7 +119,7 @@ impl Bus {
             // it (above) before it fires as one wake. Folds keep the accumulator's `received_at`, so
             // the window is measured from the FIRST message (a fixed cadence, not a sliding one). A
             // `window_sec` of 0/absent (or `latest`/`none`) ⇒ `None` = immediately poppable.
-            // Both the coalesce debounce AND the dispatch window (Phase 3) express themselves as a
+            // Both the coalesce debounce AND the dispatch window express themselves as a
             // `pop_after` (earliest-poppable) second; the effective gate is the LATER of the two —
             // a windowed group message still folds for its debounce, then waits for the window.
             let coalesce_pop_after = match &fm.coalesce {
@@ -221,7 +221,7 @@ fn adaptive_credit_key(source: &str, dedup_key: &str, received_at: i64) -> Strin
 
 /// Fold a new payload into a batch accumulator. Shape: `{<latest msg's fields…>, "_coalesced": true,
 /// "items":[…]}`. The first fold wraps the existing single payload; subsequent folds push onto `items`.
-/// Context assembly (Phase 5) renders a coalesced row from `items` ("N things since last wake").
+/// Context assembly renders a coalesced row from `items` ("N things since last wake").
 ///
 /// **The latest message's top-level fields are hoisted onto the accumulator** (the new payload's
 /// scalars overlay the row, while `items` keeps the full history). Same-chat folds share their
@@ -303,7 +303,7 @@ mod tests {
     /// The telegram group case: a chat's messages fold into ONE debounced wake, and the coalesced
     /// row keeps the LATEST message's `chat_id`/`message_id` at top-level (so the reply
     /// destination-lock + baton still resolve) while `items` holds the whole batch.
-    /// Phase 3 dispatch window: a duty with `dispatch_window: "02:00-05:00"` holds a stimulus that
+    /// dispatch window: a duty with `dispatch_window: "02:00-05:00"` holds a stimulus that
     /// arrives outside the window (via `pop_after`) until it next opens; one arriving inside is
     /// immediately eligible.
     #[tokio::test]
@@ -445,7 +445,7 @@ mod tests {
     async fn batch_folds_many_into_one_wake() {
         let b = bus();
         let def = duty("coalesce: { mode: batch, window_sec: 600, dedup_key: thread_id }\n");
-        // 50 mentions → 1 wake (the PRD's worked example, in miniature).
+        // 50 mentions → 1 wake (the worked example, in miniature).
         let ids = b
             .ingest(
                 &def,

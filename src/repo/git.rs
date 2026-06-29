@@ -1,5 +1,5 @@
-//! Plain-git repo-host adapter — the **degraded-mode fallback** (PRD §3.5) and the base
-//! of the corp variant (`GitHub/GitLab + Claude Code`, PRD §3.4).
+//! Plain-git repo-host adapter — the **degraded-mode fallback** and the base
+//! of the corp variant (`GitHub/GitLab + Claude Code`).
 //!
 //! Fully functional: all operations delegate to the shared [`GitCore`]. Because the actor
 //! bundle is just a git repo, a plain remote (GitHub/GitLab/self-hosted) is a drop-in if
@@ -67,7 +67,7 @@ impl RepoHost for PlainGitRepo {
         self.core.restore_to_head(change).await
     }
     /// Plain `git push` to the configured remote, or a no-op when none is set (offline /
-    /// degraded mode, PRD §3.5). No Gitlawb signing here.
+    /// degraded mode). No Gitlawb signing here.
     async fn push(&self) -> Result<()> {
         match &self.remote {
             Some(remote) => self.core.push(remote, &[]).await,

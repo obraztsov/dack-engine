@@ -19,6 +19,5 @@ the safety model. The rest are reference and how-to.
 - **[Workers](workers.md)** — delegated, sandboxed subagents.
 - **[Secrets & sandboxing](secrets-and-sandbox.md)** — keeping creds out of the model; isolating code.
 
-### Reference & history
-- **[internal/](internal/)** — the original PRD, architecture notes, build plan, and verification
-  audit. Design rationale and history, not user-facing.
+Design rationale and history live inline in the code's module doc comments (`src/`) and across this
+`docs/` tree.

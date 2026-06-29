@@ -1,19 +1,19 @@
-//! The harness — the actor-scheduler that wires every seam together (PRD §6). It is the
-//! **subconscious** of the silicon mind (PRD §7.6): dumb, deterministic plumbing under a
+//! The harness — the actor-scheduler that wires every seam together. It is the
+//! **subconscious** of the silicon mind: dumb, deterministic plumbing under a
 //! sovereign conscious layer. It owns the *plumbing* stores (queue, logs); the agent
 //! owns the *cognitive* stores (memory, and in Reflect its soul).
 //!
-//! The dispatch cycle for one stimulus (PRD §5.5 / §6):
+//! The dispatch cycle for one stimulus:
 //!   1. pop highest-priority pending stimulus (single-flight)
 //!   2. assemble Perceive context: SOUL + prompt + **directive (trusted, delimited)** +
 //!      **payload (untrusted, delimited)** + a short memory summary (a harness-side read of
-//!      `memory/` via [`RepoHost`](crate::repo::RepoHost) — Phase 5; the agent reaches memory
+//!      `memory/` via [`RepoHost`](crate::repo::RepoHost) — the agent reaches memory
 //!      itself through the path-gated file tools, not a Rust seam) + runlog tail
 //!   3. invoke Perceive (read-only) → AgentOutput (gist + thoughts)
 //!   4. write the durable RunLog (incl. raw stimulus, framed-untrusted) → `runlog_ref`
 //!   5. if Perceive proposes a transition the harness allows → build the **Baton** and
 //!      open a **fresh** Express invocation seeded with the **Baton only** — never the
-//!      raw payload (the firebreak, PRD §6.4)
+//!      raw payload (the firebreak)
 //!   6. Express acts via skills, writes memory, returns; harness logs the outcome
 
 use std::collections::BTreeMap;
@@ -51,7 +51,7 @@ use crate::state_prompt::{McpRef, StatePrompt};
 pub mod ingest;
 pub mod modules;
 
-/// The Reflect entry state-prompt id (`prompts/reflect.md`). Reflect is harness-entered (PRD §4.2):
+/// The Reflect entry state-prompt id (`prompts/reflect.md`). Reflect is harness-entered:
 /// no soul duty produces it — the nightly schedule and `dack reflect-now` enqueue it directly.
 pub const REFLECT_ENTRY: &str = "reflect";
 
@@ -82,7 +82,7 @@ pub fn reflect_stimulus(now: i64) -> Stimulus {
 }
 
 /// All the seams, owned as trait objects so the v1 (Gitlawb/OpenClaude) and corp
-/// (GitHub/Claude Code) wirings differ only at construction (PRD §3.4).
+/// (GitHub/Claude Code) wirings differ only at construction.
 pub struct Harness {
     pub config: Arc<DackConfig>,
     pub queue: Arc<dyn Queue>,
@@ -102,10 +102,10 @@ pub struct Harness {
 
 impl Harness {
     /// The single-flight dispatch loop. Concurrency = 1 — the duck is one mind
-    /// (architecture §3). SCAFFOLD: the body wires the real calls; the runtime stub
-    /// (`todo!`) lands in Phase 4.
+    /// SCAFFOLD: the body wires the real calls; the runtime stub
+    /// (`todo!`) — wired in a later step.
     pub async fn run(&self, mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
-        // Boot reconciliation: requeue any row a crash left stuck in `dispatched` (PRD §9.3).
+        // Boot reconciliation: requeue any row a crash left stuck in `dispatched`.
         match self.queue.reclaim_orphans().await {
             Ok(0) => {}
             Ok(n) => tracing::info!("reclaimed {n} orphaned dispatched row(s) at boot"),
@@ -117,7 +117,7 @@ impl Harness {
             Ok(n) => tracing::info!("runlog retention: dropped {n} day-file(s) beyond {}d", self.config.runlog_retention_days),
             Err(e) => tracing::warn!("runlog retention prune failed: {e}"),
         }
-        // Downtime → character (PRD §11.8): a restart enqueues a self-tier "back online" wake
+        // Downtime → character: a restart enqueues a self-tier "back online" wake
         // that Perceives then Expresses (the duck may comment on having been away).
         self.enqueue_back_online().await;
 
@@ -137,7 +137,7 @@ impl Harness {
                 }
                 continue;
             }
-            // Load-shed (Phase 4): bound the pending queue, dropping only the stalest low-prio work.
+            // Load-shed: bound the pending queue, dropping only the stalest low-prio work.
             if let Some(max) = self.config.queue_max_depth {
                 match self.queue.shed(max).await {
                     Ok(shed) if !shed.is_empty() => tracing::warn!(
@@ -152,17 +152,17 @@ impl Harness {
             match self.queue.next().await? {
                 Some(stimulus) => {
                     let snap = stimulus.clone();
-                    // Panic-isolate the cycle: logging-not-rollback (PRD §7.5) extended to PANICS. A
+                    // Panic-isolate the cycle: logging-not-rollback extended to PANICS. A
                     // panic in ONE dispatch (a malformed payload, a unicode edge, …) must NOT crash the
                     // whole duck — catch it, record a failed cycle, keep the loop alive. Essential for a
                     // hosted fleet: one bad message can never take a user's duck down.
                     match std::panic::AssertUnwindSafe(self.dispatch(stimulus)).catch_unwind().await {
-                        // Terminal states (PRD §5.6): a processed row never sticks in `dispatched`.
+                        // Terminal states: a processed row never sticks in `dispatched`.
                         Ok(Ok(())) => {
                             let _ = self.queue.update_status(&snap.id, StimulusStatus::Done).await;
                         }
                         Ok(Err(e)) => {
-                            // logging-not-rollback (PRD §7.5): a failed run is a tagged entry + a
+                            // logging-not-rollback: a failed run is a tagged entry + a
                             // terminal `failed` row, never a crash of the single-flight loop.
                             tracing::error!("dispatch error ({}): {e}", snap.id);
                             self.log_dispatch_failure(&snap, &e).await;
@@ -192,7 +192,7 @@ impl Harness {
         }
     }
 
-    /// Enqueue the self-tier "back online" wake (PRD §11.8). `PerceiveThenExpress` so the duck
+    /// Enqueue the self-tier "back online" wake. `PerceiveThenExpress` so the duck
     /// reflects on the downtime and may say something — entirely its call in Express.
     async fn enqueue_back_online(&self) {
         let now = chrono::Utc::now().timestamp();
@@ -221,7 +221,7 @@ impl Harness {
     }
 
     /// Author a tagged-error runlog entry for a dispatch that failed before writing its own
-    /// runlog (e.g. the runtime/bridge was unreachable). PRD §7.5 — errors are runlog entries.
+    /// runlog (e.g. the runtime/bridge was unreachable). — errors are runlog entries.
     async fn log_dispatch_failure(&self, stimulus: &Stimulus, err: &DackError) {
         let entry = RunLogEntry {
             run_id: format!("run-{}-error", stimulus.id.0),
@@ -251,14 +251,14 @@ impl Harness {
         // The cycle's TRUST SEED (the taint/IFC model): the meet of the standing duty's trust and
         // the world-data it carried. It ratchets DOWN as the chain touches lower-trust capabilities;
         // the accumulated tier maps to the state CEILING (`reaches`) — how far the chain may walk.
-        // I18: an `operator_signed` directive is honored ONLY against a verifying signature — never
+        // An `operator_signed` directive is honored ONLY against a verifying signature — never
         // a self-asserted label (the `dack say` path); a bad/absent signature downgrades to public.
-        // Phase 2: a DEFERRED BATON CONTINUATION pops here like any stimulus, but is NOT re-perceived
+        // a DEFERRED BATON CONTINUATION pops here like any stimulus, but is NOT re-perceived
         // — it carries a digested Baton and its already-firebreak-clamped accumulated trust, so it
         // runs directly as the act-state on that baton (no re-verify, no re-meet). A RAW stimulus
         // instead opens Perceive on the (untrusted) payload after verifying its directive tier (I18).
         let continuation = parse_continuation(&stimulus);
-        // Phase 4 — baton TTL: a deferred baton that waited too long behind higher-priority work is
+        // — baton TTL: a deferred baton that waited too long behind higher-priority work is
         // STALE (the context it digested has moved on). Expire it instead of acting on a dead gist.
         if continuation.is_some() {
             if let Some(ttl) = self.config.baton_ttl_secs {
@@ -308,14 +308,14 @@ impl Harness {
         }
         // A harness-entered Reflect (scheduled or `dack reflect-now`) counts as a reflect for the
         // cadence guard — record it so a transition-reached Reflect right after respects the
-        // interval (the entry path is itself intentionally not rate-limited; PRD §4.2).
+        // interval (the entry path is itself intentionally not rate-limited;).
         if current.state == ConsciousnessState::Reflect {
             let _ = self.queue.set_cursor("reflect:last", &now.to_string()).await;
         }
 
-        // Fan-out worklist (Phase 1): a state may emit SEVERAL intent-batons, each an independent
+        // Fan-out worklist: a state may emit SEVERAL intent-batons, each an independent
         // branch with its OWN taint trajectory. We drain breadth-first IN-WAKE (no persistence yet —
-        // Phase 2 makes batons durable queue items). Every branch is gated by the same three checks
+        // makes batons durable queue items). Every branch is gated by the same three checks
         // as a single hop — the emitting prompt's `transitions:` allow-set, the branch's taint
         // ceiling, and the structural rule — and the firebreak (fresh session + a digested Baton)
         // holds across each. Bounded by a per-step fan-out WIDTH cap and a per-cycle total-step
@@ -355,7 +355,7 @@ impl Harness {
                 .run_step(&b.prompt, &b.step, &stimulus, &b.trust, b.ceiling, b.scope_override.as_ref(), steps)
                 .await?;
             // Taint by ACTUAL access: degrade THIS branch's trust by what the step called, then
-            // recompute the ceiling its child batons are checked against (monotonic, I17).
+            // recompute the ceiling its child batons are checked against (monotonic).
             let mut trust = b.trust.clone();
             let mut ceiling = b.ceiling;
             if let Some(a) = accessed {
@@ -363,7 +363,7 @@ impl Harness {
                 ceiling = lattice.reaches(&trust);
             }
 
-            // Worker delegation (Phase 10): an Express `spawn` launches a DETACHED, KEYLESS, sandboxed
+            // Worker delegation: an Express `spawn` launches a DETACHED, KEYLESS, sandboxed
             // worker; its summary returns later as an untrusted `worker_completion` stimulus (the
             // return-firebreak). Gated to Express — the duck delegates, it never becomes the worker.
             if let Some(spawn) = out.spawn.clone() {
@@ -425,8 +425,8 @@ impl Harness {
                     );
                     continue;
                 }
-                // Self-modification (Reflect) is rate-limited by the harness clock (TIER-4, invariant
-                // I6) — even a clean branch the ceiling admits reflects only once per interval.
+                // Self-modification (Reflect) is rate-limited by the harness clock — even a clean
+                // branch the ceiling admits reflects only once per interval.
                 if next.state == ConsciousnessState::Reflect {
                     if !self.reflect_rate_limit_ok(now).await {
                         tracing::debug!(
@@ -464,12 +464,12 @@ impl Harness {
                 // branch's accumulated trust), never raw bytes.
                 let baton =
                     build_baton_from_intent(&intent, &out, &stimulus, runlog_ref.clone(), trust.clone());
-                // DEFER to the durable queue (Phase 2) ONLY when the model EXPLICITLY marks this branch
+                // DEFER to the durable queue ONLY when the model EXPLICITLY marks this branch
                 // low-priority ("do it later") — so a higher-priority stimulus can be processed first.
                 // A legacy/inherited priority runs in-wake as the natural continuation. Bounded by
                 // recursion depth, beyond which even a low baton runs in-wake to terminate. (Priority ⟂
                 // trust: it changes WHEN a branch runs, never WHAT it may do. Full per-item priority +
-                // the ≤-origin clamp arrive in Phase 3.)
+                // the ≤-origin clamp arrive later.)
                 if intent.priority == Some(Priority::Low) && depth < MAX_LINEAGE_DEPTH {
                     deferred_seq += 1;
                     let cont = continuation_stimulus(
@@ -525,7 +525,7 @@ impl Harness {
         step_seq: usize,
     ) -> Result<(AgentOutput, String, Option<TrustTier>)> {
         let spec = default_spec(prompt.state);
-        // The capabilities this state-prompt plugs (the two-sided handshake, MCP2-B).
+        // The capabilities this state-prompt plugs (the two-sided handshake,).
         let (mcp_servers, inline_read) =
             self.assemble_mcp_servers(prompt, stimulus, cycle_trust, scope_override).await;
         let recorder = self.wall_for(spec.clone(), inline_read, cycle_trust);
@@ -575,7 +575,7 @@ impl Harness {
         )];
         blocks.extend(self.context_blocks(step, stimulus, is_resume, watermark, &prompt.context()).await);
         blocks.push(transitions_block(&reachable));
-        // The agent never receives a raw secret env (TIER-4): capability tokens are injected into
+        // The agent never receives a raw secret env: capability tokens are injected into
         // the MCP transport server-side, never the agent's context. Sensor secrets live in ingest.
         let secret_env = BTreeMap::new();
 
@@ -606,16 +606,16 @@ impl Harness {
             mcp_servers,
             model,
             // The duck's consciousness states register no sub-agents (no `Task` target — sync
-            // sub-helpers exist only inside a worker, Phase 10). Workers set this in `run_worker_detached`.
+            // sub-helpers exist only inside a worker). Workers set this in `run_worker_detached`.
             agents: BTreeMap::new(),
-            // The duck is NEVER containerized — only delegated workers OS-isolate (Phase 14).
+            // The duck is NEVER containerized — only delegated workers OS-isolate.
             isolate: false,
             mounts: Vec::new(),
             allowed_tools: None, // the duck uses the engine default; the wall gates every call.
         };
         // Model-call latency: wall-clock around the whole bridge round-trip (incl. the wall/tool turns
         // — that IS the cycle's model cost). One structured event, correlated by the `cycle`/`step`
-        // span, with the token usage we already plumb (Phase 2). Latency dashboards = a log query.
+        // span, with the token usage we already plumb. Latency dashboards = a log query.
         let call_start = std::time::Instant::now();
         let (out, ran_session, usage) = self.runtime.invoke(req, recorder.clone()).await?;
         tracing::info!(
@@ -726,9 +726,9 @@ impl Harness {
     }
 
     /// The cycle's effective **directive** trust, with `operator_signed` proven cryptographically
-    /// (invariant I18 — provenance seeds trust, never a self-asserted label). Only `operator_signed`
+    /// (provenance seeds trust, never a self-asserted label). Only `operator_signed`
     /// requires proof here: `self`/`public` directives are provenance-seeded upstream by the bus
-    /// (TIER-3) and pass through. A directive that *claims* `operator_signed` is honored ONLY if a
+    /// and pass through. A directive that *claims* `operator_signed` is honored ONLY if a
     /// signature in `provenance` (`operator_sig:<b64>`) verifies against the **config-declared**
     /// operator DID over the directive body; a bad/absent/unverifiable signature → `public`.
     async fn verified_directive_tier(&self, stimulus: &Stimulus) -> TrustTier {
@@ -807,7 +807,7 @@ impl Harness {
             .insert(key.to_string(), (session_id.to_string(), now));
     }
 
-    /// The scheduled Reflect ticker (PRD §4.2): when `reflect_schedule` is set, enqueue a harness-
+    /// The scheduled Reflect ticker: when `reflect_schedule` is set, enqueue a harness-
     /// entered Reflect stimulus at each cron fire, gated by the reflect rate-limit. Harness-owned
     /// (not a soul duty) because the shared `CronWheel` is rewiped on every `stimuli/` hot-reload.
     /// Exits cleanly on shutdown. `dack reflect-now` enqueues the same stimulus out-of-band.
@@ -851,8 +851,8 @@ impl Harness {
         }
     }
 
-    /// Whether a Reflect (self-modification) run is permitted now under the harness rate-limit
-    /// (TIER-4, invariant I6): at least `reflect_min_interval_secs` since the last Reflect (persisted
+    /// Whether a Reflect (self-modification) run is permitted now under the harness rate-limit:
+    /// at least `reflect_min_interval_secs` since the last Reflect (persisted
     /// in the queue `cursor` table). `0` disables the limit; a never-reflected agent is allowed.
     async fn reflect_rate_limit_ok(&self, now: i64) -> bool {
         let interval = self.config.reflect_min_interval_secs;
@@ -876,7 +876,7 @@ impl Harness {
         StatePrompt::parse(id, &String::from_utf8_lossy(&bytes))
     }
 
-    /// Post-run soul reconciliation (PRD §7.5, invariant I13) — the durability+integrity
+    /// Post-run soul reconciliation — the durability+integrity
     /// interlock that makes tool-driven `Write`/`Edit` well-defined:
     ///   1. enumerate the soul working-tree delta (`git status`);
     ///   2. **revert** anything outside the running state's `writable_dirs` (the SAME allowlist
@@ -932,7 +932,7 @@ impl Harness {
             };
             // Commit locally; the cycle's single `push_soul` (end of dispatch) ships it along
             // with the runlog + memory commits. Staying local on push failure is fine — durable
-            // on the box, re-pushed next cycle (PRD §3.5).
+            // on the box, re-pushed next cycle.
             if let Err(e) = self.repo.commit_paths(&allowed, &commit).await {
                 tracing::warn!("reconcile {run_id}: sweep commit failed: {e}");
             }
@@ -942,7 +942,7 @@ impl Harness {
 
     /// Push the cycle's local soul commits (runlog + memory + sweep) to the configured remote,
     /// signed for `gitlawb://`. Best-effort: a node-down/offline push is logged, never fatal
-    /// — the commits are durable locally and re-push next cycle (PRD §3.5, invariant I13).
+    /// — the commits are durable locally and re-push next cycle.
     async fn push_soul(&self) {
         if let Err(e) = self.repo.push().await {
             tracing::warn!("soul push failed (kept local): {e}");
@@ -960,7 +960,7 @@ impl Harness {
 
     /// The wall for `spec` — a [`RecordingResponder`] wrapping a [`StatePolicyResponder`] wired
     /// with the operator's capability prefixes (so `mcp__twitter__*` classifies as Post in
-    /// Express) and the soul root (to relativize the absolute paths the SDK emits, PRD §4.1, §6.3).
+    /// Express) and the soul root (to relativize the absolute paths the SDK emits).
     /// `extra_read` adds the prefixes of any **inline** (soul-declared, secret-less) MCP servers
     /// plugged for this invocation — always read-tier (a soul can never inline a post/settle tool).
     fn wall_for(
@@ -983,7 +983,7 @@ impl Harness {
         RecordingResponder::wrap(responder)
     }
 
-    /// Assemble the MCP capability servers a `prompt` plugs (PRD §6.3.1, invariant I16) via the
+    /// Assemble the MCP capability servers a `prompt` plugs via the
     /// **two-sided handshake**: the soul-prompt's `mcp:` REQUESTS ∩ the operator `tier_policy` for
     /// the prompt's state ADMITS ∩ the server tier fits the state. Two ref forms:
     /// - **import** (a name): allowed only if in the tier's `import` list; the operator-registered
@@ -1026,7 +1026,7 @@ impl Harness {
                     if !tier_fits_state(server.tier, state) {
                         continue; // e.g. a settle-tier trading tool is never exposed outside Settle.
                     }
-                    // AUTHORIZATION (Phase 12): a `min_trust` server is plugged only if the cycle's
+                    // AUTHORIZATION: a `min_trust` server is plugged only if the cycle's
                     // CURRENT (post-taint) trust clears it. Because it gates on the live cycle trust, a
                     // high-trust cycle that has touched lower-trust data has already DEGRADED and loses
                     // the privileged tool mid-walk — the firebreak, for free. `None` = no trust gate.
@@ -1054,7 +1054,7 @@ impl Harness {
                         },
                         None => None,
                     };
-                    // Payload-scoped env (Phase 12): resolve each `scope_env` field and inject it into
+                    // Payload-scoped env: resolve each `scope_env` field and inject it into
                     // THIS server's env — so the capability is locked to harness-held data the model
                     // can't supply (e.g. telegram's source chat). Per-BATON reply targeting: when this
                     // branch carries a validated `scope_override` (a selected in-batch message), resolve
@@ -1115,7 +1115,7 @@ impl Harness {
 
     /// The state's context blocks, **resume-aware** (the de-bloat that keeps a sticky session coherent):
     /// - ENTRY (Perceive): the directive (lean `---resume---` half on a resume) + payload as SEPARATE
-    ///   blocks (§5.3). Plus, FRESH only, a memory tail (grounding). Plus the runlog (see `runlog_blocks`).
+    ///   blocks. Plus, FRESH only, a memory tail (grounding). Plus the runlog (see `runlog_blocks`).
     /// - ACT (Express): the digested Baton (never raw bytes). Plus the runlog (resume = conversation diff).
     /// `ctx` controls memory + the runlog views; memory is never re-sent on a resume (the session holds it;
     /// the duck `Read`s `memory/` on demand). The caller appends orientation (before) + transitions (after).
@@ -1204,10 +1204,10 @@ impl Harness {
     }
 
     /// A state-prompt's system prompt = **SOUL.md** (the constant self) + the state-prompt's own
-    /// **body** (the named chain-of-thought; MCP2-B). The body was already read live from
+    /// **body** (the named chain-of-thought;). The body was already read live from
     /// `prompts/<id>.md` when the prompt was resolved, so a Reflect edit takes effect next wake. The
     /// bridge appends the structured-output instruction. An empty soul + body degrades to a minimal
-    /// header rather than failing the run (PRD §4, §6.2).
+    /// header rather than failing the run.
     async fn system_prompt_for_prompt(&self, prompt: &StatePrompt, is_resume: bool) -> String {
         let soul = self.repo.read_file(&RepoPath("SOUL.md".into())).await.unwrap_or_default();
         let soul = String::from_utf8_lossy(&soul);
@@ -1275,7 +1275,7 @@ impl Harness {
         }
     }
 
-    /// Author the durable RunLog entry for one state invocation (PRD §7.5) — the harness
+    /// Author the durable RunLog entry for one state invocation — the harness
     /// writes it, never the agent. Carries the raw stimulus (the runlog writer frames it
     /// untrusted), the captured `(tool, decision)` records, and the soul-integrity verdict:
     /// any `reverted` paths make this a tagged-error entry (the tripwire alarm). Returns the
@@ -1320,7 +1320,7 @@ impl Harness {
 }
 
 /// Hard cap on TOTAL state-prompt invocations one stimulus may walk through, across its whole
-/// fan-out tree (Phase 1) — a runaway-loop backstop for a soul whose `transitions` form a cycle or
+/// fan-out tree — a runaway-loop backstop for a soul whose `transitions` form a cycle or
 /// a step that fans out unboundedly. Real cycles are a handful of steps; generalizes the old
 /// single-chain hop cap.
 const MAX_CYCLE_STEPS: usize = 12;
@@ -1329,12 +1329,12 @@ const MAX_CYCLE_STEPS: usize = 12;
 /// (logged). Keeps a single confused step from flooding the worklist; real fan-out is 1–3 branches.
 const MAX_FANOUT_WIDTH: usize = 5;
 
-/// How many times a lineage may DEFER a low-priority baton back through the durable queue (Phase 2)
+/// How many times a lineage may DEFER a low-priority baton back through the durable queue
 /// before further low-prio batons are just run in-wake instead — bounds queue-recursion depth so a
-/// self-reproducing fan-out can't grow the queue without end (the global cap lands in Phase 4).
+/// self-reproducing fan-out can't grow the queue without end (the global cap lands in ).
 const MAX_LINEAGE_DEPTH: usize = 4;
 
-/// The reserved `Stimulus::type_` marking a DURABLE BATON CONTINUATION (Phase 2): a fan-out branch
+/// The reserved `Stimulus::type_` marking a DURABLE BATON CONTINUATION: a fan-out branch
 /// DEFERRED to the queue instead of run in-wake, so a low-priority follow-on can be jumped by a
 /// higher-priority stimulus. Created ONLY by the harness (never a sensor/duty); dispatch runs it as
 /// `StepInput::Act(baton)` at `entry`, reseeded from the already-firebreak-clamped trust it carries
@@ -1429,7 +1429,7 @@ enum StepInput {
 /// step (never instruction prose; SOUL.md owns the how-to-operate text). Variables the model can't
 /// read from a file: the working dir, the capabilities actually plugged here, and the cycle's
 /// trust → reachable ceiling. Keeps text in the soul repo and the harness to "fill in the blanks."
-/// Run a delegated worker DETACHED (Phase 10) — a separate, KEYLESS, sandboxed `openclaude`
+/// Run a delegated worker DETACHED — a separate, KEYLESS, sandboxed `openclaude`
 /// invocation in its own `/workspace` (worker spec, no soul/post/settle), then inject the worker's
 /// (UNTRUSTED) summary as a `worker_completion` stimulus (the return-firebreak). A free fn over the
 /// cloned seams so it outlives the spawning dispatch cycle. Best-effort: any failure still fires a
@@ -1458,7 +1458,7 @@ async fn run_worker_detached(
         }
     };
 
-    // Isolation (Phase 14): the agent opts in via `isolation: docker`, and the runtime must actually
+    // Isolation: the agent opts in via `isolation: docker`, and the runtime must actually
     // carry a worker backend (`worker_guest_cwd()`). If it wants Docker but none is configured, we
     // fall back to the host run — and CRUCIALLY root the wall at whichever path the bridge will really
     // use, so the SDK's emitted paths relativize: the GUEST `/workspace` when containerized, else the
@@ -1505,7 +1505,7 @@ async fn run_worker_detached(
     // Sub-helper defs the worker may `Task`-spawn (all agents EXCEPT the lead → no lead recursion).
     // A DOCKER-isolated worker gets NONE: the SDK Docker-sandboxes each sub-agent, which is impossible
     // inside the container (no docker-in-docker). The container IS the isolation — a docker worker is a
-    // single agent. (A host worker keeps its sub-helpers — Phase 10.) The bridge disallows the `Task`
+    // single agent. (A host worker keeps its sub-helpers) The bridge disallows the `Task`
     // tool whenever `agents` is empty, so the model can't even attempt a sub-agent here.
     let agents = if isolated {
         BTreeMap::new()
@@ -1718,7 +1718,7 @@ fn orientation_block(
 
 /// Render a [`Baton`] as the act-step context block — the agent's own digested product + the
 /// harness-derived refs (e.g. `source_tweet_id`), NOT raw untrusted bytes. `payload_tier` rides
-/// along so the act state stays skeptical (PRD §6.4).
+/// along so the act state stays skeptical.
 fn baton_block(baton: &Baton) -> ContextBlock {
     let refs_rendered = if baton.refs.is_empty() {
         String::new()
@@ -1736,7 +1736,7 @@ fn baton_block(baton: &Baton) -> ContextBlock {
     }
 }
 
-/// The allowed-transitions context block (MCP2-B) — tells the agent the EXACT set of next
+/// The allowed-transitions context block — tells the agent the EXACT set of next
 /// state-prompt ids it may choose (`transition.to_prompt`), and that it picks at most one. A
 /// terminal prompt (no transitions) gets an explicit "this is the last step" note. Trusted
 /// (harness-authored from the soul's own `transitions:`).
@@ -1766,7 +1766,7 @@ fn mcp_server_of(tool: &str) -> Option<&str> {
     tool.strip_prefix("mcp__").and_then(|s| s.split_once("__")).map(|(server, _)| server)
 }
 
-/// Whether a capability tier is exposed in `state` (PRD §6.3): read everywhere, post in Express,
+/// Whether a capability tier is exposed in `state`: read everywhere, post in Express,
 /// settle ONLY in Settle (the irreversible doorway). The state half of the gate; the wall's
 /// per-state scope + the taint-derived reachability of Settle are the rest.
 fn tier_fits_state(tier: CapabilityTier, state: ConsciousnessState) -> bool {
@@ -1820,7 +1820,7 @@ fn build_mcp_config(
             for (k, v) in &server.env {
                 env.insert(k.clone(), json!(v));
             }
-            // Payload-scoped env (Phase 12): per-cycle data the harness locks the server to (e.g.
+            // Payload-scoped env: per-cycle data the harness locks the server to (e.g.
             // telegram's source chat) — the model never supplies it.
             for (k, v) in extra_env {
                 env.insert(k.clone(), json!(v));
@@ -1852,8 +1852,8 @@ fn state_tag(state: ConsciousnessState) -> &'static str {
     }
 }
 
-/// Wraps the wall ([`ActionResponder`]) to capture every `(tool, decision)` for the runlog
-/// (PRD §7.5): an injection path — a tool the agent tried that the wall denied — must be
+/// Wraps the wall ([`ActionResponder`]) to capture every `(tool, decision)` for the runlog:
+/// an injection path — a tool the agent tried that the wall denied — must be
 /// visible post-hoc and become a lesson in Reflect. Transparent: it records, then delegates
 /// the decision verbatim. The agent cannot see or touch it (it is out-of-process state).
 struct RecordingResponder {
@@ -1884,7 +1884,7 @@ impl ActionResponder for RecordingResponder {
             ActionDecision::Deny(why) => format!("deny: {why}"),
         };
         // Capture a compact input so the runlog shows the ACTION (e.g. the reply text), not just
-        // the tool name — the audit trail of what the duck actually did (PRD §7.5). Truncated.
+        // the tool name — the audit trail of what the duck actually did. Truncated.
         let mut input = req.input.to_string();
         if input.len() > 240 {
             // Truncate on a CHAR BOUNDARY: `req.input` is often multi-byte UTF-8 (e.g. Cyrillic reply
@@ -1906,15 +1906,15 @@ impl ActionResponder for RecordingResponder {
     }
 }
 
-/// Build the Baton from Perceive's output (PRD §6.4). Pure + testable: the firebreak's
+/// Build the Baton from Perceive's output. Pure + testable: the firebreak's
 /// core invariant — the Baton carries the agent's **digested gist**, never the raw
 /// stimulus payload. Returns `None` when Perceive proposed nothing to carry forward.
-/// Build the Baton for ONE fan-out branch (Phase 1). The branch's own `gist` (from its
+/// Build the Baton for ONE fan-out branch. The branch's own `gist` (from its
 /// [`BatonIntent`]) is the digested product that crosses the firebreak; an EMPTY gist falls back to
 /// the proposal gist — else the digested *thought* (a forced `PerceiveThenExpress` cycle, e.g. the
 /// heartbeat, must still open Express even if Perceive proposed nothing). Either way it is the
 /// agent's OWN product, never the raw untrusted payload. Harness-deterministic refs (reply target,
-/// telegram chat) are injected from the stimulus, never model-laundered text (PRD §6.4).
+/// telegram chat) are injected from the stimulus, never model-laundered text.
 pub fn build_baton_from_intent(
     intent: &BatonIntent,
     out: &AgentOutput,
@@ -1935,7 +1935,7 @@ pub fn build_baton_from_intent(
     };
     // Harness-derived structured reply target, taken DETERMINISTICALLY from the payload the
     // harness holds (never model-laundered text). This is the only tweet id Express sees, so it
-    // can reply to the triggering tweet but not target arbitrary ones (PRD §6.4 — the firebreak
+    // can reply to the triggering tweet but not target arbitrary ones (the firebreak
     // carries the agent's digested gist + these trusted structured refs, not the raw payload).
     if let Some(id) = stimulus.payload.get("id").and_then(|v| v.as_str()) {
         refs.insert("source_tweet_id".into(), id.to_string());
@@ -1943,7 +1943,7 @@ pub fn build_baton_from_intent(
     if let Some(author) = stimulus.payload.get("author_username").and_then(|v| v.as_str()) {
         refs.insert("source_author".into(), author.to_string());
     }
-    // Telegram (Phase 12): the chat that woke this cycle — context the duck SEES (who it's talking
+    // Telegram: the chat that woke this cycle — context the duck SEES (who it's talking
     // to). The reply DESTINATION is locked separately, into the telegram MCP's env (scope_env), so
     // the model can't redirect it. chat_id may be a JSON number or string.
     if let Some(c) = stimulus.payload.get("chat_id") {
@@ -1963,7 +1963,7 @@ pub fn build_baton_from_intent(
         // payload tier. Lets the act state stay as skeptical as everything the chain has touched.
         payload_tier: cycle_trust,
         runlog_ref,
-        // Continuity only — explicitly NOT a safety boundary (PRD §6.4).
+        // Continuity only — explicitly NOT a safety boundary.
         thoughts: out.thought.clone(),
         // Carry the branch's extra recall tags to the act-state's runlog entry.
         tags: intent.tags.clone(),
@@ -2059,7 +2059,7 @@ mod tests {
 
     /// Write the minimal state-prompt tree the dispatch tests resolve live: a `perceive` entry
     /// that may walk to `express` or `settle`, plus the two act prompts. The tmp dirs are NOT git
-    /// repos, so `status()` errors and reconcile is a no-op — these need no commit (PRD §6.3.1).
+    /// repos, so `status()` errors and reconcile is a no-op — these need no commit.
     fn seed_prompts(dir: &std::path::Path) {
         let p = dir.join("prompts");
         std::fs::create_dir_all(&p).unwrap();
@@ -2117,7 +2117,7 @@ mod tests {
         assert!(!serialized.contains("gm duck"), "raw payload text must not ride the baton");
     }
 
-    /// Phase 12.3 — a Telegram stimulus surfaces the source chat + sender as harness-derived refs
+    /// A Telegram stimulus surfaces the source chat + sender as harness-derived refs
     /// (the duck's reply CONTEXT). `chat_id` may be a JSON number; the reply DESTINATION itself is
     /// locked separately into the MCP env (scope_env), not exposed as a model argument.
     #[test]
@@ -2133,7 +2133,7 @@ mod tests {
         assert!(!serde_json::to_string(&baton).unwrap().contains("gm duck"), "raw text must not ride the baton");
     }
 
-    /// The dispatch wiring (Phase 4), offline against a mock bridge: a stimulus runs
+    /// The dispatch wiring, offline against a mock bridge: a stimulus runs
     /// Perceive, the harness authors a runlog, and a Perceive that proposes a transition
     /// opens a **fresh** Express invocation. The mock counts invocations via a file.
     #[tokio::test]
@@ -2253,7 +2253,7 @@ mod tests {
         }
     }
 
-    /// Phase 5 acceptance (PRD §11.6): **raw stimulus text never appears in Express context.**
+    /// acceptance: **raw stimulus text never appears in Express context.**
     /// Perceive *does* see the raw payload (its job is to digest it); the Baton-seeded Express
     /// context must not — the firebreak, asserted over the real assembled requests.
     #[tokio::test]
@@ -2310,8 +2310,8 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// TIER-4: NO state ever receives a raw secret env. The routing-gated act-secrets path is gone;
-    /// a capability's token is injected into its MCP transport server-side (MCP2-A/B), never the
+    /// NO state ever receives a raw secret env. The routing-gated act-secrets path is gone;
+    /// a capability's token is injected into its MCP transport server-side, never the
     /// agent's context — so every invocation's `secret_env` is empty.
     #[tokio::test]
     async fn no_state_receives_a_raw_secret_env() {
@@ -2357,7 +2357,7 @@ mod tests {
     }
 
     /// A perceive prompt that picks an `express` transition opens Express — and when it carries no
-    /// structured proposal, the Baton's gist falls back to the digested *thought* (MCP2-B; the old
+    /// structured proposal, the Baton's gist falls back to the digested *thought* (the old
     /// `PerceiveThenExpress` *force* is gone — the model now chooses from the prompt's transitions).
     /// The firebreak still holds: the thought crosses as the gist, the raw payload does not.
     #[tokio::test]
@@ -2419,7 +2419,7 @@ mod tests {
 
     /// The TAINT ceiling is enforced at dispatch: a `public` stimulus (public seed → `reaches:
     /// express`) whose perceive prompt picks the IRREVERSIBLE `settle` transition is dropped — only
-    /// perceive runs. (A public tweet reaches reversible Express, never Settle; PRD §5.7, §6.3.1.)
+    /// perceive runs. (A public tweet reaches reversible Express, never Settle)
     #[tokio::test]
     async fn public_stimulus_cannot_reach_settle() {
         use crate::identity::gitlawb::GitlawbIdentity;
@@ -2588,7 +2588,7 @@ mod tests {
         }
     }
 
-    /// Phase 1 fan-out: a Perceive that emits TWO intent-batons runs BOTH branches in one wake (the
+    /// fan-out: a Perceive that emits TWO intent-batons runs BOTH branches in one wake (the
     /// in-wake worklist) when the cycle is clean enough to admit them — express AND settle both run.
     #[tokio::test]
     async fn perceive_fans_out_to_all_admitted_branches() {
@@ -2617,7 +2617,7 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// Phase 1 fan-out + taint: a PUBLIC cycle fanning to [express, settle] runs ONLY express — the
+    /// fan-out + taint: a PUBLIC cycle fanning to [express, settle] runs ONLY express — the
     /// settle baton is above the public ceiling and is dropped per-branch (the firebreak, applied to
     /// each fan-out branch exactly as to a single hop).
     #[tokio::test]
@@ -2642,7 +2642,7 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// Phase 2: a baton the model marks EXPLICITLY low-priority is DEFERRED to the durable queue (not
+    /// a baton the model marks EXPLICITLY low-priority is DEFERRED to the durable queue (not
     /// run in-wake), and dispatching that continuation later runs the destination act-state on the
     /// carried baton — no re-perceive. The express branch (no explicit priority) still runs in-wake.
     #[tokio::test]
@@ -2719,7 +2719,7 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// Phase 2 headline: a fresh higher-priority stimulus is popped BEFORE a low-priority continuation
+    /// headline: a fresh higher-priority stimulus is popped BEFORE a low-priority continuation
     /// already waiting in the queue — the "high-prio stimulus jumps the low-prio follow-on backlog".
     #[tokio::test]
     async fn higher_priority_stimulus_preempts_a_deferred_low_baton() {
@@ -2733,7 +2733,7 @@ mod tests {
         low.priority = Priority::Low;
         queue.enqueue(low).await.unwrap();
 
-        // ...then a fresh NORMAL-priority stimulus arrives.
+        // then a fresh NORMAL-priority stimulus arrives.
         let mut fresh = poisoned_stimulus();
         fresh.id = StimulusId("fresh".into());
         fresh.priority = Priority::Normal;
@@ -2744,7 +2744,7 @@ mod tests {
         assert_eq!(queue.next().await.unwrap().unwrap().id.0, "lin-b1", "then the deferred low baton");
     }
 
-    /// Phase 4 — baton TTL: a deferred baton continuation older than `baton_ttl_secs` is EXPIRED at
+    /// baton TTL: a deferred baton continuation older than `baton_ttl_secs` is EXPIRED at
     /// dispatch (the world moved on while it waited) — it never invokes the model.
     #[tokio::test]
     async fn stale_baton_continuation_is_expired_at_dispatch() {
@@ -2798,7 +2798,7 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// Phase 7 / invariant I13: post-run soul reconciliation. Against a REAL git soul repo,
+    /// post-run soul reconciliation. Against a REAL git soul repo,
     /// an Express run's tool-driven writes are reconciled — the allowlisted `memory/` write is
     /// committed as the Soul DID, an out-of-allowlist `skills/` write is reverted + alarmed.
     #[tokio::test]
@@ -2857,7 +2857,7 @@ mod tests {
         // The allowed memory write was committed; the tree is now clean (empty unexpected-delta).
         let status = Command::new("git").arg("-C").arg(&soul).args(["status", "--porcelain"]).output().await.unwrap();
         assert!(String::from_utf8_lossy(&status.stdout).trim().is_empty(), "tree clean after reconcile");
-        // ...authored as the Soul DID, with a run/state-tagged sweep message.
+        // authored as the Soul DID, with a run/state-tagged sweep message.
         let author = Command::new("git").arg("-C").arg(&soul).args(["log", "-1", "--format=%an"]).output().await.unwrap();
         assert_eq!(String::from_utf8_lossy(&author.stdout).trim(), "did:dack:soul");
         let subject = Command::new("git").arg("-C").arg(&soul).args(["log", "-1", "--format=%s"]).output().await.unwrap();
@@ -2869,7 +2869,7 @@ mod tests {
         std::fs::remove_dir_all(&soul).ok();
     }
 
-    /// Phase 7 resilience: the run loop reclaims a crash-orphaned row, mints the "back online"
+    /// resilience: the run loop reclaims a crash-orphaned row, mints the "back online"
     /// wake, drives both to a TERMINAL state (no row stuck `dispatched`), and shuts down cleanly
     /// on the signal — the in-flight cycle finishes, then the loop exits.
     #[tokio::test]
@@ -2937,7 +2937,7 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    // ── MCP capability framework (PRD §6.3) ─────────────────────────────────────────────
+    // ── MCP capability framework ─────────────────────────────────────────────
 
     #[test]
     fn mcp_config_http_injects_bearer_header() {
@@ -3071,7 +3071,7 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// TIER-4 / invariant I6 — a CLEAN (`self`) cycle may transition into Reflect (its ceiling
+    /// a CLEAN (`self`) cycle may transition into Reflect (its ceiling
     /// `reaches: reflect`), but the harness clock RATE-LIMITS it: a second Reflect within the
     /// interval is dropped. (A public cycle could never reach Reflect at all — covered by the taint
     /// ceiling.)
@@ -3134,7 +3134,7 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// MCP2-B / invariant I16 — the self-plug handshake. On an OPEN tier (`mcp_whitelist: false`)
+    /// the self-plug handshake. On an OPEN tier (`mcp_whitelist: false`)
     /// the soul may inline a public MCP, FORCED read-tier (its prefix is registered read for the
     /// wall, no token); on a LOCKED tier the same inline is rejected; and an import that the tier's
     /// `import` list doesn't name is rejected even though the server exists.
@@ -3197,7 +3197,7 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// Phase 12 / the AUTHORIZATION axis — a `min_trust` server is assembled ONLY for a cycle whose
+    /// the AUTHORIZATION axis — a `min_trust` server is assembled ONLY for a cycle whose
     /// CURRENT trust clears it. Same state (Express), same tier_policy: a `min_trust: org` capability
     /// is denied to a `public` cycle, admitted to `org`, and admitted to any HIGHER tier (`self`) —
     /// gated purely by the cycle's live (post-taint) trust, orthogonal to the state.
@@ -3441,7 +3441,7 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// TIER-2 / invariant I17 — taint by ACTUAL access. A step's trust degradation is the `meet`
+    /// taint by ACTUAL access. A step's trust degradation is the `meet`
     /// over the registered `trust` of the MCP servers it actually CALLED: `cove-read(self)` keeps
     /// the cycle clean; `twitter(public)` or any unregistered (soul-inline) server floors it to
     /// public; a builtin or a DENIED call carries no taint.
@@ -3499,7 +3499,7 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// 8.2 / invariant I18 — an `operator_signed` directive is honored ONLY against a verifying
+    /// an `operator_signed` directive is honored ONLY against a verifying
     /// signature (`dack say`). A valid `operator_sig` over the directive body → operator_signed; a
     /// tampered body, a wrong signer, or an absent signature → public (the IFC downgrade). A
     /// non-operator directive (`self`) passes through untouched.
@@ -3577,7 +3577,7 @@ mod tests {
         assert_eq!(harness.verified_directive_tier(&selfish).await, TrustTier::self_());
     }
 
-    /// 8.7 — the per-run model override handshake. A state-prompt's `model:` is honored ONLY where
+    /// the per-run model override handshake. A state-prompt's `model:` is honored ONLY where
     /// the operator's `tier_policy[state].allow_model_override` permits; otherwise the operator's
     /// per-state `model` default (or the global `config.model`) stands. Asserted over the assembled
     /// `InvocationRequest.model` (the operator-boundary / soul-self-select shape, like mcp_whitelist).
@@ -3832,8 +3832,8 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// A worker's result re-enters the duck as an UNTRUSTED `worker_completion` stimulus (Phase 10
-    /// return-firebreak): `public` payload tier, the summary in the payload, entry at Perceive.
+    /// A worker's result re-enters the duck as an UNTRUSTED `worker_completion` stimulus
+    /// (return-firebreak): `public` payload tier, the summary in the payload, entry at Perceive.
     #[tokio::test]
     async fn worker_completion_is_an_untrusted_stimulus() {
         use crate::queue::InMemoryQueue;
@@ -3849,7 +3849,7 @@ mod tests {
         assert!(payload.contains("coder"), "the agent name is recorded");
     }
 
-    /// The async worker path end-to-end (Phase 10): resolve the `agents/` def from the repo → run a
+    /// The async worker path end-to-end: resolve the `agents/` def from the repo → run a
     /// worker invocation in a `/workspace` with the worker spec (Bash allowed) + its sub-helpers
     /// registered (the lead is NOT its own helper) → the result re-enters as a completion stimulus.
     #[tokio::test]
@@ -3903,7 +3903,7 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// Phase 14: agent `volumes:` resolve to READ-ONLY mounts (`/mnt/<base>` default), and a missing
+    /// agent `volumes:` resolve to READ-ONLY mounts (`/mnt/<base>` default), and a missing
     /// or soul-escaping `source` is rejected — only the workspace is ever writable.
     #[test]
     fn resolve_volumes_forces_readonly_and_rejects_escape() {

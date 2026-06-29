@@ -1,4 +1,4 @@
-//! **Agent definitions** (Phase 10) — the soul-owned `agents/**/*.md` workforce defs the duck may
+//! **Agent definitions** — the soul-owned `agents/**/*.md` workforce defs the duck may
 //! delegate to. Two roles, one shape:
 //! - the **lead worker** (e.g. `coder`) the duck spawns ASYNC (harness-launched, sandboxed) — its
 //!   `prompt`/`tools` drive a fresh, keyless `/workspace` invocation;
@@ -31,7 +31,7 @@ pub struct AgentFrontmatter {
     #[serde(default, rename = "maxTurns")]
     pub max_turns: Option<u32>,
     /// Harness-only (NOT sent to the SDK): the isolation backend for an ASYNC worker run of this def.
-    /// `docker` ⇒ run the bridge in a container (Phase 14, needs `runtime.worker_sandbox.enabled`);
+    /// `docker` ⇒ run the bridge in a container (needs `runtime.worker_sandbox.enabled`);
     /// `host` (or absent) ⇒ run on the host. (`worktree` is reserved/legacy.)
     #[serde(default)]
     pub isolation: Option<String>,
@@ -42,7 +42,7 @@ pub struct AgentFrontmatter {
     pub volumes: Vec<VolumeSpec>,
 }
 
-/// One read-only volume an agent def attaches to its containerized worker (Phase 14). `source` is a
+/// One read-only volume an agent def attaches to its containerized worker. `source` is a
 /// path RELATIVE TO THE SOUL ROOT (resolved + containment-checked by the harness); `target` is the
 /// in-container mount path (default `/mnt/<basename>`). Always mounted read-only.
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,4 +1,4 @@
-//! The **Baton** — the firebreak made structural (PRD §6.4).
+//! The **Baton** — the firebreak made structural.
 //!
 //! The one piece of data that is neither cleanly harness-owned nor agent-owned: it
 //! is *in flight* between two agent invocations, mediated by the harness. The
@@ -10,7 +10,7 @@
 //! What it covers: contamination *carried across* (verbatim "ignore previous
 //! instructions…" never rides into Express). What it does NOT cover: a malicious
 //! *conclusion* carried across (the laundered-plan attack) — that residual class is
-//! caught only by bounded blast radius and the irreversibility wall (PRD §7.6), never
+//! caught only by bounded blast radius and the irreversibility wall, never
 //! by context reset. Do not let this drift to over-confidence.
 
 use std::collections::BTreeMap;
@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use super::stimulus::TrustTier;
 
-/// Perceive → Express/Settle handoff (PRD §6.4).
+/// Perceive → Express/Settle handoff.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Baton {
     /// Digested intent — the agent's OWN product, **not** raw stimulus text. The

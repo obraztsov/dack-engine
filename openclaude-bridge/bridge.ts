@@ -18,7 +18,7 @@
  * decision. Structured output = the model's FINAL message is a JSON object matching the Rust
  * `AgentOutput` (provider-agnostic; an MCP `submit` tool perturbed provider routing).
  * Run: `bun run bridge.ts`. SDK portability: swapping the import below for
- * `@anthropic-ai/claude-agent-sdk` is the corp / Claude-Code runtime path (PRD §3.4).
+ * `@anthropic-ai/claude-agent-sdk` is the corp / Claude-Code runtime path.
  */
 
 import * as readline from 'node:readline'
@@ -132,7 +132,7 @@ async function runInvoke(inv: any) {
   // The duck's act-phase capabilities, assembled by the harness for this state (tokens injected
   // into headers/env). The wall still gates EVERY call (canUseTool → Rust), tier-classified.
   if (inv.mcp_servers && typeof inv.mcp_servers === 'object') options.mcpServers = inv.mcp_servers
-  // Sub-agent defs the worker may Task-spawn (Phase 10). Empty for the duck's states.
+  // Sub-agent defs the worker may Task-spawn. Empty for the duck's states.
   if (inv.agents && typeof inv.agents === 'object' && Object.keys(inv.agents).length) options.agents = inv.agents
 
   let finalText = ''

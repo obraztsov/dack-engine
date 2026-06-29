@@ -1,11 +1,11 @@
-//! Cron source (PRD §5.1, §11 step 4) — a tiny timer wheel over the registered cron
+//! Cron source — a tiny timer wheel over the registered cron
 //! duties. Each tick emits a [`FiredTrigger`] (empty payload — a cron fire carries no
 //! world data; the duty's sensor, if any, does the perceiving). **Zero reasoning here**
-//! (architecture §1): the wheel only decides *when*, never *what*.
+//! the wheel only decides *when*, never *what*.
 //!
 //! Hot-reload: [`reschedule`](CronWheel::reschedule) swaps the schedule set and wakes the
 //! loop, so a Reflect-authored `stimuli/` change re-times the duck's alarm clock without a
-//! restart (PRD §5.1).
+//! restart.
 
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -20,7 +20,7 @@ use crate::error::Result;
 
 /// Standard 5-field cron (`min hour dom month dow`) → the `cron` crate's 6-field form by
 /// prepending a `0` seconds column. 6/7-field expressions pass through unchanged. This is
-/// why the `stimuli/` examples can use familiar `"0 */4 * * *"` (PRD §10.3).
+/// why the `stimuli/` examples can use familiar `"0 */4 * * *"`.
 fn normalize_cron(expr: &str) -> String {
     let expr = expr.trim();
     if expr.split_whitespace().count() == 5 {

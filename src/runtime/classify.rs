@@ -1,5 +1,5 @@
 //! Map OpenClaude's raw permission event `(tool_name, input)` to a [`ToolClass`] +
-//! optional target path (PRD §6.3, grounded against OpenClaude 0.15.0).
+//! optional target path (grounded against OpenClaude 0.15.0).
 //!
 //! The SDK/gRPC permission callback hands us `(name, input, toolUseID)` — NOT a
 //! pre-classified event — so the responder derives the class here. **Fail-closed:**
@@ -30,7 +30,7 @@ pub fn classify_tool(
 ) -> (ToolClass, Option<String>) {
     // Config-driven capability tools win first, most-privileged first (settle > post > read), so
     // an irreversible prefix can never be shadowed by a looser one. Derived from the `mcp_servers`
-    // registry tiers (PRD §6.3). The FIRST matching prefix CLAIMS the tool: if that server carries
+    // registry tiers. The FIRST matching prefix CLAIMS the tool: if that server carries
     // a `tools` allowlist and the bare tool isn't on it, the tool is denied **fail-closed**
     // (→ `Other`), never re-classified by a looser prefix — this is how `cove-read` (read tier)
     // can serve an endpoint that also exposes `buy_token` without that trade tool ever counting

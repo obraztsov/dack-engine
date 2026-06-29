@@ -1,17 +1,17 @@
-//! **State-prompts** (MCP2-B) — the soul-owned chain-of-thought (PRD §6.3.1). A state-prompt is a
+//! **State-prompts** — the soul-owned chain-of-thought. A state-prompt is a
 //! named variant of a consciousness state: `(state-tier, prompt body, MCP plan, allowed
 //! transitions)`. They live in a **nested filesystem tree mirroring `stimuli/`** — e.g.
 //! `prompts/settle.md`, `prompts/twitter/perceive_mention.md`, `prompts/twitter/feed_reply.md` —
 //! and a state-prompt's **id is its path relative to `prompts/`, without the extension**
 //! (`twitter/perceive_mention`).
 //!
-//! The split (architecture §2, invariant I16): the **operator owns the WALL** (which consciousness
+//! The split: the **operator owns the WALL** (which consciousness
 //! tiers exist, their reversibility, and — via `tier_policy` — which MCP classes a tier admits); the
 //! **soul owns the PATH** (which state-prompts run, in what order, and which *permitted* MCPs each
 //! plugs). The frontmatter here is the soul's half; it can only ever REQUEST a capability — the
 //! operator's `tier_policy` and the wall decide whether it is granted.
 //!
-//! **frontmatter is config; the body is the directive text** (trusted; PRD §5.3), exactly as in
+//! **frontmatter is config; the body is the directive text** (trusted), exactly as in
 //! `stimuli/`. The harness reads a state-prompt **live** from the soul repo each time it is opened,
 //! so a Reflect edit takes effect on the next wake.
 

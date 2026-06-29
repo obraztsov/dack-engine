@@ -1,4 +1,4 @@
-//! The agent's I/O contract (PRD §6.2). Conceptually the agent has **no free-form
+//! The agent's I/O contract. Conceptually the agent has **no free-form
 //! output channel** — every external effect is a skill (Twitter via skill, DAC via
 //! skill+MCP, commits via gl-MCP). The agent's *return value* to the harness is this
 //! small structured object: reasoning + whether a state transition is requested.
@@ -15,7 +15,7 @@ pub enum Intent {
     Reply,
     Post,
     Research,
-    /// Hand a real, longer job to a keyless sandboxed worker (Phase 10). Declared in Perceive to
+    /// Hand a real, longer job to a keyless sandboxed worker. Declared in Perceive to
     /// signal the intent; the actual [`SpawnRequest`] is honored only once the duck reaches Express.
     Delegate,
     Ignore,
@@ -66,7 +66,7 @@ where
     })
 }
 
-/// A requested state transition (MCP2-B). The agent names the **next state-prompt id** it chooses
+/// A requested state transition. The agent names the **next state-prompt id** it chooses
 /// — exactly one of the current prompt's declared `transitions` (or `None` to terminate). Whether
 /// it is honored is decided by the harness: the id must be in the allowed set, resolve to a real
 /// `prompts/<id>.md`, sit within the route ceiling, and pass [`crate::state::allowed_transition`].
@@ -80,7 +80,7 @@ pub struct Transition {
     pub reason: String,
 }
 
-/// One **fan-out branch** the model proposes from a state (Phase 1). A single cycle may emit
+/// One **fan-out branch** the model proposes from a state. A single cycle may emit
 /// SEVERAL — each its own digested gist + destination state-prompt, processed as an independent
 /// branch with its own taint trajectory (the in-wake worklist). Supersedes the single [`Transition`]
 /// (still accepted and normalized to a one-element fan-out by [`AgentOutput::fan_out`]).
@@ -95,7 +95,7 @@ pub struct BatonIntent {
     #[serde(default)]
     pub gist: String,
     /// Proposed scheduling priority for this branch. Harness-CLAMPED (never trusted to raise above
-    /// the origin) — `None` ⇒ inherit the cycle's. Honored from Phase 3; carried here from Phase 1.
+    /// the origin) — `None` ⇒ inherit the cycle's. Honored from carried here from .
     #[serde(default)]
     pub priority: Option<Priority>,
     /// The message this branch REPLIES TO — the id the model copies from a message it saw in the
@@ -115,7 +115,7 @@ pub struct BatonIntent {
     pub reason: String,
 }
 
-/// A request to delegate a job to a **keyless sandboxed worker** (Phase 10). The agent names an
+/// A request to delegate a job to a **keyless sandboxed worker**. The agent names an
 /// `agents/<agent>.md` def + a one-shot `brief`; the harness launches the worker ASYNCHRONOUSLY
 /// (its own worker-spec sandbox, no soul/post/settle), and its summary returns later as an UNTRUSTED
 /// `worker_completion` stimulus (the return-firebreak). Honored only from an act state (Express) —
@@ -137,11 +137,11 @@ pub struct TagNote {
     pub note: String,
 }
 
-/// The full agent return value (PRD §6.2).
+/// The full agent return value.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentOutput {
     /// Internal reasoning — **logged, never published** (Eliza-style "thought").
-    /// Rides the Baton for continuity but is NOT a safety boundary (PRD §6.4).
+    /// Rides the Baton for continuity but is NOT a safety boundary.
     pub thought: String,
     /// Tag-notes: per-conversation "sticky notes" appended to the SHORT-TERM tag-notes catalogue
     /// (`runlogs/tag-notes.ndjson`). Replaces the old `memory_append` — long-term `memory/` is written
@@ -151,14 +151,14 @@ pub struct AgentOutput {
     pub tag_notes: Option<Vec<TagNote>>,
     #[serde(default)]
     pub proposal: Option<Proposal>,
-    /// Optional worker delegation (Phase 10). Honored only from Express; launched async, returns as
+    /// Optional worker delegation. Honored only from Express; launched async, returns as
     /// an untrusted `worker_completion` stimulus. `None` (the common case) = no delegation.
     #[serde(default)]
     pub spawn: Option<SpawnRequest>,
     /// Legacy single transition (still accepted). `fan_out()` folds it into `batons`.
     #[serde(default)]
     pub transition: Transition,
-    /// **Fan-out** (Phase 1): the branches this cycle wants to take. Several = do several things at
+    /// **Fan-out**: the branches this cycle wants to take. Several = do several things at
     /// once, each its own gist + destination, each an independent branch. Empty = terminate. Wins
     /// over the legacy `transition` when present.
     #[serde(default)]
@@ -216,7 +216,7 @@ mod tests {
     }
 
     /// `fan_out()` normalizes both shapes: the new `batons` list wins; a legacy single `transition`
-    /// folds to one branch; nothing ⇒ terminate. This is the back-compat contract for Phase 1.
+    /// folds to one branch; nothing ⇒ terminate. This is the back-compat contract for .
     #[test]
     fn fan_out_normalizes_legacy_and_multi() {
         // New shape: an explicit batons list is used verbatim (the fan-out).

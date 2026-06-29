@@ -1,10 +1,10 @@
 //! Claude Code one-shot adapter — the **swappable degraded runtime** (`claude -p
 //! "<prompt>"`), the Hermes-style stateless pattern. Live-verified during grounding:
-//! `claude -p "…"` returns a completion end-to-end (`docs/VERIFICATION.md`).
+//! `claude -p "…"` returns a completion end-to-end.
 //!
 //! This is the proof that the [`RuntimeClient`](super::RuntimeClient) seam is real: the
 //! same harness drives either OpenClaude (session-ful, live `canUseTool` approval) or a
-//! plain `claude -p` one-shot. The corp variant (PRD §3.4) lands here too.
+//! plain `claude -p` one-shot. The corp variant lands here too.
 //!
 //! **Two honest limitations of one-shot mode**, both consistent with the architecture:
 //! 1. **No live approval round-trip.** `claude -p` decides permissions from flags
@@ -18,7 +18,7 @@
 //! It is also strictly firebreak-*safe*: every call is a fresh context (no session), so
 //! no untrusted payload can persist across the Perceive→Express boundary.
 //!
-//! SCAFFOLD: spawns `claude -p` with the per-state allow/deny list in Phase 4+.
+//! SCAFFOLD: spawns `claude -p` with the per-state allow/deny list in.
 
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -48,7 +48,7 @@ impl RuntimeClient for ClaudeCliClient {
         _responder: Arc<dyn ActionResponder>,
     ) -> Result<(AgentOutput, Option<super::SessionId>, Option<super::InvokeUsage>)> {
         todo!(
-            "Phase 4+: spawn `claude -p <assembled-prompt>` with --append-system-prompt for \
+            "spawn `claude -p <assembled-prompt>` with --append-system-prompt for \
              the SOUL/state prompt and --disallowedTools derived from the state scope; parse \
              the one-shot result into AgentOutput. The `responder` is consulted to BUILD the \
              static allow/deny list (no live round-trip); SettleTx is never permitted here."

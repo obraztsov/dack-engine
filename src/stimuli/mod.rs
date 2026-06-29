@@ -1,11 +1,11 @@
-//! The stimulus registry (PRD §5.1–§5.4). **The `stimuli/` directory IS the agent's
+//! The stimulus registry. **The `stimuli/` directory IS the agent's
 //! job description**: each `.md` is a *standing duty* the agent performs when triggered,
 //! carrying its own briefing text. A set of duty-stimuli is a decomposed job
 //! description — the unit that generalizes to future firm actors.
 //!
 //! Registration convention: walk `stimuli/` to **max depth 2**; every `.md` (depth ≤ 2)
 //! is a stimulus definition. Sensors live in a sibling `scripts/`. The `.md`'s
-//! **frontmatter is config**; its **body is the directive text** (trusted, PRD §5.3).
+//! **frontmatter is config**; its **body is the directive text** (trusted).
 //! `stimuli/` is writable only in Reflect — so this is gated self-evolution of the
 //! duck's own senses and duties.
 
@@ -22,8 +22,8 @@ fn default_entry_id() -> String {
 use crate::error::{DackError, Result};
 use crate::model::stimulus::{Priority, StimulusType, TrustTier};
 
-/// Trigger that fires a duty (PRD §5.1). `cron` (re)schedules a timer; `webhook`
-/// registers a listener on the fly. The Twitter push-path swap (PRD §10.2) is just
+/// Trigger that fires a duty. `cron` (re)schedules a timer; `webhook`
+/// registers a listener on the fly. The Twitter push-path swap is just
 /// flipping `cron` → `webhook` here — no architectural change.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -32,14 +32,14 @@ pub enum Trigger {
     Webhook { path: String },
 }
 
-/// What rows this duty emits (PRD §5.4 `emits:`).
+/// What rows this duty emits (`emits:`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Emits {
     #[serde(rename = "type")]
     pub type_: StimulusType,
 }
 
-/// Cross-poll dedup cursor (PRD §10.2) — a monotonic **watermark** the harness persists in the
+/// Cross-poll dedup cursor — a monotonic **watermark** the harness persists in the
 /// queue DB so a polling sensor never re-discovers what it already saw (e.g. X `since_id`). The
 /// harness fetches the stored value, injects it into the sensor's env before the run, and after
 /// the run advances it to the max `field` over the discovered candidates. Single-flight → no race.
@@ -63,13 +63,13 @@ impl CursorSpec {
     }
 }
 
-/// The YAML frontmatter of a `STIMULUS.md` (PRD §5.4).
+/// The YAML frontmatter of a `STIMULUS.md`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StimulusFrontmatter {
     pub id: String,
     pub trigger: Trigger,
     /// Path to the sensor executable (resolved into the sibling `scripts/`). Omit for a
-    /// pure-cron self-prompt. **Honored only for trusted directive tiers** (PRD §5.2).
+    /// pure-cron self-prompt. **Honored only for trusted directive tiers**.
     #[serde(default)]
     pub sensor: Option<String>,
     /// Trust tier of THIS `.md` body (trusted intent): `self` | `operator_signed`.
@@ -77,30 +77,30 @@ pub struct StimulusFrontmatter {
     pub emits: Emits,
     #[serde(default)]
     pub coalesce: Option<CoalescePolicy>,
-    /// The **entry state-prompt id** this duty opens at (MCP2-B) — a path under `prompts/` without
+    /// The **entry state-prompt id** this duty opens at a path under `prompts/` without
     /// the extension, e.g. `twitter/perceive_mention` or the flat `perceive`. The soul owns the
     /// chain from here (the prompt's `transitions`); the operator route only sets the ceiling.
     #[serde(default = "default_entry_id")]
     pub entry: String,
     #[serde(default)]
     pub priority: Option<Priority>,
-    /// **Dispatch window** (Phase 3): a daily UTC range `"HH:MM-HH:MM"` (may cross midnight, e.g.
+    /// **Dispatch window**: a daily UTC range `"HH:MM-HH:MM"` (may cross midnight, e.g.
     /// `"22:00-05:00"`). A stimulus arriving OUTSIDE it is held — via `pop_after` — until the window
     /// next opens: "handle the noisy public groups only at deep night." `None` ⇒ always eligible.
     #[serde(default)]
     pub dispatch_window: Option<String>,
     /// Secrets-provider scopes this duty's sensor needs (by provider `name`). The harness
     /// runs those trusted provider scripts and injects only their short-lived token env — the
-    /// sensor never holds the root credential (PRD §7.2; `docs/SECRETS-AND-SANDBOX.md`).
+    /// sensor never holds the root credential (`docs/SECRETS-AND-SANDBOX.md`).
     #[serde(default)]
     pub secrets: Vec<String>,
-    /// Optional cross-poll dedup watermark (PRD §10.2) — see [`CursorSpec`]. Present on polling
+    /// Optional cross-poll dedup watermark — see [`CursorSpec`]. Present on polling
     /// sensors (mentions) so the duck never re-processes (or re-replies to) an already-seen item.
     #[serde(default)]
     pub cursor: Option<CursorSpec>,
 }
 
-/// A daily **dispatch window** in UTC (Phase 3), parsed from `"HH:MM-HH:MM"`. A stimulus arriving
+/// A daily **dispatch window** in UTC, parsed from `"HH:MM-HH:MM"`. A stimulus arriving
 /// outside the window is deferred — via the queue's `pop_after` gate — to the next time it opens.
 /// Crosses midnight when `start > end` (e.g. `"22:00-05:00"`). UTC keeps it deterministic; the
 /// operator picks the range in UTC.
@@ -153,7 +153,7 @@ impl DispatchWindow {
 #[derive(Debug, Clone)]
 pub struct StimulusDef {
     pub frontmatter: StimulusFrontmatter,
-    /// The `.md` body — the trusted briefing appended to Perceive context (PRD §5.5.6).
+    /// The `.md` body — the trusted briefing appended to Perceive context.
     pub directive_body: String,
     /// Repo-relative path the def was loaded from (used for the trusted-dir check).
     pub source_path: String,
@@ -195,13 +195,13 @@ impl StimulusDef {
 
     /// Whether this def's `sensor` reference is honored (trusted directive tier).
     /// The trusted-*dir* half is enforced at registration (only trusted repo dirs are
-    /// walked); this is the tier half (PRD §5.2/§5.3).
+    /// walked); this is the tier half.
     pub fn sensor_honored(&self) -> bool {
         crate::sensor::scripts_honored(&self.frontmatter.directive_tier)
     }
 
     /// Absolute path to this duty's sensor executable, if it declares one **and** its
-    /// directive tier honors scripts (PRD §5.2). Resolved relative to the duty's own
+    /// directive tier honors scripts. Resolved relative to the duty's own
     /// directory (the dir holding the `.md`), so `sensor: ./scripts/x.sh` lands in the
     /// sibling `scripts/`. `None` for pure-cron self-prompts or untrusted tiers.
     pub fn resolved_sensor(&self, repo_root: impl AsRef<Path>) -> Option<PathBuf> {
@@ -214,14 +214,14 @@ impl StimulusDef {
     }
 }
 
-/// Maximum file-depth the registry walks under `stimuli/` (PRD §5.1): a file directly in
+/// Maximum file-depth the registry walks under `stimuli/`: a file directly in
 /// `stimuli/` is depth 1, so `MAX_DEPTH = 2` admits the `stimuli/<duty>/STIMULUS.md`
 /// convention and excludes anything more deeply nested.
 pub const MAX_DEPTH: usize = 2;
 
-/// The registered set of duties — **the agent's job description** (PRD §5.1) — plus any
+/// The registered set of duties — **the agent's job description** — plus any
 /// per-file parse errors. A malformed duty is **skipped, not fatal**: one bad `.md` must
-/// not blind the duck to all its other senses (logging-not-rollback, PRD §7.5). The
+/// not blind the duck to all its other senses (logging-not-rollback). The
 /// registry is rebuilt on each `stimuli/` change (hot-reload).
 #[derive(Debug, Default)]
 pub struct Registry {
@@ -232,7 +232,7 @@ pub struct Registry {
 
 impl Registry {
     /// Walk `<repo_root>/stimuli/` to file-depth ≤ [`MAX_DEPTH`], parsing every `.md`.
-    /// Only `stimuli/` is walked — the **trusted-dir** half of the sensor gate (PRD §5.2):
+    /// Only `stimuli/` is walked — the **trusted-dir** half of the sensor gate:
     /// nothing outside the duck's own repo can register a duty or a script.
     pub fn load(repo_root: impl AsRef<Path>) -> Result<Registry> {
         let repo_root = repo_root.as_ref();
@@ -333,7 +333,7 @@ mod tests {
         assert!(DispatchWindow::parse("02:00-02:00").is_none());
     }
 
-    // The §5.4 worked example, verbatim shape.
+    // The  worked example, verbatim shape.
     const CLARITY: &str = r#"---
 id: clarity-reply-guy
 trigger: { type: cron, schedule: "0 * * * *" }
@@ -370,7 +370,7 @@ selective; skip low-quality bait.
         assert!(StimulusDef::parse("no frontmatter here", "x.md").is_err());
     }
 
-    // ── Registry / walker (Phase 3) ───────────────────────────────────────────
+    // ── Registry / walker ───────────────────────────────────────────
 
     fn cron_duty(id: &str, sensor: Option<&str>) -> String {
         let sensor_line = sensor.map(|s| format!("sensor: {s}\n")).unwrap_or_default();

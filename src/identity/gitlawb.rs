@@ -1,16 +1,16 @@
-//! Gitlawb identity adapter (PRD §3.1, §3.4) — v1 implementation of [`IdentityProvider`],
-//! grounded against `gl` 0.3.8 (`docs/VERIFICATION.md`).
+//! Gitlawb identity adapter — v1 implementation of [`IdentityProvider`],
+//! grounded against `gl` 0.3.8.
 //!
 //! Each role is a separate `gl` identity **dir** (`gl identity new --dir <dir>` writes an
 //! `identity.pem`; the DID is `did:key:z6Mk…`). The **Soul dir is harness-only** — its key
 //! never enters agent env; the harness invokes `gl identity sign --dir <soul>` to attest
-//! commits on the duck's behalf (PRD §3.3). The Builder dir is env-forwardable.
+//! commits on the duck's behalf. The Builder dir is env-forwardable.
 //!
 //! - `sign`  → `gl identity sign --dir <dir> <message>` → base64url Ed25519 signature.
 //! - `did`   → resolved at construction via `gl identity show --dir <dir>`.
-//! - `verify`→ deferred to Phase 8 (`dack say` operator_signed): decode `did:key` → Ed25519
+//! - `verify`→ `dack say` operator_signed: decode `did:key` → Ed25519
 //!   pubkey and verify in-process. `gl` 0.3.8 exposes no general message-verify command, so
-//!   verification is ours to do (provenance is a local crypto check — PRD §5.7).
+//!   verification is ours to do (provenance is a local crypto check —).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -96,7 +96,7 @@ impl IdentityProvider for GitlawbIdentity {
     }
 
     async fn verify(&self, did: &Did, payload: &[u8], sig: &Signature) -> Result<bool> {
-        // Phase 8 (operator_signed / `dack say`): a LOCAL crypto check, never a rhetorical one.
+        // (operator_signed / `dack say`): a LOCAL crypto check, never a rhetorical one.
         // Pure (no `self` state) → factored out so the unit test can exercise it without `gl`.
         verify_ed25519_did(did, payload, sig)
     }

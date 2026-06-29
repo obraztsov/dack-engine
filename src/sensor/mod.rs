@@ -1,4 +1,4 @@
-//! The sensor contract (PRD §5.2) — **the gut-feeling fix: sensors perceive, never act.**
+//! The sensor contract — **the gut-feeling fix: sensors perceive, never act.**
 //!
 //! A sensor is an executable whose *sole job is to perceive*: read the outside world
 //! and emit candidate stimulus rows. The contract:
@@ -17,7 +17,7 @@
 //! **trust tier**, not agent tool-permission. Honored ONLY for `operator_signed`/`self`
 //! provenance and ONLY from trusted repo dirs; for `public`-tier stimuli, frontmatter
 //! is data-only and any script reference is ignored — **a tweet cannot ship a script**
-//! (PRD §5.2, §5.3).
+//! 
 
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -29,8 +29,8 @@ use serde::Deserialize;
 use crate::error::Result;
 use crate::model::stimulus::{StimulusType, TrustTier};
 
-/// One candidate row a sensor emits on stdout (PRD §5.2). `payload_tier` is optional and may only
-/// LOWER trust: the bus clamps it down to the source-derived seed (TIER-3); absent → the seed.
+/// One candidate row a sensor emits on stdout. `payload_tier` is optional and may only
+/// LOWER trust: the bus clamps it down to the source-derived seed; absent → the seed.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SensorCandidate {
     #[serde(rename = "type")]
@@ -42,8 +42,8 @@ pub struct SensorCandidate {
     pub payload_tier: Option<TrustTier>,
 }
 
-/// Whether a stimulus's script reference is honored, by the directive's trust tier
-/// (PRD §5.2/§5.3). The trusted-dir check is the caller's (the registry only registers
+/// Whether a stimulus's script reference is honored, by the directive's trust tier.
+/// The trusted-dir check is the caller's (the registry only registers
 /// defs from trusted repo dirs); this is the tier half.
 pub fn scripts_honored(directive_tier: &TrustTier) -> bool {
     *directive_tier == TrustTier::operator() || *directive_tier == TrustTier::self_()
@@ -53,7 +53,7 @@ pub fn scripts_honored(directive_tier: &TrustTier) -> bool {
 pub trait SensorRunner: Send + Sync {
     /// Run `exe` with `stdin` piped in and `env` injected (read-scoped only), bounded by
     /// `timeout`. Parse stdout as newline-delimited JSON candidates. Non-zero exit →
-    /// `Err` (logged failure, no rows — PRD §5.2).
+    /// `Err` (logged failure, no rows —).
     async fn run(
         &self,
         exe: &Path,

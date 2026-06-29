@@ -648,7 +648,9 @@ impl Harness {
         // Honor the structured memory line (gated to a write-capable state); free-form tool writes
         // to memory/ are caught by the sweep. Then reconcile + author the runlog.
         self.honor_memory_append(prompt.state, &out).await;
-        let reverted = self.reconcile_soul(prompt.state, &stimulus.id.0).await;
+        // The tripwire reverts out-of-allowlist soul writes and alarms via the harness logs; its return
+        // is consumed there, so the runlog write below doesn't need it.
+        self.reconcile_soul(prompt.state, &stimulus.id.0).await;
         // Runlog tags: the conversation key (when the prompt opts in via `tag_key`) + any tags the acting
         // baton carries — so a tagged view can recall this conversation later.
         let mut tags: Vec<String> = Vec::new();
@@ -665,7 +667,7 @@ impl Harness {
             }
         }
         let runlog_ref = self
-            .write_runlog(prompt.state, stimulus, &out, tool_calls, &reverted, step_seq, tags)
+            .write_runlog(prompt.state, stimulus, &out, tool_calls, step_seq, tags)
             .await?;
         Ok((out, runlog_ref, accessed))
     }
@@ -874,8 +876,9 @@ impl Harness {
     ///   2. **revert** anything outside the running state's `writable_dirs` (the SAME allowlist
     ///      the wall enforces) — out-of-allowlist writes, or *any* write in read-only Perceive;
     ///   3. **commit** the remaining (allowlisted) delta as the **Soul DID**, then **push**.
-    /// Returns the reverted paths so [`write_runlog`](Self::write_runlog) can raise the alarm as a
-    /// tagged-error entry. Best-effort: a git hiccup is logged, never fatal to the cycle.
+    /// A revert raises the alarm in the HARNESS logs (`tracing::warn!`) — not the runlog, which is the
+    /// agent's own memory. Returns the reverted paths (used by tests). Best-effort: a git hiccup is
+    /// logged, never fatal to the cycle.
     async fn reconcile_soul(&self, state: ConsciousnessState, run_id: &str) -> Vec<String> {
         let spec = default_spec(state);
         let changes = match self.repo.status().await {
@@ -903,6 +906,17 @@ impl Harness {
                 }
                 reverted.push(ch.path.0.clone());
             }
+        }
+
+        if !reverted.is_empty() {
+            // Operator-facing alarm → the HARNESS logs (not the runlog: the runlog is the agent's own
+            // memory now, read via recall, not by an operator). Note a revert can be the agent writing
+            // outside its allowlist (a security signal) OR an operator's uncommitted hand-edit caught
+            // mid-cycle (`dack reconcile` to persist hand-edits — see cli) — the paths tell which.
+            tracing::warn!(
+                state = ?state, run = run_id, paths = %reverted.join(", "),
+                "soul-integrity tripwire reverted out-of-allowlist write(s)"
+            );
         }
 
         if !allowed.is_empty() {
@@ -1269,18 +1283,13 @@ impl Harness {
         stimulus: &Stimulus,
         out: &AgentOutput,
         tool_calls: Vec<ToolCallRecord>,
-        reverted: &[String],
         step_seq: usize,
         tags: Vec<String>,
     ) -> Result<String> {
-        let outcome = if reverted.is_empty() {
-            Outcome::Ok
-        } else {
-            Outcome::Error(format!(
-                "soul-integrity tripwire reverted out-of-allowlist write(s): {}",
-                reverted.join(", ")
-            ))
-        };
+        // A tripwire revert is reported in the HARNESS logs (`reconcile_soul`), not here — the runlog is
+        // the agent's own narrative, so a cycle is `Ok` unless it genuinely errored (the dispatch-error
+        // path writes its own `Outcome::Error` entry).
+        let outcome = Outcome::Ok;
         let entry = RunLogEntry {
             // Unique per step: the entry (step 1) keeps the clean id; each later fan-out baton gets a
             // `-b{n}` suffix so N in-wake batons don't collide on one run-id in the runlog (they did).

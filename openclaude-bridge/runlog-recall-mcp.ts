@@ -1,10 +1,11 @@
 /**
  * Runlog RECALL capability — a standalone **stdio MCP server** the bridge spawns, sibling of
- * `twitter-read-mcp.ts`. It lets the duck PULL its own recent conversation history on demand, so a
- * FRESH or size-EVICTED sticky session can rebuild context instead of being blind ("remember the last
- * N messages in this chat"). It reads the duck's OWN runlog (the harness-authored record) from the
- * private runlog repo at `runlogs/*.md` (cwd-relative — stdio MCPs are spawned with cwd = the soul
- * repo), filtered by the conversation TAG. The pure parse/render logic lives in `runlog-recall.ts`.
+ * `twitter-read-mcp.ts`. It is the duck's full interface to its OWN runlog memory, so it NEVER has to
+ * touch the file tools (the `runlogs/` dir is gitignored → `Glob` misses files, and a dense day blows
+ * the read size-limit). Tools: `recall_conversation` (this chat) · `recall_by_tag(tag, date?)` (any
+ * chat/topic, optionally a specific day) · `list_recent_tags` (recent conversations) · `list_dates`
+ * (the calendar) · `list_tags_by_day` (conversations on a day) · `search_runlog` (find where a topic
+ * was discussed). Reads the harness-authored runlog markdown; pure logic lives in `runlog-recall.ts`.
  *
  * Registered `tier: read`, `trust: public` (it re-surfaces past UNTRUSTED incoming text, so the wall
  * floors the calling cycle at Express — recall can never enable a trade/self-edit). The current
@@ -20,11 +21,16 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
 import {
   clamp,
+  listDateFiles,
   listRecentTags,
+  loadEntries,
   pageByTag,
+  parseDay,
   parseEntries,
   readRecentRunlogs,
+  recentDates,
   renderTranscript,
+  searchEntries,
 } from './runlog-recall'
 
 // The MCP's cwd is the daemon's launch dir (where `openclaude-bridge/` lives), NOT the soul repo — so a
@@ -34,6 +40,10 @@ const RUNLOG_DIR =
   process.env.RECALL_DIR ??
   (process.env.DACK_BRIDGE_CWD ? `${process.env.DACK_BRIDGE_CWD}/runlogs` : 'runlogs')
 const asText = (v: unknown) => ({ content: [{ type: 'text' as const, text: JSON.stringify(v) }] })
+
+// Read windows (in day-files): recall reaches back enough to survive a multi-day pause; discovery
+// (tags/search) scans wider. All are cheap markdown reads — no network, no secrets.
+const RECALL_DAYS = 7
 
 const server = new McpServer({ name: 'recall', version: '0.1.0' })
 
@@ -50,7 +60,7 @@ server.registerTool(
   async ({ limit, offset }: { limit?: number; offset?: number }) => {
     const tag = process.env.RECALL_TAG
     if (!tag) return asText({ ok: false, error: 'no RECALL_TAG in scope — this cycle has no conversation tag' })
-    const entries = pageByTag(parseEntries(readRecentRunlogs(RUNLOG_DIR)), tag, clamp(limit, 30, 200), Math.max(0, offset ?? 0))
+    const entries = pageByTag(parseEntries(readRecentRunlogs(RUNLOG_DIR, RECALL_DAYS)), tag, clamp(limit, 30, 200), Math.max(0, offset ?? 0))
     return asText({ ok: true, tag, count: entries.length, transcript: renderTranscript(entries) })
   },
 )
@@ -59,14 +69,21 @@ server.registerTool(
   'recall_by_tag',
   {
     description:
-      "Recall the recent transcript of ANOTHER of your chats/topics by its tag (find tags with " +
-      '`list_recent_tags`). Same pagination as `recall_conversation`. This is your private memory across ' +
-      "chats — be discreet: don't repeat one chat's content to whoever you're talking to now.",
-    inputSchema: { tag: z.string().min(1), limit: z.number().int().optional(), offset: z.number().int().optional() },
+      "Recall the transcript of ANOTHER of your chats/topics by its tag (find tags with `list_recent_tags` " +
+      'or `list_tags_by_day`). Pass `date` (YYYY-MM-DD) to read that specific day; omit it for the recent ' +
+      'window. Same `limit`/`offset` pagination. This is your private memory across chats — be discreet: ' +
+      "don't repeat one chat's content to whoever you're talking to now.",
+    inputSchema: {
+      tag: z.string().min(1),
+      date: z.string().optional(),
+      limit: z.number().int().optional(),
+      offset: z.number().int().optional(),
+    },
   },
-  async ({ tag, limit, offset }: { tag: string; limit?: number; offset?: number }) => {
-    const entries = pageByTag(parseEntries(readRecentRunlogs(RUNLOG_DIR)), tag, clamp(limit, 30, 200), Math.max(0, offset ?? 0))
-    return asText({ ok: true, tag, count: entries.length, transcript: renderTranscript(entries) })
+  async ({ tag, date, limit, offset }: { tag: string; date?: string; limit?: number; offset?: number }) => {
+    const all = date ? parseDay(RUNLOG_DIR, date) : parseEntries(readRecentRunlogs(RUNLOG_DIR, RECALL_DAYS))
+    const entries = pageByTag(all, tag, clamp(limit, 30, 200), Math.max(0, offset ?? 0))
+    return asText({ ok: true, tag, date: date ?? null, count: entries.length, transcript: renderTranscript(entries) })
   },
 )
 
@@ -74,13 +91,54 @@ server.registerTool(
   'list_recent_tags',
   {
     description:
-      'List the conversation tags seen in your recent runlog, newest first, with a hint of who/what is ' +
-      'under each — so you can find the tag to pass to `recall_by_tag`.',
-    inputSchema: { limit: z.number().int().optional() },
+      'List the conversation tags seen across your recent runlog (default last 7 days), newest first, with ' +
+      'a hint of who/what is under each — so you can find the tag to pass to `recall_by_tag`.',
+    inputSchema: { days: z.number().int().optional(), limit: z.number().int().optional() },
   },
-  async ({ limit }: { limit?: number }) => {
-    const tags = listRecentTags(parseEntries(readRecentRunlogs(RUNLOG_DIR)), clamp(limit, 20, 100))
-    return asText({ ok: true, tags })
+  async ({ days, limit }: { days?: number; limit?: number }) => {
+    const entries = loadEntries(RUNLOG_DIR, recentDates(RUNLOG_DIR, clamp(days, 7, 60)))
+    return asText({ ok: true, tags: listRecentTags(entries, clamp(limit, 20, 100)) })
+  },
+)
+
+server.registerTool(
+  'list_dates',
+  {
+    description:
+      'The CALENDAR of your runlog: which days exist, newest first, each with its entry count + size. Use ' +
+      'it to see how far back your memory goes before drilling in with `list_tags_by_day` / `recall_by_tag`. ' +
+      "Always prefer this over file tools — the `runlogs/` files are private and not directly browsable.",
+    inputSchema: {},
+  },
+  async () => asText({ ok: true, dates: listDateFiles(RUNLOG_DIR) }),
+)
+
+server.registerTool(
+  'list_tags_by_day',
+  {
+    description:
+      'List the conversations/tags active on ONE day (YYYY-MM-DD), with a who-was-here hint — to navigate a ' +
+      'specific day, then read one with `recall_by_tag(tag, date)`.',
+    inputSchema: { date: z.string().min(1), limit: z.number().int().optional() },
+  },
+  async ({ date, limit }: { date: string; limit?: number }) => {
+    const tags = listRecentTags(parseDay(RUNLOG_DIR, date), clamp(limit, 40, 200))
+    return asText({ ok: true, date, tags })
+  },
+)
+
+server.registerTool(
+  'search_runlog',
+  {
+    description:
+      'Search your runlog for a keyword across your thoughts, the messages you received, and your replies ' +
+      '(default last 14 days). Returns where each hit lives — date + tag + a snippet — so you can pull the ' +
+      'full thread with `recall_by_tag(tag, date)`. This is how you find "when did we talk about X".',
+    inputSchema: { query: z.string().min(1), days: z.number().int().optional(), limit: z.number().int().optional() },
+  },
+  async ({ query, days, limit }: { query: string; days?: number; limit?: number }) => {
+    const entries = loadEntries(RUNLOG_DIR, recentDates(RUNLOG_DIR, clamp(days, 14, 60)))
+    return asText({ ok: true, query, hits: searchEntries(entries, query, clamp(limit, 20, 100)) })
   },
 )
 

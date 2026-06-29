@@ -52,10 +52,19 @@ pub fn classify_tool(
     }
 
     match tool {
-        // Pure reads (OpenClaude tool names + common aliases).
-        "Read" | "FileRead" | "Grep" | "Glob" | "LS" | "LSP" | "WebFetch" | "WebSearch"
-        | "ReadMcpResource" | "ListMcpResources" | "ToolSearch" | "TaskGet" | "TaskList"
-        | "TaskOutput" | "NotebookRead" => (ToolClass::Read, None),
+        // Builtin FILE reads — blocked from the private `runlogs/` dir (the recall MCPs are the only
+        // path to runlog history; the gitignore makes raw Glob/Read unreliable, so this denies it
+        // outright → `Other`). A non-runlog path is a normal read.
+        "Read" | "FileRead" | "Grep" | "Glob" | "LS" | "NotebookRead" => {
+            if targets_runlogs(input) {
+                return (ToolClass::Other, None);
+            }
+            (ToolClass::Read, None)
+        }
+
+        // Non-file reads (no path to gate).
+        "LSP" | "WebFetch" | "WebSearch" | "ReadMcpResource" | "ListMcpResources" | "ToolSearch"
+        | "TaskGet" | "TaskList" | "TaskOutput" => (ToolClass::Read, None),
 
         // File writes — the path decides memory vs soul (gated by writable_dirs).
         "Write" | "FileWrite" | "Edit" | "FileEdit" | "MultiEdit" | "NotebookEdit" => {
@@ -77,6 +86,18 @@ fn extract_path(input: &Value) -> Option<String> {
         .or_else(|| input.get("path"))
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+/// Does a file-read's input target the private `runlogs/` dir? Checks every path-ish field
+/// (`file_path`, `path`, `pattern` — the last for `Glob`) for a `runlogs` path SEGMENT, so
+/// `runlogs/2026-…md`, `…/runlogs`, and `runlogs/**/*` all match while `runlogs_archive` does not.
+fn targets_runlogs(input: &Value) -> bool {
+    ["file_path", "path", "pattern"].iter().any(|k| {
+        input
+            .get(*k)
+            .and_then(Value::as_str)
+            .is_some_and(|p| p.split(|c| c == '/' || c == '\\').any(|seg| seg == "runlogs"))
+    })
 }
 
 #[cfg(test)]
@@ -164,6 +185,39 @@ mod tests {
         assert_eq!(
             classify_tool("mcp__cove-read__buy_token", &json!({}), &settle, &post, &read).0,
             ToolClass::Other // fail-closed: not on the allowlist → denied, never Read.
+        );
+    }
+
+    #[test]
+    fn runlog_file_reads_are_blocked_but_recall_mcp_and_normal_reads_pass() {
+        let (s, p, r) = (settle(), post(), read());
+        // Direct file access to a runlog → Other (denied everywhere). Glob by pattern + Read by path.
+        assert_eq!(
+            classify_tool("Glob", &json!({"path": "soul-template", "pattern": "runlogs/**/*"}), &s, &p, &r).0,
+            ToolClass::Other,
+        );
+        assert_eq!(
+            classify_tool("Read", &json!({"file_path": "/x/soul-template/runlogs/2026-06-29.md"}), &s, &p, &r).0,
+            ToolClass::Other,
+        );
+        assert_eq!(
+            classify_tool("Grep", &json!({"path": "runlogs"}), &s, &p, &r).0,
+            ToolClass::Other,
+        );
+        // A normal read is unaffected; the `runlogs` SEGMENT must be exact (no false-match on a substring).
+        assert_eq!(
+            classify_tool("Read", &json!({"file_path": "memory/social.md"}), &s, &p, &r).0,
+            ToolClass::Read,
+        );
+        assert_eq!(
+            classify_tool("Glob", &json!({"pattern": "runlogs_archive/*"}), &s, &p, &r).0,
+            ToolClass::Read,
+        );
+        // The recall MCPs read runlogs via node fs, NOT the Read tool — they classify by prefix, untouched.
+        let recall = open(&["mcp__recall-self__", "mcp__recall__"]);
+        assert_eq!(
+            classify_tool("mcp__recall-self__recent_activity", &json!({}), &s, &p, &recall).0,
+            ToolClass::Read,
         );
     }
 

@@ -3,7 +3,10 @@
     "allow": [
       "Bash(cargo build *)",
       "Bash(cargo test *)",
-      "Bash(cargo clippy *)"
+      "Bash(cargo clippy *)",
+      "Bash(./target/release/dack --config dack.config.yaml say \"ack — recall navigation online\")",
+      "Read(//private/tmp/**)",
+      "Bash(break)"
     ]
   }
 }

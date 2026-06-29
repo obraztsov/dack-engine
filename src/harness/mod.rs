@@ -1143,13 +1143,18 @@ impl Harness {
                     body: stimulus.payload.to_string(),
                     trusted: false, // delimited as untrusted regardless of content.
                 });
-                // Memory: FRESH grounding only — never re-injected on a resume (the session holds it).
+                // Self-orientation: the skills catalogue + the memory-index head, so the model is TOLD
+                // what knowledge-tools and memory it has instead of discovering them by listing dirs.
+                // FRESH grounding only — never re-injected on a resume (the session already holds it).
                 if ctx.memory && !is_resume {
-                    out.push(ContextBlock {
-                        label: "memory-recent".into(),
-                        body: self.memory_tail(40).await,
-                        trusted: true, // the duck's own self-authored notes (not world data).
-                    });
+                    let body = self.self_orientation().await;
+                    if !body.trim().is_empty() {
+                        out.push(ContextBlock {
+                            label: "self-orientation".into(),
+                            body,
+                            trusted: true, // harvested from the duck's own soul files (not world data).
+                        });
+                    }
                 }
                 out.extend(self.runlog_blocks(tag, is_resume, watermark, &ctx.runlog).await);
             }
@@ -1234,16 +1239,61 @@ impl Harness {
             .unwrap_or_else(|_| std::env::current_dir().map(|c| c.join(&p)).unwrap_or(p))
     }
 
-    /// Last `max_lines` of `memory/log.md` (the duck's narrative memory), or empty if absent.
-    async fn memory_tail(&self, max_lines: usize) -> String {
-        let bytes = self
-            .repo
-            .read_file(&RepoPath("memory/log.md".into()))
-            .await
-            .unwrap_or_default();
+    /// The fresh-wake **self-orientation** catalogue: WHAT the duck has at hand that it would
+    /// otherwise have to discover by blindly listing dirs — its **skills** (each
+    /// `skills/<name>/SKILL.md` self-describes via frontmatter) and the **head of its memory index**
+    /// (`memory/INDEX.md`). The MCP *tools* are surfaced natively by the runtime (the SDK lists each
+    /// `mcp__server__tool`); this block names the knowledge-tools the runtime can't. Empty string if
+    /// the soul carries neither. Fresh wakes only — a resume's session already holds it.
+    async fn self_orientation(&self) -> String {
+        let mut sections: Vec<String> = Vec::new();
+        let skills = self.skills_catalogue().await;
+        if !skills.is_empty() {
+            sections.push(format!(
+                "skills available — your how-to guides; Read `skills/<name>/SKILL.md` before using one:\n{skills}"
+            ));
+        }
+        let idx = self.memory_index_head(30).await;
+        if !idx.trim().is_empty() {
+            sections.push(format!(
+                "memory index (`memory/INDEX.md` — your catalogue; start here, Read entries on demand):\n{}",
+                idx.trim_end()
+            ));
+        }
+        sections.join("\n\n")
+    }
+
+    /// One `- name — description` line per `skills/*/SKILL.md`, harvested from its frontmatter and
+    /// sorted for a stable order. Empty if the soul has no skills.
+    async fn skills_catalogue(&self) -> String {
+        let entries = self.repo.list_dir(&RepoPath("skills".into()), 2).await.unwrap_or_default();
+        let mut lines = Vec::new();
+        for p in entries {
+            // Match exactly `skills/<name>/SKILL.md` — top-level skill dirs only.
+            let Some(name) = p.0.strip_prefix("skills/").and_then(|r| r.strip_suffix("/SKILL.md"))
+            else {
+                continue;
+            };
+            if name.is_empty() || name.contains('/') {
+                continue;
+            }
+            if let Ok(bytes) = self.repo.read_file(&p).await {
+                if let Some(line) = skill_catalogue_entry(name, &String::from_utf8_lossy(&bytes)) {
+                    lines.push(line);
+                }
+            }
+        }
+        lines.sort();
+        lines.join("\n")
+    }
+
+    /// First `max_lines` of `memory/INDEX.md` (the duck's long-term-memory catalogue), or empty if
+    /// absent. The agent Reads individual entries on demand; this just orients it to the index.
+    async fn memory_index_head(&self, max_lines: usize) -> String {
+        let bytes =
+            self.repo.read_file(&RepoPath("memory/INDEX.md".into())).await.unwrap_or_default();
         let text = String::from_utf8_lossy(&bytes);
-        let lines: Vec<&str> = text.lines().collect();
-        lines[lines.len().saturating_sub(max_lines)..].join("\n")
+        text.lines().take(max_lines).collect::<Vec<_>>().join("\n")
     }
 
     /// The trust floor for long-term writes (`memory/`) and tag-notes — `config.memory_write_min_trust`
@@ -1681,6 +1731,43 @@ fn sticky_session_key(
         })
         .collect();
     format!("{}|{}|{}", prompt_id, taint.name(), resolved.join(","))
+}
+
+/// Collapse every run of whitespace (incl. the folded-scalar newlines a `description: >` block
+/// produces) into single spaces, trimmed — so a multi-line SKILL description renders as one line.
+fn collapse_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Truncate to at most `max` chars on a char boundary, appending `…` when it had to cut.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let cut: String = s.chars().take(max).collect();
+        format!("{}…", cut.trim_end())
+    }
+}
+
+/// Parse a `SKILL.md`'s frontmatter into a one-line catalogue entry `- name — description`.
+/// `None` when the frontmatter is missing/malformed or carries no usable description (so a
+/// half-written skill is skipped rather than shown blank). `dir_name` is the fallback name.
+fn skill_catalogue_entry(dir_name: &str, skill_md: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct SkillFm {
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        description: String,
+    }
+    let (yaml, _body) = crate::stimuli::split_frontmatter(skill_md).ok()?;
+    let fm: SkillFm = serde_yaml::from_str(yaml).ok()?;
+    let name = if fm.name.trim().is_empty() { dir_name } else { fm.name.trim() };
+    let desc = collapse_ws(&fm.description);
+    if desc.is_empty() {
+        return None;
+    }
+    Some(format!("- {name} — {}", truncate_chars(&desc, 240)))
 }
 
 fn orientation_block(
@@ -3670,6 +3757,39 @@ mod tests {
         assert_eq!(sticky_session_key("p", &TrustTier::self_(), &[], &s), "p|self|");
     }
 
+    #[test]
+    fn skill_catalogue_entry_renders_name_and_collapsed_description() {
+        // A folded `description: >` scalar (its newlines become spaces) → one catalogue line.
+        let md = "---\nname: twitter\ndescription: >\n  Read X for context\n  in Perceive, and post\n  in Express.\n---\n# body\nstuff";
+        assert_eq!(
+            skill_catalogue_entry("twitter", md).unwrap(),
+            "- twitter — Read X for context in Perceive, and post in Express."
+        );
+    }
+
+    #[test]
+    fn skill_catalogue_entry_falls_back_and_skips_unusable() {
+        // No `name:` → fall back to the directory name.
+        assert_eq!(
+            skill_catalogue_entry("cove", "---\ndescription: just this\n---\nbody").unwrap(),
+            "- cove — just this"
+        );
+        // No description → skipped (don't show a half-written skill blank).
+        assert!(skill_catalogue_entry("x", "---\nname: x\n---\nbody").is_none());
+        // No frontmatter fence → skipped, not a panic.
+        assert!(skill_catalogue_entry("x", "no frontmatter here").is_none());
+    }
+
+    #[test]
+    fn truncate_chars_is_char_safe_and_marks_cuts() {
+        assert_eq!(truncate_chars("short", 240), "short");
+        assert_eq!(truncate_chars("aaaa", 2), "aa…");
+        // Multibyte: cutting must stay on a char boundary (no panic, no split é).
+        let s = "héllo wörld";
+        let out = truncate_chars(s, 4);
+        assert!(out.ends_with('…') && out.chars().count() == 5);
+    }
+
     /// Sticky resume-by-id end-to-end at the harness: two items in the SAME thread reuse one engine
     /// session (the 2nd run passes `resume`), while a different thread starts fresh. (The
     /// `RecordingRuntime` echoes a stable id so we can assert the resume.)
@@ -3686,6 +3806,16 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
         std::fs::create_dir_all(&tmp).unwrap();
         seed_prompts(&tmp);
+        // A skill + a memory index so the fresh-wake `self-orientation` block has content to carry
+        // (it's dropped when empty), letting us assert it's fresh-only.
+        std::fs::create_dir_all(tmp.join("skills/demo")).unwrap();
+        std::fs::write(
+            tmp.join("skills/demo/SKILL.md"),
+            "---\nname: demo\ndescription: a demo skill\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.join("memory")).unwrap();
+        std::fs::write(tmp.join("memory/INDEX.md"), "# Memory index\n- a thing\n").unwrap();
         let config = Arc::new(DackConfig::from_yaml("operator_did: \"did:x\"").unwrap());
         let queue: Arc<dyn Queue> = Arc::new(InMemoryQueue::new());
         let runtime = Arc::new(RecordingRuntime {
@@ -3759,13 +3889,17 @@ mod tests {
         // scoping itself is unit-tested in `runlog::tail_filtered_gates_by_time_and_tag`; FileRunLog here
         // doesn't filter, so this asserts the BLOCK ASSEMBLY — which label appears when.)
         let has = |i: usize, label: &str| seen[i].blocks.iter().any(|b| b.label == label);
-        assert!(has(0, "memory-recent"), "fresh wake carries the memory block (grounding)");
-        assert!(!has(1, "memory-recent"), "RESUME drops memory (the session already has it)");
+        assert!(has(0, "self-orientation"), "fresh wake carries the self-orientation block (grounding)");
+        assert!(!has(1, "self-orientation"), "RESUME drops self-orientation (the session already has it)");
         assert!(!has(1, "environment-recent"), "RESUME drops the global environment view (fresh-only)");
         assert!(has(1, "conversation-since-last-wake"), "RESUME injects the conversation DIFF block");
         assert!(!has(1, "conversation-recent"), "a resume uses the diff label, not the fresh tail");
-        assert!(has(2, "memory-recent"), "a different thread's fresh wake carries memory again");
+        assert!(has(2, "self-orientation"), "a different thread's fresh wake carries self-orientation again");
         assert!(has(2, "environment-recent"), "a fresh wake (with prior runlog) carries the environment view");
+        // The block actually surfaces the skill catalogue + the memory-index head (not an empty shell).
+        let orient0 = seen[0].blocks.iter().find(|b| b.label == "self-orientation").unwrap();
+        assert!(orient0.body.contains("- demo — a demo skill"), "skills catalogue surfaced");
+        assert!(orient0.body.contains("Memory index"), "memory-index head surfaced");
 
         std::fs::remove_dir_all(&tmp).ok();
     }

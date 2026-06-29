@@ -125,6 +125,31 @@ fn default_true() -> bool {
     true
 }
 
+fn default_log_level() -> String {
+    "info".into()
+}
+fn default_log_format() -> String {
+    "auto".into()
+}
+
+/// Operational logging config (the `tracing` subscriber). Distinct from the runlog (the agent's
+/// soul-committed self-narrative). `level`: trace|debug|info|warn|error (env `RUST_LOG` overrides for
+/// per-module control, e.g. `dack::harness=debug`). `format`: `auto` (pretty TEXT on a TTY, JSON when
+/// piped/containerized — `docker logs`-parseable), or force `text`/`json`. Logs go to stdout.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogConfig {
+    #[serde(default = "default_log_level")]
+    pub level: String,
+    #[serde(default = "default_log_format")]
+    pub format: String,
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self { level: default_log_level(), format: default_log_format() }
+    }
+}
+
 /// One tier in the operator-configured **trust lattice** (the taint/IFC model). A `name` plus the
 /// highest consciousness state a cycle whose accumulated trust is this tier may walk to (`reaches`).
 /// **Rank = position** in `DackConfig.trust_tiers` (low→high); the lattice is a total order.
@@ -552,6 +577,9 @@ pub struct DackConfig {
     /// `None` (default) = size-eviction off (only the idle TTL applies). Set it in the operator config.
     #[serde(default)]
     pub session_max_context_tokens: Option<u64>,
+    /// Operational logging (the `tracing` subscriber): level + format. Default `info`/`auto`.
+    #[serde(default)]
+    pub log: LogConfig,
     /// **Load-shedding cap** (Phase 4): the max PENDING queue depth before the OLDEST `Low`-priority
     /// items are evicted (Normal+ is the protected floor, never shed; every eviction is logged).
     /// Protects a busy duck from a runaway low-priority fan-out backlog. `None` = unbounded.

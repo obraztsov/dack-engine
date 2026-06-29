@@ -27,7 +27,12 @@ import {
   renderTranscript,
 } from './runlog-recall'
 
-const RUNLOG_DIR = process.env.RECALL_DIR ?? 'runlogs'
+// The MCP's cwd is the daemon's launch dir (where `openclaude-bridge/` lives), NOT the soul repo — so a
+// bare `runlogs` would miss the files at `<soul>/runlogs`. Prefer the operator-set `RECALL_DIR`; else
+// derive from `DACK_BRIDGE_CWD` (the soul root the harness injects into the bridge env); else bare.
+const RUNLOG_DIR =
+  process.env.RECALL_DIR ??
+  (process.env.DACK_BRIDGE_CWD ? `${process.env.DACK_BRIDGE_CWD}/runlogs` : 'runlogs')
 const asText = (v: unknown) => ({ content: [{ type: 'text' as const, text: JSON.stringify(v) }] })
 
 const server = new McpServer({ name: 'recall', version: '0.1.0' })
@@ -80,4 +85,6 @@ server.registerTool(
 )
 
 await server.connect(new StdioServerTransport())
-console.error('[runlog-recall-mcp] ready')
+// One-line readiness + where it reads from + entry count, so an operator can see recall is wired right.
+const ready_n = (() => { try { return parseEntries(readRecentRunlogs(RUNLOG_DIR)).length } catch { return -1 } })()
+console.error(`[runlog-recall-mcp] ready (dir=${RUNLOG_DIR}, ${ready_n} entries)`)

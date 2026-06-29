@@ -159,7 +159,7 @@ impl Ingestor {
         while let Some(fired) = rx.recv().await {
             let def_id = fired.def_id.clone();
             if let Err(e) = self.process(fired, Utc::now().timestamp()).await {
-                eprintln!("ingest: duty `{def_id}` failed: {e}");
+                tracing::warn!("ingest: duty `{def_id}` failed: {e}");
             }
         }
     }
@@ -243,7 +243,7 @@ pub fn spawn_stimuli_watcher(
             (repo_root.clone(), registry.clone(), cron.clone(), webhook.clone());
         handle.spawn(async move {
             if let Err(e) = reload(&repo_root, &registry, cron.as_ref(), webhook.as_ref()).await {
-                eprintln!("stimuli hot-reload failed: {e}");
+                tracing::warn!("stimuli hot-reload failed: {e}");
             }
         });
     })

@@ -108,7 +108,7 @@ impl CronScheduler for CronWheel {
             match parse_cron(expr) {
                 Ok(s) => parsed.push((def_id.clone(), s)),
                 // One bad cron must not silence every other timer (logging-not-rollback).
-                Err(e) => eprintln!("cron: skipping duty `{def_id}`: {e}"),
+                Err(e) => tracing::warn!("cron: skipping duty `{def_id}`: {e}"),
             }
         }
         *self.schedules.lock().unwrap() = parsed;

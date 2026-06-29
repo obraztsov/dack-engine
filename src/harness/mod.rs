@@ -108,8 +108,8 @@ impl Harness {
         // Boot reconciliation: requeue any row a crash left stuck in `dispatched` (PRD §9.3).
         match self.queue.reclaim_orphans().await {
             Ok(0) => {}
-            Ok(n) => eprintln!("dack: reclaimed {n} orphaned dispatched row(s) at boot"),
-            Err(e) => eprintln!("dack: boot reclaim failed: {e}"),
+            Ok(n) => tracing::info!("reclaimed {n} orphaned dispatched row(s) at boot"),
+            Err(e) => tracing::error!("boot reclaim failed: {e}"),
         }
         // Downtime → character (PRD §11.8): a restart enqueues a self-tier "back online" wake
         // that Perceives then Expresses (the duck may comment on having been away).
@@ -119,7 +119,7 @@ impl Harness {
             // Graceful shutdown: a SIGTERM (set via the watch) is honored at a cycle boundary —
             // an in-flight dispatch always finishes (no zombie `dispatched` row), then we exit.
             if *shutdown.borrow() {
-                eprintln!("dack: shutdown signal — consciousness loop exiting cleanly");
+                tracing::info!("shutdown signal — consciousness loop exiting cleanly");
                 return Ok(());
             }
             // Soft kill-switch (`dack pause`): a shared cursor flag. While set, the loop idles at the
@@ -134,13 +134,13 @@ impl Harness {
             // Load-shed (Phase 4): bound the pending queue, dropping only the stalest low-prio work.
             if let Some(max) = self.config.queue_max_depth {
                 match self.queue.shed(max).await {
-                    Ok(shed) if !shed.is_empty() => eprintln!(
-                        "dack: load-shed {} low-prio queue item(s) over cap {max}: {}",
+                    Ok(shed) if !shed.is_empty() => tracing::warn!(
+                        "load-shed {} low-prio queue item(s) over cap {max}: {}",
                         shed.len(),
                         shed.iter().map(|i| i.0.as_str()).collect::<Vec<_>>().join(", ")
                     ),
                     Ok(_) => {}
-                    Err(e) => eprintln!("dack: load-shed failed: {e}"),
+                    Err(e) => tracing::warn!("load-shed failed: {e}"),
                 }
             }
             match self.queue.next().await? {
@@ -158,7 +158,7 @@ impl Harness {
                         Ok(Err(e)) => {
                             // logging-not-rollback (PRD §7.5): a failed run is a tagged entry + a
                             // terminal `failed` row, never a crash of the single-flight loop.
-                            eprintln!("dack: dispatch error ({}): {e}", snap.id);
+                            tracing::error!("dispatch error ({}): {e}", snap.id);
                             self.log_dispatch_failure(&snap, &e).await;
                             let _ = self.queue.update_status(&snap.id, StimulusStatus::Failed).await;
                         }
@@ -168,7 +168,7 @@ impl Harness {
                                 .map(|s| s.to_string())
                                 .or_else(|| panic.downcast_ref::<String>().cloned())
                                 .unwrap_or_else(|| "unknown panic".into());
-                            eprintln!("dack: dispatch PANICKED ({}): {msg} — cycle failed, loop continues", snap.id);
+                            tracing::error!("dispatch PANICKED ({}): {msg} — cycle failed, loop continues", snap.id);
                             self.log_dispatch_failure(&snap, &DackError::Runtime(format!("panic: {msg}"))).await;
                             let _ = self.queue.update_status(&snap.id, StimulusStatus::Failed).await;
                         }
@@ -210,7 +210,7 @@ impl Harness {
             entry: self.config.default_entry.clone(),
         };
         if let Err(e) = self.queue.enqueue(stim).await {
-            eprintln!("dack: back-online enqueue failed: {e}");
+            tracing::warn!("back-online enqueue failed: {e}");
         }
     }
 
@@ -234,6 +234,11 @@ impl Harness {
         let _ = self.runlog.append(&entry).await;
     }
 
+    #[tracing::instrument(
+        name = "cycle",
+        skip_all,
+        fields(stim = %stimulus.id.0, source = %stimulus.source, kind = %stimulus.type_)
+    )]
     async fn dispatch(&self, stimulus: Stimulus) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
         let lattice = self.config.lattice();
@@ -253,7 +258,7 @@ impl Harness {
             if let Some(ttl) = self.config.baton_ttl_secs {
                 let age = now - stimulus.received_at;
                 if age > ttl as i64 {
-                    eprintln!("dispatch: stale baton expired ({age}s old > {ttl}s TTL) — dropped ({})", stimulus.id);
+                    tracing::warn!("dispatch: stale baton expired ({age}s old > {ttl}s TTL) — dropped ({})", stimulus.id);
                     return Ok(());
                 }
             }
@@ -279,7 +284,7 @@ impl Harness {
         let current = match self.resolve_state_prompt(&stimulus.entry).await {
             Ok(p) => p,
             Err(e) => {
-                eprintln!(
+                tracing::error!(
                     "dispatch: entry state-prompt `{}` unresolved: {e} — dropping ({})",
                     stimulus.entry, stimulus.id
                 );
@@ -289,7 +294,7 @@ impl Harness {
         };
         // The entry tier itself must be within the seed ceiling.
         if !within_ceiling(current.state, ceiling) {
-            eprintln!(
+            tracing::debug!(
                 "dispatch: entry `{}` (state {:?}) above trust ceiling {:?} (cycle trust `{}`) — dropping ({})",
                 current.id, current.state, ceiling, cycle_trust.name(), stimulus.id
             );
@@ -333,7 +338,7 @@ impl Harness {
         while let Some(b) = work.pop_front() {
             steps += 1;
             if steps > MAX_CYCLE_STEPS {
-                eprintln!(
+                tracing::warn!(
                     "dispatch: cycle step budget ({MAX_CYCLE_STEPS}) reached — dropping {} pending branch(es) ({})",
                     work.len() + 1,
                     stimulus.id
@@ -361,7 +366,7 @@ impl Harness {
                     let soul_root = self.soul_root();
                     tokio::spawn(async move { run_worker_detached(rt, q, rp, soul_root, spawn).await });
                 } else {
-                    eprintln!(
+                    tracing::debug!(
                         "dispatch: `spawn` from {:?} ignored — workers launch only from Express ({})",
                         b.prompt.state, stimulus.id
                     );
@@ -376,7 +381,7 @@ impl Harness {
                     continue; // a baton with no destination = a terminal note; nothing to schedule.
                 }
                 if emitted >= MAX_FANOUT_WIDTH {
-                    eprintln!(
+                    tracing::warn!(
                         "dispatch: fan-out width cap ({MAX_FANOUT_WIDTH}) at `{}` — extra batons dropped ({})",
                         b.prompt.id, stimulus.id
                     );
@@ -385,7 +390,7 @@ impl Harness {
                 let next_id = intent.to_prompt.clone();
                 // Soul's half: the chosen id must be in THIS prompt's allowed set.
                 if !b.prompt.permits_transition_to(&next_id) {
-                    eprintln!(
+                    tracing::debug!(
                         "dispatch: `{next_id}` not in `{}`'s transitions — dropped ({})",
                         b.prompt.id, stimulus.id
                     );
@@ -394,21 +399,21 @@ impl Harness {
                 let next = match self.resolve_state_prompt(&next_id).await {
                     Ok(p) => p,
                     Err(e) => {
-                        eprintln!("dispatch: baton target `{next_id}` unresolved: {e} — dropped ({})", stimulus.id);
+                        tracing::error!("dispatch: baton target `{next_id}` unresolved: {e} — dropped ({})", stimulus.id);
                         continue;
                     }
                 };
                 // Taint enforcement: the branch must be within the POST-step ceiling (a step that
                 // touched a lower-trust capability may have just dropped it below this target).
                 if !within_ceiling(next.state, ceiling) {
-                    eprintln!(
+                    tracing::debug!(
                         "dispatch: baton to `{}` (state {:?}) above trust ceiling {:?} (branch trust `{}`) — dropped ({})",
                         next.id, next.state, ceiling, trust.name(), stimulus.id
                     );
                     continue;
                 }
                 if !allowed_transition(b.prompt.state, next.state) {
-                    eprintln!(
+                    tracing::debug!(
                         "dispatch: transition {:?}→{:?} structurally disallowed — dropped ({})",
                         b.prompt.state, next.state, stimulus.id
                     );
@@ -418,7 +423,7 @@ impl Harness {
                 // I6) — even a clean branch the ceiling admits reflects only once per interval.
                 if next.state == ConsciousnessState::Reflect {
                     if !self.reflect_rate_limit_ok(now).await {
-                        eprintln!(
+                        tracing::debug!(
                             "dispatch: Reflect baton to `{}` rate-limited (< {}s since last) — dropped ({})",
                             next.id, self.config.reflect_min_interval_secs, stimulus.id
                         );
@@ -436,13 +441,13 @@ impl Harness {
                     intent.reply_to.as_deref(),
                 );
                 if intent.reply_to.is_some() && scope_override.is_none() {
-                    eprintln!(
+                    tracing::warn!(
                         "dispatch: baton to `{}` reply_to `{}` matched no message in the batch — \
                          replying to the latest instead ({})",
                         next.id, intent.reply_to.as_deref().unwrap_or(""), stimulus.id
                     );
                 } else if let Some(item) = &scope_override {
-                    eprintln!(
+                    tracing::debug!(
                         "dispatch: baton to `{}` threads reply to message {} ({})",
                         next.id,
                         item.get("message_id").map(|v| v.to_string()).unwrap_or_else(|| "?".into()),
@@ -466,12 +471,12 @@ impl Harness {
                         scope_override.as_ref(),
                     );
                     match self.queue.enqueue(cont).await {
-                        Ok(()) => eprintln!(
+                        Ok(()) => tracing::debug!(
                             "dispatch: deferred low-prio baton → queue (`{}`, depth {}) ({})",
                             next.id, depth + 1, stimulus.id
                         ),
                         Err(e) => {
-                            eprintln!("dispatch: enqueue deferred baton failed ({}): {e} — running in-wake", stimulus.id);
+                            tracing::warn!("dispatch: enqueue deferred baton failed ({}): {e} — running in-wake", stimulus.id);
                             work.push_back(Branch { prompt: next, step: StepInput::Act(baton), trust: trust.clone(), ceiling, scope_override });
                         }
                     }
@@ -498,6 +503,11 @@ impl Harness {
     /// act = the digested Baton), the MCP capabilities it plugs, and the wall; invoke; honor the
     /// memory line (gated); reconcile the soul (tripwire + commit-sweep); author the runlog. Returns
     /// the agent output + the `runlog_ref` the next hop's Baton points at.
+    #[tracing::instrument(
+        name = "step",
+        skip_all,
+        fields(state = ?prompt.state, prompt = %prompt.id, step = step_seq)
+    )]
     async fn run_step(
         &self,
         prompt: &StatePrompt,
@@ -532,7 +542,7 @@ impl Harness {
         let resume = match &session_key {
             Some(key) => {
                 let r = self.sticky_resume(key);
-                eprintln!(
+                tracing::debug!(
                     "sticky[{key}]: {}",
                     match &r {
                         Some((id, _)) => format!("RESUME session {id}"),
@@ -573,6 +583,8 @@ impl Harness {
             .then(|| prompt.model.clone())
             .flatten()
             .or_else(|| policy.model.clone());
+        // Captured for the latency log (the `model` binding is moved into the request below).
+        let model_label = model.clone().unwrap_or_else(|| "default".into());
 
         // Built AFTER the resume lookup: a sticky RESUME gets the lean `resume_body`, a fresh run the
         // full body.
@@ -595,7 +607,19 @@ impl Harness {
             mounts: Vec::new(),
             allowed_tools: None, // the duck uses the engine default; the wall gates every call.
         };
+        // Model-call latency: wall-clock around the whole bridge round-trip (incl. the wall/tool turns
+        // — that IS the cycle's model cost). One structured event, correlated by the `cycle`/`step`
+        // span, with the token usage we already plumb (Phase 2). Latency dashboards = a log query.
+        let call_start = std::time::Instant::now();
         let (out, ran_session, usage) = self.runtime.invoke(req, recorder.clone()).await?;
+        tracing::info!(
+            elapsed_ms = call_start.elapsed().as_millis() as u64,
+            model = %model_label,
+            input_tokens = usage.map(|u| u.input_tokens).unwrap_or(0),
+            cache_read_tokens = usage.map(|u| u.cache_read_input_tokens).unwrap_or(0),
+            resumed = is_resume,
+            "model call"
+        );
         // Sticky-session bookkeeping. Persist the engine session id so the next item with the same key
         // resumes it — UNLESS this turn's context has grown past `session_max_context_tokens`, in which
         // case EVICT (don't store) so the next wake starts FRESH. Caps cost + the bloat that drives
@@ -605,7 +629,7 @@ impl Harness {
             match self.config.session_max_context_tokens {
                 Some(cap) if ctx > cap => {
                     self.sessions.lock().unwrap().remove(key);
-                    eprintln!(
+                    tracing::debug!(
                         "sticky[{key}]: EVICTED — context {}k > cap {}k (next wake fresh)",
                         ctx / 1000,
                         cap / 1000
@@ -708,7 +732,7 @@ impl Harness {
             .as_deref()
             .and_then(|p| p.strip_prefix("operator_sig:"));
         let Some(sig_b64) = sig_b64 else {
-            eprintln!(
+            tracing::warn!(
                 "dispatch: `{}` claims operator_signed with no signature — downgrading to public",
                 stimulus.id
             );
@@ -725,14 +749,14 @@ impl Harness {
         {
             Ok(true) => TrustTier::operator(),
             Ok(false) => {
-                eprintln!(
+                tracing::warn!(
                     "dispatch: `{}` operator signature INVALID — downgrading to public",
                     stimulus.id
                 );
                 TrustTier::public()
             }
             Err(e) => {
-                eprintln!(
+                tracing::warn!(
                     "dispatch: `{}` operator signature unverifiable ({e}) — downgrading to public",
                     stimulus.id
                 );
@@ -786,15 +810,15 @@ impl Harness {
         let schedule = match crate::sources::cron::parse_cron(&expr) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("dack: bad reflect_schedule `{expr}`: {e} — scheduled Reflect disabled");
+                tracing::error!("bad reflect_schedule `{expr}`: {e} — scheduled Reflect disabled");
                 return;
             }
         };
-        eprintln!("dack: reflect scheduler up (`{expr}`).");
+        tracing::info!("reflect scheduler up (`{expr}`).");
         loop {
             let now = chrono::Utc::now();
             let Some(next) = crate::sources::cron::next_fire(&schedule, now) else {
-                eprintln!("dack: reflect_schedule never fires again — scheduler exiting");
+                tracing::warn!("reflect_schedule never fires again — scheduler exiting");
                 return;
             };
             let wait = (next - now).to_std().unwrap_or(Duration::from_secs(1));
@@ -809,12 +833,12 @@ impl Harness {
             // The cadence guard — a scheduled Reflect within the interval of the last one is skipped
             // (e.g. a manual `reflect-now` an hour earlier). `reflect-now` itself does not check this.
             if !self.reflect_rate_limit_ok(ts).await {
-                eprintln!("dack: scheduled Reflect skipped — within reflect_min_interval_secs of the last");
+                tracing::debug!("scheduled Reflect skipped — within reflect_min_interval_secs of the last");
                 continue;
             }
             match self.queue.enqueue(reflect_stimulus(ts)).await {
-                Ok(()) => eprintln!("dack: scheduled Reflect enqueued."),
-                Err(e) => eprintln!("dack: scheduled Reflect enqueue failed: {e}"),
+                Ok(()) => tracing::info!("scheduled Reflect enqueued."),
+                Err(e) => tracing::warn!("scheduled Reflect enqueue failed: {e}"),
             }
         }
     }
@@ -858,7 +882,7 @@ impl Harness {
             Ok(c) => c,
             Err(e) => {
                 // A non-git soul dir (tests) or a transient git error — log and move on.
-                eprintln!("reconcile {run_id} {state:?}: status failed: {e}");
+                tracing::warn!("reconcile {run_id} {state:?}: status failed: {e}");
                 return Vec::new();
             }
         };
@@ -875,7 +899,7 @@ impl Harness {
             } else {
                 // The tripwire: a write the running state may not make. Restore HEAD + alarm.
                 if let Err(e) = self.repo.restore_to_head(ch).await {
-                    eprintln!("reconcile {run_id}: revert {} failed: {e}", ch.path.0);
+                    tracing::error!("reconcile {run_id}: revert {} failed: {e}", ch.path.0);
                 }
                 reverted.push(ch.path.0.clone());
             }
@@ -890,7 +914,7 @@ impl Harness {
             // with the runlog + memory commits. Staying local on push failure is fine — durable
             // on the box, re-pushed next cycle (PRD §3.5).
             if let Err(e) = self.repo.commit_paths(&allowed, &commit).await {
-                eprintln!("reconcile {run_id}: sweep commit failed: {e}");
+                tracing::warn!("reconcile {run_id}: sweep commit failed: {e}");
             }
         }
         reverted
@@ -901,7 +925,7 @@ impl Harness {
     /// — the commits are durable locally and re-push next cycle (PRD §3.5, invariant I13).
     async fn push_soul(&self) {
         if let Err(e) = self.repo.push().await {
-            eprintln!("soul push failed (kept local): {e}");
+            tracing::warn!("soul push failed (kept local): {e}");
         }
     }
 
@@ -958,17 +982,17 @@ impl Harness {
         for req in &prompt.mcp {
             let name = req.name();
             if policy.deny.iter().any(|d| d == name) {
-                eprintln!("mcp `{name}` denied by {state:?} tier_policy — skipped");
+                tracing::debug!("mcp `{name}` denied by {state:?} tier_policy — skipped");
                 continue;
             }
             match req {
                 McpRef::Import(_) => {
                     if !policy.import.iter().any(|i| i == name) {
-                        eprintln!("mcp import `{name}` not permitted at {state:?} (tier_policy.import) — skipped");
+                        tracing::debug!("mcp import `{name}` not permitted at {state:?} (tier_policy.import) — skipped");
                         continue;
                     }
                     let Some(server) = self.config.mcp_server(name) else {
-                        eprintln!("mcp import `{name}` not in mcp_servers registry — skipped");
+                        tracing::warn!("mcp import `{name}` not in mcp_servers registry — skipped");
                         continue;
                     };
                     if !tier_fits_state(server.tier, state) {
@@ -980,7 +1004,7 @@ impl Harness {
                     // the privileged tool mid-walk — the firebreak, for free. `None` = no trust gate.
                     if let Some(min) = &server.min_trust {
                         if !lattice.permits(cycle_trust, min) {
-                            eprintln!(
+                            tracing::debug!(
                                 "mcp `{name}` needs min_trust `{}` > cycle trust `{}` — skipped",
                                 min.name(),
                                 cycle_trust.name()
@@ -996,7 +1020,7 @@ impl Harness {
                                 .or_else(|| env.keys().next().cloned())
                                 .and_then(|k| env.get(&k).cloned()),
                             Err(e) => {
-                                eprintln!("mcp `{name}` secret `{}`: {e}", auth.secret);
+                                tracing::warn!("mcp `{name}` secret `{}`: {e}", auth.secret);
                                 continue; // fail-closed: no token → don't expose a half-authed server.
                             }
                         },
@@ -1034,7 +1058,7 @@ impl Harness {
                 }
                 McpRef::Inline { name, url } => {
                     if policy.mcp_whitelist {
-                        eprintln!("mcp inline `{name}` rejected — {state:?} is locked (mcp_whitelist) — skipped");
+                        tracing::debug!("mcp inline `{name}` rejected — {state:?} is locked (mcp_whitelist) — skipped");
                         continue;
                     }
                     // A soul-declared public MCP: FORCED read-tier, NO secret. Build an http config
@@ -1230,7 +1254,7 @@ impl Harness {
             )
             .await
         {
-            eprintln!("memory_append write failed: {e}");
+            tracing::warn!("memory_append write failed: {e}");
         }
     }
 
@@ -1497,12 +1521,13 @@ async fn run_worker_detached(
         // default toolset (parts of which Docker-sandbox sub-work and die inside the worker container).
         allowed_tools: def.fm.tools.clone(),
     };
-    eprintln!(
+    tracing::info!(
         "worker `{}` launched in {} ({})",
         spawn.agent,
         workspace.display(),
         if isolated { "docker" } else { "host" }
     );
+    let worker_start = std::time::Instant::now();
     let summary = match runtime.invoke(req, recorder).await {
         Ok((out, _, _)) => out
             .proposal
@@ -1511,6 +1536,7 @@ async fn run_worker_detached(
             .unwrap_or(out.thought),
         Err(e) => format!("ERROR: worker run failed: {e}"),
     };
+    tracing::debug!(agent = %spawn.agent, elapsed_ms = worker_start.elapsed().as_millis() as u64, "worker call");
     // Reap the container by name (best-effort): a normal `--rm` exit already removed it (rm errors,
     // ignored); a timeout/kill left an orphan (the local `docker` client died, not the container) →
     // `rm -f` stops it before it burns more gateway credit.
@@ -1534,7 +1560,7 @@ fn resolve_worker_volumes(
         let host = match soul_canon.join(&v.source).canonicalize() {
             Ok(p) if p.starts_with(&soul_canon) => p,
             _ => {
-                eprintln!("worker volume `{}` rejected (outside soul, or missing) — skipped", v.source);
+                tracing::warn!("worker volume `{}` rejected (outside soul, or missing) — skipped", v.source);
                 continue;
             }
         };
@@ -1610,7 +1636,7 @@ async fn enqueue_worker_completion(queue: &Arc<dyn Queue>, spawn: &SpawnRequest,
         entry: "perceive".into(),
     };
     if let Err(e) = queue.enqueue(stim).await {
-        eprintln!("worker completion enqueue failed: {e}");
+        tracing::warn!("worker completion enqueue failed: {e}");
     }
 }
 

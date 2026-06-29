@@ -104,7 +104,7 @@ impl PushTarget {
                         return Err(e);
                     }
                     let backoff = std::time::Duration::from_millis(500u64 << (attempt - 1));
-                    eprintln!(
+                    tracing::info!(
                         "soul push `{}` attempt {attempt}/{MAX_ATTEMPTS} failed (transient): {e} \
                          — retrying in {backoff:?}",
                         self.name()
@@ -208,16 +208,16 @@ impl RepoHost for MultiRemoteRepo {
         let mut first_required_err: Option<DackError> = None;
         for t in &self.targets {
             match t.push(&self.core).await {
-                Ok(()) => eprintln!("dack: soul pushed → {}", t.name()),
+                Ok(()) => tracing::info!("soul pushed → {}", t.name()),
                 Err(e) => {
                     if t.required() {
-                        eprintln!("dack: soul push FAILED (required) → {}: {e}", t.name());
+                        tracing::error!("soul push FAILED (required) → {}: {e}", t.name());
                         if first_required_err.is_none() {
                             first_required_err = Some(e);
                         }
                     } else {
-                        eprintln!(
-                            "dack: soul push failed (best-effort, re-pushed next cycle) → {}: {e}",
+                        tracing::warn!(
+                            "soul push failed (best-effort, re-pushed next cycle) → {}: {e}",
                             t.name()
                         );
                     }

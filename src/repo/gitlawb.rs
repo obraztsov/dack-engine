@@ -105,7 +105,7 @@ impl RepoHost for GitlawbRepo {
                         return Err(e);
                     }
                     let backoff = std::time::Duration::from_millis(500u64 << (attempt - 1));
-                    eprintln!(
+                    tracing::warn!(
                         "gitlawb push attempt {attempt}/{MAX_ATTEMPTS} failed (transient): {e} — retrying in {backoff:?}"
                     );
                     tokio::time::sleep(backoff).await;

@@ -141,8 +141,8 @@ impl Bus {
                             let window = ad.window_sec(spent);
                             self.queue.set_cursor(&key, &(spent + 1).to_string()).await?;
                             // Observable: the window stepping up as a chat spends its daily budget.
-                            eprintln!(
-                                "dack: coalesce[adaptive] {}:{} spent={}/{} → window={window}s",
+                            tracing::debug!(
+                                "coalesce[adaptive] {}:{} spent={}/{} → window={window}s",
                                 fm.id,
                                 chat,
                                 spent + 1,

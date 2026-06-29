@@ -71,19 +71,19 @@ impl ModuleSupervisor {
         let skipped: Vec<&str> =
             self.modules.iter().filter(|m| !m.enabled).map(|m| m.name.as_str()).collect();
         if !skipped.is_empty() {
-            eprintln!("dack: modules disabled (not started): {}", skipped.join(", "));
+            tracing::info!("modules disabled (not started): {}", skipped.join(", "));
         }
         if handles.is_empty() {
             return;
         }
-        eprintln!("dack: modules up — supervising {} ({}).", handles.len(), started.join(", "));
+        tracing::info!("modules up — supervising {} ({}).", handles.len(), started.join(", "));
         // Block until shutdown; each child task observes the same watch + tears itself down, then
         // we join them so the daemon doesn't exit out from under a still-killing child.
         let _ = shutdown.changed().await;
         for h in handles {
             let _ = h.await;
         }
-        eprintln!("dack: modules stopped.");
+        tracing::info!("modules stopped.");
     }
 }
 
@@ -124,7 +124,7 @@ impl SupervisedModule {
             if *shutdown.borrow() {
                 return;
             }
-            eprintln!("dack: module `{name}` restarting in {}s", backoff.as_secs());
+            tracing::warn!("module `{name}` restarting in {}s", backoff.as_secs());
             tokio::select! {
                 _ = tokio::time::sleep(backoff) => {}
                 _ = shutdown.changed() => return,
@@ -143,7 +143,7 @@ impl SupervisedModule {
         let mut env = self.module.env.clone();
         match self.broker.env_for(&self.module.secrets).await {
             Ok(secret_env) => env.extend(secret_env),
-            Err(e) => eprintln!("dack: module `{name}` secrets unresolved ({e}) — starting without"),
+            Err(e) => tracing::warn!("module `{name}` secrets unresolved ({e}) — starting without"),
         }
         let spec = ProcessSpec {
             command: self.module.command.clone(),
@@ -158,7 +158,7 @@ impl SupervisedModule {
         let mut cmd = match self.sandbox.command(&spec) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("dack: module `{name}` command build failed: {e}");
+                tracing::error!("module `{name}` command build failed: {e}");
                 return RunOutcome::SpawnFailed;
             }
         };
@@ -167,23 +167,23 @@ impl SupervisedModule {
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("dack: module `{name}` spawn failed: {e}");
+                tracing::error!("module `{name}` spawn failed: {e}");
                 return RunOutcome::SpawnFailed;
             }
         };
-        eprintln!("dack: module `{name}` started (pid {:?}).", child.id());
+        tracing::info!("module `{name}` started (pid {:?}).", child.id());
         tokio::select! {
             status = child.wait() => {
                 let code = status.ok().and_then(|s| s.code());
-                eprintln!(
-                    "dack: module `{name}` exited (code {code:?}) after {}s.",
+                tracing::warn!(
+                    "module `{name}` exited (code {code:?}) after {}s.",
                     started.elapsed().as_secs()
                 );
                 RunOutcome::Exited { uptime: started.elapsed() }
             }
             _ = shutdown.changed() => {
                 let _ = child.kill().await;
-                eprintln!("dack: module `{name}` stopped (shutdown).");
+                tracing::info!("module `{name}` stopped (shutdown).");
                 RunOutcome::Shutdown
             }
         }

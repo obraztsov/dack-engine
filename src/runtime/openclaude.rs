@@ -412,7 +412,7 @@ impl RuntimeClient for OpenClaudeClient {
                         return Ok((output, session_id.map(SessionId), usage))
                     }
                     FromBridge::Error { message } => return Err(DackError::Runtime(message)),
-                    FromBridge::Log { message } => eprintln!("[bridge] {message}"),
+                    FromBridge::Log { message } => tracing::info!("[bridge] {message}"),
                 }
             }
         };

@@ -39,6 +39,7 @@ pub mod agent_def;
 pub mod error;
 pub mod harness;
 pub mod identity;
+pub mod logging;
 pub mod model;
 pub mod queue;
 pub mod repo;

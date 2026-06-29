@@ -75,6 +75,11 @@ pub enum Command {
 /// `pause`/`resume`/`reflect-now`/`reconcile` are the operator controls that act on the shared
 /// SQLite queue (cursor flags + injected stimuli) the running daemon observes (PRD §8.3).
 pub async fn dispatch(cli: Cli) -> Result<()> {
+    // Structured logging for EVERY command (so an operator command like `reconcile` shows its push
+    // results, not just the long-running `run`). Best-effort config load for the level/format; a bad
+    // config path still lets the command run and report its own error. Idempotent (`run` won't re-init).
+    let log = DackConfig::load(&cli.config).map(|c| c.log).unwrap_or_default();
+    crate::logging::init(&log);
     match cli.command {
         Command::Run => run(&cli.config).await,
         Command::Status => status(&cli.config).await,
@@ -210,7 +215,7 @@ fn remotes_to_targets(
         if is_gitlawb {
             let role = r.identity.as_deref().unwrap_or("soul");
             let Some(dir) = config.identities.dir(role) else {
-                eprintln!("dack: remote `{name}` (gitlawb) needs identities.{role} to sign — skipping");
+                tracing::warn!("remote `{name}` (gitlawb) needs identities.{role} to sign — skipping");
                 continue;
             };
             // Absolutize: `GITLAWB_KEY` is read by the push helper running with cwd = the repo,
@@ -242,10 +247,10 @@ fn build_soul_repo(
 ) -> Arc<dyn RepoHost> {
     let targets = remotes_to_targets(&config.effective_soul_remotes(), config);
     if targets.is_empty() {
-        eprintln!("dack: no soul_remotes — plain-git, local-only (commits stay on the box, no push)");
+        tracing::info!("no soul_remotes — plain-git, local-only (commits stay on the box, no push)");
     } else {
-        eprintln!(
-            "dack: soul push targets: {}",
+        tracing::info!(
+            "soul push targets: {}",
             targets.iter().map(|t| t.name()).collect::<Vec<_>>().join(", ")
         );
     }
@@ -270,10 +275,10 @@ fn build_runlog_repo(
     };
     let targets = remotes_to_targets(remotes, config);
     if targets.is_empty() {
-        eprintln!("dack: runlog repo local-only (no runlog_remote) — private + disposable");
+        tracing::info!("runlog repo local-only (no runlog_remote) — private + disposable");
     } else {
-        eprintln!(
-            "dack: runlog push target: {}",
+        tracing::info!(
+            "runlog push target: {}",
             targets.iter().map(|t| t.name()).collect::<Vec<_>>().join(", ")
         );
     }
@@ -304,8 +309,8 @@ fn ensure_runlog_repo(runlog_root: &std::path::Path, runlog_remote: Option<&crat
     if healthy {
         return;
     }
-    eprintln!(
-        "dack: runlog repo at {} missing/corrupt — discarding local state + {}",
+    tracing::warn!(
+        "runlog repo at {} missing/corrupt — discarding local state + {}",
         runlog_root.display(),
         if runlog_remote.is_some() { "cloning from remote" } else { "init fresh empty" }
     );
@@ -323,10 +328,10 @@ fn ensure_runlog_repo(runlog_root: &std::path::Path, runlog_remote: Option<&crat
                 .map(|s| s.success())
                 .unwrap_or(false)
         {
-            eprintln!("dack: runlog repo restored from {}", remote_label(&r.url));
+            tracing::info!("runlog repo restored from {}", remote_label(&r.url));
             return;
         }
-        eprintln!("dack: runlog clone unavailable — starting a fresh empty repo");
+        tracing::warn!("runlog clone unavailable — starting a fresh empty repo");
     }
     let _ = std::fs::create_dir_all(runlog_root);
     for args in [
@@ -390,7 +395,7 @@ async fn reconcile(config_path: &str) -> Result<()> {
             }
             println!("dack: committed {} path(s) as operator ({}).", paths.len(), id.0);
             if let Err(e) = repo.push().await {
-                eprintln!("dack: push failed (kept local; the daemon re-pushes next cycle): {e}");
+                tracing::warn!("push failed (kept local; the daemon re-pushes next cycle): {e}");
             }
         }
         None => println!("dack: nothing staged — tree already clean at HEAD."),
@@ -403,13 +408,14 @@ async fn reconcile(config_path: &str) -> Result<()> {
 /// Phase 4; until then `run` keeps the duck's senses live and the queue filling.
 async fn run(config_path: &str) -> Result<()> {
     let config = Arc::new(DackConfig::load(config_path)?);
+    // (Structured logging was already brought up in `dispatch` from this same config.)
     // Fail fast if the capability prefixes overlap (a settle tool must never classify as Post).
     config.validate_capabilities()?;
     // Dry-run (testing): the WALL denies the configured tool prefixes so outward actions are
     // composed-but-not-executed — uniformly across every MCP (twitter, cove, …). No per-server env.
     if config.dry_run.enabled {
-        eprintln!(
-            "dack: DRY-RUN — the wall blocks these tool prefixes (composed, not executed): {}",
+        tracing::info!(
+            "DRY-RUN — the wall blocks these tool prefixes (composed, not executed): {}",
             config.dry_run.block.join(", ")
         );
     }
@@ -440,8 +446,8 @@ async fn run(config_path: &str) -> Result<()> {
         let reg = registry.read().unwrap();
         cron.reschedule(&reg.cron_routes()).await?;
         webhook.set_routes(&reg.webhook_routes()).await?;
-        eprintln!(
-            "dack: {} duties registered ({} malformed); webhook on {addr}",
+        tracing::info!(
+            "{} duties registered ({} malformed); webhook on {addr}",
             reg.defs.len(),
             reg.errors.len()
         );
@@ -514,8 +520,8 @@ async fn run(config_path: &str) -> Result<()> {
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("install SIGTERM handler");
         tokio::select! {
-            _ = term.recv() => eprintln!("dack: SIGTERM — draining"),
-            _ = tokio::signal::ctrl_c() => eprintln!("dack: SIGINT — draining"),
+            _ = term.recv() => tracing::info!("SIGTERM — draining"),
+            _ = tokio::signal::ctrl_c() => tracing::info!("SIGINT — draining"),
         }
         let _ = shutdown_tx.send(true);
     });
@@ -524,11 +530,11 @@ async fn run(config_path: &str) -> Result<()> {
         let sd = shutdown_rx.clone();
         async move {
             if let Err(e) = h.run(sd).await {
-                eprintln!("dack: consciousness loop stopped: {e}");
+                tracing::error!("consciousness loop stopped: {e}");
             }
         }
     });
-    eprintln!("dack: consciousness loop up (queue → Perceive → wall → Express).");
+    tracing::info!("consciousness loop up (queue → Perceive → wall → Express).");
     // The scheduled Reflect ticker (PRD §4.2): enqueues a harness-entered Reflect at `reflect_schedule`
     // (no-op if unset). Harness-owned so it survives `stimuli/` hot-reloads. `dack reflect-now` is the
     // out-of-band manual trigger of the same run.
@@ -563,15 +569,15 @@ async fn run(config_path: &str) -> Result<()> {
         registry,
         broker,
     });
-    eprintln!("dack: ingestion up (cron+webhook → bus → queue).");
+    tracing::info!("ingestion up (cron+webhook → bus → queue).");
     // The ingestion loop is the process's main future. Stop it on shutdown too, so the whole
     // daemon exits (systemd then restarts it) instead of the consciousness loop alone draining.
     let mut sd = shutdown_rx;
     tokio::select! {
         _ = ingestor.run(rx) => {}
-        _ = sd.changed() => eprintln!("dack: ingestion stopping — shutdown"),
+        _ = sd.changed() => tracing::info!("ingestion stopping — shutdown"),
     }
-    eprintln!("dack: stopped cleanly.");
+    tracing::info!("stopped cleanly.");
     Ok(())
 }
 
@@ -648,8 +654,8 @@ fn build_worker_backend(config: &DackConfig) -> Result<Option<WorkerBackend>> {
                 ws.image
             )));
         }
-        eprintln!(
-            "dack: worker_sandbox enabled but Docker/image `{}` unavailable — workers FALL BACK TO HOST (require:false).",
+        tracing::warn!(
+            "worker_sandbox enabled but Docker/image `{}` unavailable — workers FALL BACK TO HOST (require:false).",
             ws.image
         );
         return Ok(None);
@@ -662,7 +668,7 @@ fn build_worker_backend(config: &DackConfig) -> Result<Option<WorkerBackend>> {
     // closed before result"). Default generously; the operator can tighten via `worker_sandbox.memory`.
     policy.memory = ws.memory.clone().or_else(|| Some("2g".to_string()));
     policy.pids_limit = ws.pids_limit;
-    eprintln!("dack: worker_sandbox up — workers OS-isolated in docker image `{}`.", ws.image);
+    tracing::info!("worker_sandbox up — workers OS-isolated in docker image `{}`.", ws.image);
     Ok(Some(WorkerBackend {
         sandbox: Arc::new(DockerSandbox::default()),
         policy,
@@ -690,7 +696,7 @@ fn sweep_stale_workspaces(soul_root: &std::path::Path) {
         }
     }
     if swept > 0 {
-        eprintln!("dack: swept {swept} stale worker workspace(s).");
+        tracing::debug!("swept {swept} stale worker workspace(s).");
     }
 }
 

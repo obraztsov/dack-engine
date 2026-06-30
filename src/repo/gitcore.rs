@@ -84,9 +84,24 @@ impl GitCore {
                 .await
                 .map_err(|e| DackError::Repo(format!("mkdir {}: {e}", path.0)))?;
         }
-        tokio::fs::write(&full, contents)
+        // ATOMIC replace: write to a unique temp in the same dir, then rename over the target. A
+        // concurrent READER (the recall MCP runs in its OWN process, so it can't share a lock) thus
+        // sees either the whole old file or the whole new one — never a half-written/truncated file.
+        // The nonce keeps two writes to the same path from colliding on the temp name.
+        static TMP_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = TMP_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = std::path::PathBuf::from(format!(
+            "{}.tmp.{}.{nonce}",
+            full.display(),
+            std::process::id()
+        ));
+        tokio::fs::write(&tmp, contents)
             .await
             .map_err(|e| DackError::Repo(format!("write {}: {e}", path.0)))?;
+        if let Err(e) = tokio::fs::rename(&tmp, &full).await {
+            let _ = tokio::fs::remove_file(&tmp).await; // best-effort cleanup of the orphan temp
+            return Err(DackError::Repo(format!("rename {}: {e}", path.0)));
+        }
         self.git(&["add", "--", &path.0]).await?;
 
         // Nothing staged for this path (unchanged) → don't create an empty commit.

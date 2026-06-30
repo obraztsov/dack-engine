@@ -18,11 +18,10 @@ import { z } from 'zod'
 import {
   atLeastTrust,
   clamp,
+  cursorPage,
   findEntry,
   listRecentTags,
   loadEntries,
-  pageMeta,
-  pageRecent,
   readTagNotes,
   recentActivity,
   recentDates,
@@ -47,22 +46,26 @@ server.registerTool(
       "thoughts and what you said, each tagged with its run_id + chat + origin trust. NEVER the raw incoming " +
       "text, so reading it keeps you clean (self-trust). Use it to take stock of what's been happening. " +
       "Long thoughts are TRUNCATED with a `[+N chars — read_entry …]` marker — pass that run_id to " +
-      "`read_entry` for the full one. `limit`/`offset` page from the newest (offset 0 = most recent; then " +
-      "offset by `limit`); the reply's `page` tells you total/has_more/next_offset. `min_trust` " +
+      "`read_entry` for the full one. Pages NEWEST first: omit `cursor` for the latest `limit`, then pass " +
+      "back the reply's `page.cursor` for the next (older) page (null = no more). `min_trust` " +
       '(self|org|public) floors out lower-trust chats (e.g. set `org` to ignore strangers).',
     inputSchema: {
       days: z.number().int().optional(),
       min_trust: z.string().optional(),
       limit: z.number().int().optional(),
-      offset: z.number().int().optional(),
+      cursor: z.string().optional(),
     },
   },
-  async ({ days, min_trust, limit, offset }: { days?: number; min_trust?: string; limit?: number; offset?: number }) => {
+  async ({ days, min_trust, limit, cursor }: { days?: number; min_trust?: string; limit?: number; cursor?: string }) => {
     const d = clamp(days, 2, 30)
-    const lim = clamp(limit, 25, 50)
-    const off = Math.max(0, offset ?? 0)
-    const { items, total } = pageRecent(recentActivity(RUNLOG_DIR, d, min_trust), lim, off)
-    return asText({ ok: true, days: d, min_trust: min_trust ?? null, page: pageMeta(total, off, lim, items.length), log: renderThoughtLog(items) })
+    const page = cursorPage(recentActivity(RUNLOG_DIR, d, min_trust), clamp(limit, 25, 50), cursor)
+    return asText({
+      ok: true,
+      days: d,
+      min_trust: min_trust ?? null,
+      page: { total: page.total, returned: page.returned, has_more: page.has_more, cursor: page.cursor },
+      log: renderThoughtLog(page.items),
+    })
   },
 )
 
@@ -72,23 +75,26 @@ server.registerTool(
     description:
       'Your OWN thoughts + replies in ONE chat/topic by its tag (find tags with `list_recent_tags`), over ' +
       'the recent window. Thoughts-only (no raw incoming) — stays self-trust. Long thoughts are truncated ' +
-      'with a `read_entry` marker; `limit`/`offset` page from the newest (see the reply\'s `page`). ' +
+      "with a `read_entry` marker; pages newest first (omit `cursor`, then pass back `page.cursor`). " +
       '`min_trust` optional floor.',
     inputSchema: {
       tag: z.string().min(1),
       days: z.number().int().optional(),
       min_trust: z.string().optional(),
       limit: z.number().int().optional(),
-      offset: z.number().int().optional(),
+      cursor: z.string().optional(),
     },
   },
-  async ({ tag, days, min_trust, limit, offset }: { tag: string; days?: number; min_trust?: string; limit?: number; offset?: number }) => {
-    const lim = clamp(limit, 25, 50)
-    const off = Math.max(0, offset ?? 0)
+  async ({ tag, days, min_trust, limit, cursor }: { tag: string; days?: number; min_trust?: string; limit?: number; cursor?: string }) => {
     const all = loadEntries(RUNLOG_DIR, recentDates(RUNLOG_DIR, clamp(days, 7, 30)))
     const matched = atLeastTrust(all.filter((e) => e.tags.includes(tag) && (e.thought || e.sent.length)), min_trust)
-    const { items, total } = pageRecent(matched, lim, off)
-    return asText({ ok: true, tag, page: pageMeta(total, off, lim, items.length), log: renderThoughtLog(items) })
+    const page = cursorPage(matched, clamp(limit, 25, 50), cursor)
+    return asText({
+      ok: true,
+      tag,
+      page: { total: page.total, returned: page.returned, has_more: page.has_more, cursor: page.cursor },
+      log: renderThoughtLog(page.items),
+    })
   },
 )
 

@@ -4,9 +4,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   parseEntries,
-  pageByTag,
-  pageRecent,
-  pageMeta,
+  cursorPage,
+  decodeCursor,
   renderTranscript,
   listRecentTags,
   searchEntries,
@@ -21,6 +20,10 @@ import {
   atLeastTrust,
   readTagNotes,
 } from './runlog-recall'
+
+/** Test helper: the old `pageByTag(entries, tag, limit, 0)` is now `filter + cursorPage(...).items`. */
+const byTag = (entries: any[], tag: string, limit = 30) =>
+  cursorPage(entries.filter((e) => e.tags.includes(tag)), limit).items
 
 // A fixture runlog in the exact format `src/runlog/mod.rs::render` emits: two chats interleaved
 // (chatA = single messages, chatB = a coalesced batch), an entry with a reply, and one with silence.
@@ -81,7 +84,7 @@ test('parseEntries extracts tags, incoming (single + coalesced), and sent replie
 
 test('pageByTag filters to one conversation and renders an in/out transcript', () => {
   const es = parseEntries(FIXTURE)
-  const a = pageByTag(es, 'chatA', 30, 0)
+  const a = byTag(es, 'chatA')
   expect(a.length).toBe(3) // chatA only — chatB excluded
   const t = renderTranscript(a)
   expect(t).toContain('[@alice]: hi duck')
@@ -89,15 +92,17 @@ test('pageByTag filters to one conversation and renders an in/out transcript', (
   expect(t).not.toContain('bob') // no cross-conversation leak
 })
 
-test('offset pages further back from the most-recent end', () => {
-  const es = parseEntries(FIXTURE)
-  // chatA has 3 entries (ts 100 perceive, 100 express, 300). Most-recent 1:
-  const recent = pageByTag(es, 'chatA', 1, 0)
-  expect(recent.length).toBe(1)
-  expect(recent[0].runId).toContain('-3-') // the newest chatA entry
-  // Offset by 1 → the one before it.
-  const older = pageByTag(es, 'chatA', 1, 1)
-  expect(older[0].runId).toContain('express')
+test('cursor pages further back from the most-recent end (keyset)', () => {
+  const chatA = parseEntries(FIXTURE).filter((e) => e.tags.includes('chatA'))
+  // chatA has 3 entries (ts 100 perceive, 100 express, 300). Page 1 = most-recent 1:
+  const p1 = cursorPage(chatA, 1)
+  expect(p1.items.length).toBe(1)
+  expect(p1.items[0].runId).toContain('-3-') // the newest chatA entry
+  expect(p1.has_more).toBe(true)
+  // Pass the cursor back → the entry before it (no dup of the newest).
+  const p2 = cursorPage(chatA, 1, p1.cursor!)
+  expect(p2.items[0].runId).toContain('express')
+  expect(p2.items[0].runId).not.toContain('-3-')
 })
 
 test('list_recent_tags returns distinct tags newest-first with user hints', () => {
@@ -108,13 +113,13 @@ test('list_recent_tags returns distinct tags newest-first with user hints', () =
 
 test('the transcript collapses the duplicate incoming that perceive+express both store', () => {
   // chatA's wake stored "hi duck" on BOTH the perceive AND the express entry → render it once.
-  const a = pageByTag(parseEntries(FIXTURE), 'chatA', 30, 0)
+  const a = byTag(parseEntries(FIXTURE), 'chatA')
   const t = renderTranscript(a)
   expect(t.match(/\[@alice\]: hi duck/g)?.length).toBe(1)
 })
 
 test('an unknown tag recalls nothing (clean, not an error)', () => {
-  expect(pageByTag(parseEntries(FIXTURE), 'chatZ', 30, 0)).toEqual([])
+  expect(byTag(parseEntries(FIXTURE), 'chatZ')).toEqual([])
   expect(renderTranscript([])).toBe('(no recalled messages for this tag)')
 })
 
@@ -206,20 +211,33 @@ test('renderThoughtLog leaves a short entry whole (run_id header, no truncation 
   expect(renderThoughtLog([e])).toBe('[run-y · chatA · org] thought: short\n  ↳ you: gm')
 })
 
-test('pageRecent pages from the newest end + pageMeta reports total/has_more/next_offset', () => {
-  const items = Array.from({ length: 10 }, (_, i) => i) // 0..9 chronological (9 = newest)
-  const p0 = pageRecent(items, 3, 0) // newest 3
-  expect(p0.items).toEqual([7, 8, 9])
-  expect(p0.total).toBe(10)
-  const meta0 = pageMeta(p0.total, 0, 3, p0.items.length)
-  expect(meta0.has_more).toBe(true)
-  expect(meta0.next_offset).toBe(3)
-  const p1 = pageRecent(items, 3, 3) // next page back
-  expect(p1.items).toEqual([4, 5, 6])
-  // Last page → no more.
-  const last = pageRecent(items, 3, 9)
-  expect(last.items).toEqual([0])
-  expect(pageMeta(last.total, 9, 3, last.items.length).has_more).toBe(false)
+test('cursorPage is THREAD-SAFE: a concurrent append between pages causes no dup/skip', () => {
+  const mk = (i: number): any => ({
+    date: 'd', runId: `r${i}`, state: 'perceive', timestamp: i,
+    tags: ['c'], trust: 'self', thought: `t${i}`, incoming: [], sent: [],
+  })
+  const items = [mk(0), mk(1), mk(2), mk(3)] // chronological, newest last (r3)
+  const p1 = cursorPage(items, 2) // newest 2
+  expect(p1.items.map((e) => e.runId)).toEqual(['r2', 'r3'])
+  expect(p1.total).toBe(4)
+  expect(p1.has_more).toBe(true)
+  // Another thread APPENDS a new entry at the newest end before we fetch page 2.
+  items.push(mk(4))
+  const p2 = cursorPage(items, 2, p1.cursor!)
+  // Page 2 = the entries OLDER than the cursor — unaffected by the append (no r4, no dup of r2/r3).
+  expect(p2.items.map((e) => e.runId)).toEqual(['r0', 'r1'])
+  expect(p2.has_more).toBe(false)
+  expect(p2.cursor).toBeNull()
+})
+
+test('cursorPage: an aged-out cursor falls back to the newest page (not an error); bad cursor decodes null', () => {
+  const mk = (i: number): any => ({ date: 'd', runId: `r${i}`, state: 'p', timestamp: i, tags: ['c'], trust: 'self', thought: '', incoming: [], sent: [] })
+  const items = [mk(1), mk(2)]
+  // A cursor for a run_id no longer in the window → newest page.
+  const p = cursorPage(items, 5, Buffer.from(JSON.stringify({ r: 'gone' })).toString('base64'))
+  expect(p.items.map((e) => e.runId)).toEqual(['r1', 'r2'])
+  expect(decodeCursor('not-base64-{')).toBeNull()
+  expect(decodeCursor(undefined)).toBeNull()
 })
 
 test('renderEntryFull: self view omits raw incoming; public view includes it', () => {

@@ -125,6 +125,13 @@ pub struct DailyFileRunLog {
     pub repo: std::sync::Arc<dyn RepoHost>,
     /// DID the runlog commits are attributed to (the Soul — the whole bundle is the duck's).
     pub author_did: String,
+    /// Serializes every MUTATING op (append / append_tag_note / prune) so concurrent cycles can't
+    /// race the read-modify-write of a runlog file or the runlog-repo `git commit`. Each op is
+    /// read→render→write→commit as ONE critical section. Single-flight today → uncontended; this is
+    /// what makes the runlog safe once cycles run on multiple threads (every cycle, incl. read-only
+    /// Perceive, writes a runlog entry, so parallel chats WOULD call this concurrently). The held
+    /// region is just the brief file+commit, never the model call — parallelism of the work is kept.
+    write_lock: tokio::sync::Mutex<()>,
 }
 
 impl DailyFileRunLog {
@@ -132,6 +139,7 @@ impl DailyFileRunLog {
         Self {
             repo,
             author_did: author_did.into(),
+            write_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -203,6 +211,8 @@ impl DailyFileRunLog {
 #[async_trait]
 impl RunLogWriter for DailyFileRunLog {
     async fn append(&self, entry: &RunLogEntry) -> Result<String> {
+        // One writer at a time: the read-modify-write below + the commit are one critical section.
+        let _guard = self.write_lock.lock().await;
         let date = Self::today();
         // `self.repo` is the RUNLOG repo, rooted at `<soul>/runlogs/` — so the file is `<date>.md`
         // (no `runlogs/` prefix). The returned `runlog_ref` stays SOUL-relative (`runlogs/<date>.md#…`)
@@ -255,6 +265,8 @@ impl RunLogWriter for DailyFileRunLog {
         timestamp: i64,
         max: usize,
     ) -> Result<()> {
+        // Same critical section as `append`: serialize the RMW + commit of `tag-notes.ndjson`.
+        let _guard = self.write_lock.lock().await;
         let path = RepoPath("tag-notes.ndjson".into());
         let existing =
             String::from_utf8_lossy(&self.repo.read_file(&path).await.unwrap_or_default()).into_owned();
@@ -288,6 +300,8 @@ impl RunLogWriter for DailyFileRunLog {
         if keep_days == 0 {
             return Ok(0); // 0 = retention disabled (keep everything).
         }
+        // Hold the writer lock: deleting + committing day-files must not interleave with an append.
+        let _guard = self.write_lock.lock().await;
         // The runlog repo is rooted AT `<soul>/runlogs/`, so list its root for `<date>.md` files.
         let entries = self.repo.list_dir(&RepoPath(String::new()), 1).await.unwrap_or_default();
         let mut days: Vec<String> = entries
@@ -400,6 +414,49 @@ mod tests {
             outcome: Outcome::Ok,
             timestamp: 1000,
             tags: vec![],
+        }
+    }
+
+    /// The multithreading guarantee: N cycles appending CONCURRENTLY (as parallel chats would) must
+    /// not lose any entry. Without `write_lock` the read-modify-write races (both read the same file,
+    /// both append, the second clobbers the first → lost update); the mutex serializes them. Run on a
+    /// multi-thread runtime so the appends genuinely contend.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_appends_do_not_lose_entries() {
+        use crate::repo::git::PlainGitRepo;
+        use tokio::process::Command;
+
+        let dir = std::env::temp_dir().join(format!("dack-concurrent-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.name", "s"],
+            vec!["config", "user.email", "s@d"],
+        ] {
+            Command::new("git").arg("-C").arg(&dir).args(&args).output().await.unwrap();
+        }
+        let log = std::sync::Arc::new(DailyFileRunLog::new(
+            std::sync::Arc::new(PlainGitRepo::new(&dir, "did:dack:soul")),
+            "did:dack:soul",
+        ));
+
+        const N: usize = 24;
+        let tasks: Vec<_> = (0..N)
+            .map(|i| {
+                let log = log.clone();
+                tokio::spawn(async move { log.append(&entry(&format!("run-c{i}-perceive"))).await.unwrap() })
+            })
+            .collect();
+        for t in tasks {
+            t.await.unwrap();
+        }
+
+        // Every run_id present exactly once → no lost update, no duplication.
+        let tail = log.tail(10_000).await.unwrap();
+        for i in 0..N {
+            let id = format!("run-c{i}-perceive");
+            assert_eq!(tail.matches(&id).count(), 1, "entry `{id}` lost or duplicated");
         }
     }
 

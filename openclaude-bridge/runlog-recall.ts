@@ -135,14 +135,6 @@ export function renderTranscript(entries: Entry[], opts: { maxMsg?: number } = {
   return lines.join('\n')
 }
 
-/** Filter to a tag, then page from the MOST RECENT end: offset skips the newest, limit caps. */
-export function pageByTag(entries: Entry[], tag: string, limit: number, offset: number): Entry[] {
-  const matched = entries.filter((e) => e.tags.includes(tag))
-  const end = matched.length - offset
-  const start = Math.max(0, end - limit)
-  return end > 0 ? matched.slice(start, end) : []
-}
-
 /** Distinct tags newest-first, each with who's been seen under it — to find a tag for `recall_by_tag`. */
 export function listRecentTags(entries: Entry[], limit: number): { tag: string; last_seen: number; users: string[] }[] {
   const byTag = new Map<string, { lastSeen: number; users: Set<string> }>()
@@ -292,28 +284,58 @@ export function renderThoughtLog(
 
 /** Pagination metadata the model navigates by — explicit so it never has to do offset arithmetic or
  * guess whether it has seen everything. `next_offset` is null when the list is exhausted. */
-export interface PageMeta {
-  total: number
-  offset: number
-  limit: number
-  returned: number
-  has_more: boolean
-  next_offset: number | null
+/** An opaque pagination cursor = the run_id of the OLDEST entry the model has seen so far. KEYSET
+ * pagination on this stable id (not a numeric offset) is what makes a paged read THREAD-SAFE: new
+ * entries always append at the NEWEST end, so they can never shift the boundary between a cursor and
+ * the older entries — no page can dup or skip an entry because another thread wrote mid-scroll. */
+export function encodeCursor(runId: string): string {
+  return Buffer.from(JSON.stringify({ r: runId })).toString('base64')
 }
-export function pageMeta(total: number, offset: number, limit: number, returned: number): PageMeta {
-  const next = offset + returned
-  const has_more = next < total
-  return { total, offset, limit, returned, has_more, next_offset: has_more ? next : null }
+export function decodeCursor(cursor?: string): string | null {
+  if (!cursor) return null
+  try {
+    const o = JSON.parse(Buffer.from(cursor, 'base64').toString('utf8'))
+    return typeof o?.r === 'string' ? o.r : null
+  } catch {
+    return null
+  }
 }
 
-/** Page a chronological (newest-last) list from the MOST RECENT end — `offset` skips the newest,
- * `limit` caps — returning the slice still in chronological order plus the total (for `pageMeta`).
- * Same semantics as `pageByTag`, so every recall tool pages identically. */
-export function pageRecent<T>(items: T[], limit: number, offset: number): { items: T[]; total: number } {
-  const total = items.length
-  const end = total - Math.max(0, offset)
-  const start = Math.max(0, end - limit)
-  return { items: end > 0 ? items.slice(start, end) : [], total }
+export interface CursorPage<T> {
+  items: T[]
+  total: number
+  returned: number
+  has_more: boolean
+  /** Pass back to fetch the next (OLDER) page; null when the start of the window is reached. */
+  cursor: string | null
+}
+
+/** Keyset-page a chronological (newest-last) list, NEWEST first: the first call (no cursor) returns
+ * the newest `limit`; a `cursor` returns the `limit` entries strictly OLDER than that run_id. Stable
+ * under concurrent appends. If the cursor entry has aged out of the window, falls back to the newest
+ * page (rather than erroring). The returned page stays in chronological order (newest last). */
+export function cursorPage<T extends { runId: string }>(
+  items: T[],
+  limit: number,
+  cursor?: string,
+): CursorPage<T> {
+  const lim = Math.max(1, limit)
+  let end = items.length // exclusive upper bound; default = the newest end
+  const after = decodeCursor(cursor)
+  if (after) {
+    const idx = items.findIndex((e) => e.runId === after)
+    if (idx >= 0) end = idx // entries STRICTLY older than the cursor entry
+  }
+  const start = Math.max(0, end - lim)
+  const page = items.slice(start, end)
+  const has_more = start > 0
+  return {
+    items: page,
+    total: items.length,
+    returned: page.length,
+    has_more,
+    cursor: has_more && page.length ? encodeCursor(page[0].runId) : null,
+  }
 }
 
 /** Find ONE entry by its `run_id` across the last `days` of runlog — the target of `read_entry`. */

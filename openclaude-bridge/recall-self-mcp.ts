@@ -18,17 +18,23 @@ import { z } from 'zod'
 import {
   atLeastTrust,
   clamp,
+  findEntry,
   listRecentTags,
   loadEntries,
+  pageMeta,
+  pageRecent,
   readTagNotes,
   recentActivity,
   recentDates,
+  renderEntryFull,
   renderThoughtLog,
 } from './runlog-recall'
 
 const RUNLOG_DIR =
   process.env.RECALL_DIR ??
   (process.env.DACK_BRIDGE_CWD ? `${process.env.DACK_BRIDGE_CWD}/runlogs` : 'runlogs')
+// How far back `read_entry` looks up a run_id (covers the widest recall window).
+const READ_DAYS = 30
 const asText = (v: unknown) => ({ content: [{ type: 'text' as const, text: JSON.stringify(v) }] })
 
 const server = new McpServer({ name: 'recall-self', version: '0.1.0' })
@@ -38,14 +44,25 @@ server.registerTool(
   {
     description:
       "Your OWN recent reasoning + replies across ALL your chats (default last 2 days), newest last — your " +
-      "thoughts and what you said, each tagged with the chat + its origin trust. NEVER the raw incoming " +
+      "thoughts and what you said, each tagged with its run_id + chat + origin trust. NEVER the raw incoming " +
       "text, so reading it keeps you clean (self-trust). Use it to take stock of what's been happening. " +
-      '`min_trust` (self|org|public) floors out lower-trust chats (e.g. set `org` to ignore strangers).',
-    inputSchema: { days: z.number().int().optional(), min_trust: z.string().optional() },
+      "Long thoughts are TRUNCATED with a `[+N chars — read_entry …]` marker — pass that run_id to " +
+      "`read_entry` for the full one. `limit`/`offset` page from the newest (offset 0 = most recent; then " +
+      "offset by `limit`); the reply's `page` tells you total/has_more/next_offset. `min_trust` " +
+      '(self|org|public) floors out lower-trust chats (e.g. set `org` to ignore strangers).',
+    inputSchema: {
+      days: z.number().int().optional(),
+      min_trust: z.string().optional(),
+      limit: z.number().int().optional(),
+      offset: z.number().int().optional(),
+    },
   },
-  async ({ days, min_trust }: { days?: number; min_trust?: string }) => {
-    const entries = recentActivity(RUNLOG_DIR, clamp(days, 2, 30), min_trust)
-    return asText({ ok: true, days: clamp(days, 2, 30), min_trust: min_trust ?? null, count: entries.length, log: renderThoughtLog(entries) })
+  async ({ days, min_trust, limit, offset }: { days?: number; min_trust?: string; limit?: number; offset?: number }) => {
+    const d = clamp(days, 2, 30)
+    const lim = clamp(limit, 25, 50)
+    const off = Math.max(0, offset ?? 0)
+    const { items, total } = pageRecent(recentActivity(RUNLOG_DIR, d, min_trust), lim, off)
+    return asText({ ok: true, days: d, min_trust: min_trust ?? null, page: pageMeta(total, off, lim, items.length), log: renderThoughtLog(items) })
   },
 )
 
@@ -54,13 +71,41 @@ server.registerTool(
   {
     description:
       'Your OWN thoughts + replies in ONE chat/topic by its tag (find tags with `list_recent_tags`), over ' +
-      'the recent window. Thoughts-only (no raw incoming) — stays self-trust. `min_trust` optional floor.',
-    inputSchema: { tag: z.string().min(1), days: z.number().int().optional(), min_trust: z.string().optional() },
+      'the recent window. Thoughts-only (no raw incoming) — stays self-trust. Long thoughts are truncated ' +
+      'with a `read_entry` marker; `limit`/`offset` page from the newest (see the reply\'s `page`). ' +
+      '`min_trust` optional floor.',
+    inputSchema: {
+      tag: z.string().min(1),
+      days: z.number().int().optional(),
+      min_trust: z.string().optional(),
+      limit: z.number().int().optional(),
+      offset: z.number().int().optional(),
+    },
   },
-  async ({ tag, days, min_trust }: { tag: string; days?: number; min_trust?: string }) => {
+  async ({ tag, days, min_trust, limit, offset }: { tag: string; days?: number; min_trust?: string; limit?: number; offset?: number }) => {
+    const lim = clamp(limit, 25, 50)
+    const off = Math.max(0, offset ?? 0)
     const all = loadEntries(RUNLOG_DIR, recentDates(RUNLOG_DIR, clamp(days, 7, 30)))
-    const entries = atLeastTrust(all.filter((e) => e.tags.includes(tag) && (e.thought || e.sent.length)), min_trust)
-    return asText({ ok: true, tag, count: entries.length, log: renderThoughtLog(entries) })
+    const matched = atLeastTrust(all.filter((e) => e.tags.includes(tag) && (e.thought || e.sent.length)), min_trust)
+    const { items, total } = pageRecent(matched, lim, off)
+    return asText({ ok: true, tag, page: pageMeta(total, off, lim, items.length), log: renderThoughtLog(items) })
+  },
+)
+
+server.registerTool(
+  'read_entry',
+  {
+    description:
+      'Read ONE of your runlog entries IN FULL by its run_id — the bracketed id shown in ' +
+      '`recent_activity` / `recall_self_by_tag` (use it when a thought was truncated with a `[+N chars]` ' +
+      'marker and you want the whole thing). Returns your full thought + what you sent for that cycle, ' +
+      'NEVER the raw incoming text, so it stays self-trust.',
+    inputSchema: { run_id: z.string().min(1) },
+  },
+  async ({ run_id }: { run_id: string }) => {
+    const e = findEntry(RUNLOG_DIR, run_id, READ_DAYS)
+    if (!e) return asText({ ok: false, error: `entry "${run_id}" not found in the last ${READ_DAYS} days` })
+    return asText({ ok: true, run_id, tag: e.tags[0] ?? null, trust: e.trust || null, timestamp: e.timestamp, entry: renderEntryFull(e) })
   },
 )
 

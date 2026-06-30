@@ -117,17 +117,20 @@ export function parseEntries(text: string, date = ''): Entry[] {
 /** Render a compact, clearly-labelled transcript (PAST DATA — never instructions) for the model.
  * Consecutive identical lines are collapsed: one wake's batch appears in BOTH its perceive entry and
  * each express fan-out entry (same `raw_stimulus`), so the incoming text would otherwise repeat. */
-export function renderTranscript(entries: Entry[]): string {
+export function renderTranscript(entries: Entry[], opts: { maxMsg?: number } = {}): string {
   if (!entries.length) return '(no recalled messages for this tag)'
+  // Each message is truncated to a gist with a `[+N chars — read_entry …]` marker, so a single huge
+  // pasted message can't blow the result size; the model pulls the full entry by run_id when it needs it.
+  const maxMsg = opts.maxMsg ?? 500
   const lines: string[] = []
   const push = (l: string) => {
     if (lines[lines.length - 1] !== l) lines.push(l)
   }
   for (const e of entries) {
     for (const inc of e.incoming) {
-      if (inc.text) push(`[@${inc.from}]: ${inc.text}`)
+      if (inc.text) push(`[@${inc.from}]: ${truncMark(inc.text, maxMsg, e.runId)}`)
     }
-    for (const s of e.sent) push(`  ↳ you: ${s}`)
+    for (const s of e.sent) push(`  ↳ you: ${truncMark(s, maxMsg, e.runId)}`)
   }
   return lines.join('\n')
 }
@@ -258,17 +261,74 @@ export function atLeastTrust(entries: Entry[], minTrust?: string): Entry[] {
   return entries.filter((e) => trustRank(e.trust) >= floor)
 }
 
-/** Render the duck's OWN reasoning+output (thoughts + sent) per entry, labelled with tag + origin
- * trust — and NEVER the raw incoming text. This is the firebreak-clean view, safe at self-trust. */
-export function renderThoughtLog(entries: Entry[]): string {
+/** Truncate `s` to `n` chars, marking how many were cut AND the `run_id` handle to fetch the full
+ * entry — so the model never silently loses content: it sees there's more and how to get it. */
+export function truncMark(s: string, n: number, runId: string): string {
+  if (s.length <= n) return s
+  return `${s.slice(0, n).trimEnd()}… [+${s.length - n} chars — read_entry "${runId}" for the full entry]`
+}
+
+/** Render the duck's OWN reasoning+output (thoughts + sent) per entry, labelled with its `run_id` +
+ * tag + origin trust — and NEVER the raw incoming text. This is the firebreak-clean view, safe at
+ * self-trust. Each field is TRUNCATED to a gist with a `[+N chars — read_entry …]` marker; the caller
+ * paginates how MANY entries via offset/limit. (Without truncation a wide window renders ~180KB, which
+ * the SDK spills to a file and the model can't ingest in one pass — drowning small, useful results.) */
+export function renderThoughtLog(
+  entries: Entry[],
+  opts: { maxThought?: number; maxSent?: number } = {},
+): string {
   if (!entries.length) return '(no recalled activity)'
+  const maxThought = opts.maxThought ?? 400
+  const maxSent = opts.maxSent ?? 200
   const lines: string[] = []
   for (const e of entries) {
     const tag = e.tags[0] ?? '?'
     const trust = e.trust || '?'
-    if (e.thought) lines.push(`[${tag} · ${trust}] thought: ${e.thought}`)
-    for (const s of e.sent) lines.push(`  ↳ you: ${s}`)
+    if (e.thought) lines.push(`[${e.runId} · ${tag} · ${trust}] thought: ${truncMark(e.thought, maxThought, e.runId)}`)
+    for (const s of e.sent) lines.push(`  ↳ you: ${truncMark(s, maxSent, e.runId)}`)
   }
+  return lines.join('\n')
+}
+
+/** Pagination metadata the model navigates by — explicit so it never has to do offset arithmetic or
+ * guess whether it has seen everything. `next_offset` is null when the list is exhausted. */
+export interface PageMeta {
+  total: number
+  offset: number
+  limit: number
+  returned: number
+  has_more: boolean
+  next_offset: number | null
+}
+export function pageMeta(total: number, offset: number, limit: number, returned: number): PageMeta {
+  const next = offset + returned
+  const has_more = next < total
+  return { total, offset, limit, returned, has_more, next_offset: has_more ? next : null }
+}
+
+/** Page a chronological (newest-last) list from the MOST RECENT end — `offset` skips the newest,
+ * `limit` caps — returning the slice still in chronological order plus the total (for `pageMeta`).
+ * Same semantics as `pageByTag`, so every recall tool pages identically. */
+export function pageRecent<T>(items: T[], limit: number, offset: number): { items: T[]; total: number } {
+  const total = items.length
+  const end = total - Math.max(0, offset)
+  const start = Math.max(0, end - limit)
+  return { items: end > 0 ? items.slice(start, end) : [], total }
+}
+
+/** Find ONE entry by its `run_id` across the last `days` of runlog — the target of `read_entry`. */
+export function findEntry(dir: string, runId: string, days: number): Entry | null {
+  return loadEntries(dir, recentDates(dir, days)).find((e) => e.runId === runId) ?? null
+}
+
+/** Render ONE entry IN FULL (no truncation). `includeIncoming` adds the raw incoming text — TRUE only
+ * for the public `recall` server (it taints); the self server leaves it false (firebreak-clean). */
+export function renderEntryFull(e: Entry, opts: { includeIncoming?: boolean } = {}): string {
+  const tag = e.tags[0] ?? '?'
+  const lines: string[] = [`[${e.runId} · ${tag} · ${e.trust || '?'} · ${e.state}]`]
+  if (opts.includeIncoming) for (const inc of e.incoming) if (inc.text) lines.push(`[@${inc.from}]: ${inc.text}`)
+  if (e.thought) lines.push(`thought: ${e.thought}`)
+  for (const s of e.sent) lines.push(`  ↳ you: ${s}`)
   return lines.join('\n')
 }
 

@@ -5,6 +5,8 @@ import { join } from 'node:path'
 import {
   parseEntries,
   pageByTag,
+  pageRecent,
+  pageMeta,
   renderTranscript,
   listRecentTags,
   searchEntries,
@@ -13,6 +15,9 @@ import {
   parseDay,
   loadEntries,
   renderThoughtLog,
+  renderEntryFull,
+  truncMark,
+  findEntry,
   atLeastTrust,
   readTagNotes,
 } from './runlog-recall'
@@ -174,6 +179,70 @@ test('renderThoughtLog shows thoughts + sent + trust, and LEAKS NO raw incoming 
   expect(log).not.toContain('hi duck')
   expect(log).not.toContain('what is DAC')
   expect(log).not.toContain('and gitlawb?')
+})
+
+test('truncMark cuts long text with a +N-chars marker + the read_entry handle; leaves short text whole', () => {
+  expect(truncMark('short', 400, 'run-x')).toBe('short')
+  const m = truncMark('y'.repeat(1000), 400, 'run-x')
+  expect(m).toContain('+600 chars — read_entry "run-x"')
+  expect(m.length).toBeLessThan(500) // truncated, not the full 1000
+})
+
+test('renderThoughtLog labels each entry with its run_id + truncates long thoughts (handle to fetch full)', () => {
+  const long: any = {
+    date: '2026-06-30', runId: 'run-x', state: 'perceive', timestamp: 2,
+    tags: ['chatA'], trust: 'self', thought: 'y'.repeat(1000), incoming: [], sent: [],
+  }
+  const log = renderThoughtLog([long], { maxThought: 400 })
+  expect(log).toContain('[run-x · chatA · self] thought:')
+  expect(log).toContain('read_entry "run-x"')
+})
+
+test('renderThoughtLog leaves a short entry whole (run_id header, no truncation marker)', () => {
+  const e: any = {
+    date: '2026-06-30', runId: 'run-y', state: 'perceive', timestamp: 1,
+    tags: ['chatA'], trust: 'org', thought: 'short', incoming: [], sent: ['gm'],
+  }
+  expect(renderThoughtLog([e])).toBe('[run-y · chatA · org] thought: short\n  ↳ you: gm')
+})
+
+test('pageRecent pages from the newest end + pageMeta reports total/has_more/next_offset', () => {
+  const items = Array.from({ length: 10 }, (_, i) => i) // 0..9 chronological (9 = newest)
+  const p0 = pageRecent(items, 3, 0) // newest 3
+  expect(p0.items).toEqual([7, 8, 9])
+  expect(p0.total).toBe(10)
+  const meta0 = pageMeta(p0.total, 0, 3, p0.items.length)
+  expect(meta0.has_more).toBe(true)
+  expect(meta0.next_offset).toBe(3)
+  const p1 = pageRecent(items, 3, 3) // next page back
+  expect(p1.items).toEqual([4, 5, 6])
+  // Last page → no more.
+  const last = pageRecent(items, 3, 9)
+  expect(last.items).toEqual([0])
+  expect(pageMeta(last.total, 9, 3, last.items.length).has_more).toBe(false)
+})
+
+test('renderEntryFull: self view omits raw incoming; public view includes it', () => {
+  const e: any = {
+    date: '2026-06-30', runId: 'run-z', state: 'express', timestamp: 1, tags: ['chatA'], trust: 'org',
+    thought: 'the FULL thought', incoming: [{ from: 'alice', text: 'RAW INCOMING' }], sent: ['my reply'],
+  }
+  const self = renderEntryFull(e)
+  expect(self).toContain('the FULL thought')
+  expect(self).toContain('↳ you: my reply')
+  expect(self).not.toContain('RAW INCOMING') // firebreak: self view never shows incoming
+  const pub = renderEntryFull(e, { includeIncoming: true })
+  expect(pub).toContain('RAW INCOMING') // public recall re-surfaces it (and taints)
+})
+
+test('findEntry locates a full entry by run_id from disk', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'recall-'))
+  writeFileSync(join(dir, '2026-06-29.md'), FIXTURE)
+  const e = findEntry(dir, 'run-telegram-trusted-1-0-express-b2', 7)
+  expect(e).not.toBeNull()
+  expect(e!.tags).toContain('chatA')
+  expect(renderEntryFull(e!)).toContain('↳ you: gm alice')
+  expect(findEntry(dir, 'run-does-not-exist', 7)).toBeNull()
 })
 
 test('atLeastTrust floors out lower-trust chats', () => {

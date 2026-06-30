@@ -66,24 +66,30 @@ export function extractJsonObjects(s: string): any[] {
 }
 
 /**
- * Extract the `AgentOutput` from the model's final text (tolerant of fences / prose / multi-object).
- * `log` receives any loud diagnostics (the bridge passes `console.error`; tests capture them).
+ * Extract the `AgentOutput` from the model's final text (tolerant of fences / prose / multi-object),
+ * AND report whether a JSON object was actually found. `ok: false` ONLY on a genuine PARSE-FAIL (the
+ * model emitted prose, not the contract) — a valid stop (`{"batons":[]}`) parses fine and is
+ * `ok: true`. The bridge uses `ok` to decide whether to re-prompt for the JSON. `log` receives any
+ * loud diagnostics (the bridge passes `console.error`; tests capture them).
  */
-export function parseOutput(text: string, log: (m: string) => void = () => {}): unknown {
+export function tryParseOutput(
+  text: string,
+  log: (m: string) => void = () => {},
+): { ok: boolean; output: unknown } {
   let t = text.trim()
   const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/i)
   if (fence && fence[1]) t = fence[1].trim()
 
   // Fast path: a single clean object (the normal case — behaviour unchanged).
   try {
-    return normalize(JSON.parse(t), text)
+    return { ok: true, output: normalize(JSON.parse(t), text) }
   } catch {
     /* fall through to the robust scan */
   }
 
   // Robust path: every top-level object the model emitted.
   const objs = extractJsonObjects(t)
-  if (objs.length === 1) return normalize(objs[0], text)
+  if (objs.length === 1) return { ok: true, output: normalize(objs[0], text) }
   if (objs.length > 1) {
     // Merge later-wins for scalar fields (thought/transition/spawn), but CONCATENATE the `batons`
     // arrays across objects — the model sometimes splits its fan-out across several JSON objects, and
@@ -95,7 +101,7 @@ export function parseOutput(text: string, log: (m: string) => void = () => {}): 
       `[bridge:parse] multi-object output: ${objs.length} JSON objects — merged ` +
         `(${allBatons.length} batons concatenated)`,
     )
-    return normalize(merged, text)
+    return { ok: true, output: normalize(merged, text) }
   }
 
   // Nothing parseable: keep the raw text in `thought` and terminate — but LOUD, never silent.
@@ -103,5 +109,10 @@ export function parseOutput(text: string, log: (m: string) => void = () => {}): 
     `[bridge:parse] PARSE-FAIL: no parseable JSON object in the model's ${text.length}-char final ` +
       `message — cycle terminates (to_prompt=null); raw kept in thought`,
   )
-  return normalize(null, text)
+  return { ok: false, output: normalize(null, text) }
+}
+
+/** Backward-compatible wrapper: just the normalized output (callers that don't need the parse status). */
+export function parseOutput(text: string, log: (m: string) => void = () => {}): unknown {
+  return tryParseOutput(text, log).output
 }

@@ -1,5 +1,5 @@
 import { test, expect } from 'bun:test'
-import { parseOutput, extractJsonObjects } from './parse'
+import { parseOutput, tryParseOutput, extractJsonObjects } from './parse'
 
 test('single clean object parses unchanged (the normal path)', () => {
   const out: any = parseOutput('{"thought":"t","transition":{"to_prompt":"express","reason":""}}')
@@ -64,4 +64,34 @@ test('total garbage logs loudly and terminates (to_prompt null), never silently'
   expect(out.transition.to_prompt).toBe(null)
   expect(out.thought).toContain('rambled')
   expect(logs.join(' ')).toContain('PARSE-FAIL')
+})
+
+// --- the parse-status signal that gates PARSE-FAIL recovery (the bridge only re-prompts on ok:false) ---
+
+test('tryParseOutput: prose with no JSON → ok:false (triggers recovery)', () => {
+  const r = tryParseOutput('Good piece. Honest take: the holacracy framing is clean...')
+  expect(r.ok).toBe(false)
+  expect((r.output as any).thought).toContain('Good piece')
+})
+
+test('tryParseOutput: a valid empty-baton STOP → ok:true (must NOT trigger recovery)', () => {
+  // The model deliberately chose to stop. This is valid JSON — re-prompting it would be wrong.
+  const r = tryParseOutput('{"thought":"nothing to do","batons":[]}')
+  expect(r.ok).toBe(true)
+  expect((r.output as any).batons).toEqual([])
+})
+
+test('tryParseOutput: a normal single object → ok:true', () => {
+  const r = tryParseOutput('{"thought":"t","batons":[{"to_prompt":"telegram/express","gist":"g"}]}')
+  expect(r.ok).toBe(true)
+})
+
+test('tryParseOutput: multi-object (recovered) → ok:true (no further recovery needed)', () => {
+  const r = tryParseOutput('{"thought":"a"}\n{"thought":"b","transition":{"to_prompt":"express"}}')
+  expect(r.ok).toBe(true)
+})
+
+test('tryParseOutput: fenced JSON → ok:true', () => {
+  const r = tryParseOutput('```json\n{"thought":"f","batons":[]}\n```')
+  expect(r.ok).toBe(true)
 })

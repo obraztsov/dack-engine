@@ -22,7 +22,7 @@
  */
 
 import * as readline from 'node:readline'
-import { parseOutput } from './parse'
+import { tryParseOutput } from './parse'
 
 // The SDK snapshots process.cwd() at MODULE-INIT and uses it for ALL tool/file path resolution
 // (getCwd → pwd → STATE.cwd; options.cwd is NOT honored on the programmatic query() path). So a
@@ -64,6 +64,17 @@ const OUTPUT_INSTRUCTION =
   'stop. Each "to_prompt" must be one of the ids in your allowed-transitions context block. Set ' +
   '"spawn" to delegate a job to a worker (only if your orientation lists it as available; the worker ' +
   'runs detached and returns later), else null. Output nothing after the JSON.'
+
+// PARSE-FAIL recovery: how many times to re-prompt for the JSON when the model emits prose instead.
+// Bounded here AND by the harness's `invoke_timeout_secs` (the whole round-trip shares that budget).
+const MAX_PARSE_RETRIES = 2
+// The recovery turn's prompt. It runs in the SAME session with EVERY tool denied (see runInvoke), so
+// it physically cannot re-fire an action the failed turn may have already taken — it can only emit text.
+const RETRY_PROMPT =
+  'Your previous message was not the required JSON object, so it could not be processed. Do NOT call ' +
+  'any tool or take any further action — anything you intended is already done or no longer needed. ' +
+  'Reply with ONLY the single JSON object (no prose, no markdown fence) describing your decision, in ' +
+  'the shape you were given. If nothing further is needed, return it with "batons": [].'
 
 const pending = new Map<string, (d: { allow: boolean; message?: string }) => void>()
 let started = false
@@ -135,10 +146,51 @@ async function runInvoke(inv: any) {
   // Sub-agent defs the worker may Task-spawn. Empty for the duck's states.
   if (inv.agents && typeof inv.agents === 'object' && Object.keys(inv.agents).length) options.agents = inv.agents
 
+  // First pass: the real invocation — tools live, the wall (canUseTool → Rust) gating every call.
+  let { finalText, sessionId, usage } = await runQuery(inv.user_prompt, options, inv.model)
+  let parsed = tryParseOutput(finalText, console.error)
+
+  // Bounded PARSE-FAIL recovery: ONLY when the model emitted prose instead of the closing JSON
+  // (`ok: false` — a valid `{"batons":[]}` stop parses fine and is skipped). Re-prompt IN THE SAME
+  // SESSION for just the JSON, with EVERY tool denied, so a recovery turn can never re-fire an action
+  // the first turn may have already taken (no duplicate post/reply/trade). Bounded by MAX_PARSE_RETRIES
+  // and, overall, by the harness's invoke timeout.
+  let attempt = 0
+  while (!parsed.ok && attempt < MAX_PARSE_RETRIES && sessionId) {
+    attempt++
+    console.error(
+      `[bridge:parse] PARSE-FAIL recovery ${attempt}/${MAX_PARSE_RETRIES}: re-prompting for JSON only (all tools denied)`,
+    )
+    const retryOptions: any = {
+      ...options,
+      resume: sessionId,
+      // No capability servers for a text-only turn — nothing to reconnect.
+      mcpServers: undefined,
+      // Hard firewall: deny EVERY tool on the recovery turn → it can only produce text, never an action.
+      canUseTool: async () => ({ behavior: 'deny', message: 'recovery turn: no tools — reply with ONLY the JSON.' }),
+    }
+    const r = await runQuery(RETRY_PROMPT, retryOptions, inv.model)
+    if (r.sessionId) sessionId = r.sessionId
+    if (r.usage) usage = r.usage
+    finalText = r.finalText
+    parsed = tryParseOutput(finalText, console.error)
+  }
+
+  // `usage` (the resumed-context token counts) rides the result so the harness can size-evict a session.
+  emit({ kind: 'result', output: parsed.output, session_id: sessionId, usage })
+  process.exit(0)
+}
+
+/** Drive one model turn to completion: accumulate its final text, session id, and usage. */
+async function runQuery(
+  prompt: string,
+  options: any,
+  model: string | null,
+): Promise<{ finalText: string; sessionId: string | null; usage: any }> {
   let finalText = ''
   let sessionId: string | null = null
   let usage: any = null
-  for await (const m of query({ prompt: inv.user_prompt, options }) as AsyncIterable<any>) {
+  for await (const m of query({ prompt, options }) as AsyncIterable<any>) {
     // Capture the engine session id (carried on the SDK messages) → returned for sticky resume.
     if (m?.session_id) sessionId = m.session_id
     // Concise capability connection status (NOT the tool list — keep it grep-safe): an operator
@@ -151,11 +203,14 @@ async function runInvoke(inv: any) {
     } else if (m?.type === 'result') {
       if (m?.result) finalText ||= m.result
       usage = m.usage ?? m.modelUsage ?? null
-      // Cost telemetry → stderr (inherited by the harness log). Per-invocation = per-state.
+      // Cost telemetry → stderr (inherited by the harness log). Per-invocation = per-state. `subtype`
+      // tells us WHY a turn ended (end_turn vs an interrupt vs max-turns) — the signal for diagnosing
+      // a model that calls a tool then skips the closing JSON.
       console.error(
         '[bridge:usage]',
         JSON.stringify({
-          model: inv.model ?? null,
+          model: model ?? null,
+          subtype: m.subtype ?? null,
           usage,
           cost_usd: m.total_cost_usd ?? null,
           duration_ms: m.duration_ms ?? null,
@@ -164,8 +219,5 @@ async function runInvoke(inv: any) {
       )
     }
   }
-
-  // `usage` (the resumed-context token counts) rides the result so the harness can size-evict a session.
-  emit({ kind: 'result', output: parseOutput(finalText, console.error), session_id: sessionId, usage })
-  process.exit(0)
+  return { finalText, sessionId, usage }
 }

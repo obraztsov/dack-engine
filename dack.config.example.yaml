@@ -64,10 +64,15 @@ mcp_servers:
   #   scope_env: { TELEGRAM_REPLY_CHAT: chat_id, TELEGRAM_REPLY_TO: message_id }
   # - name: cove-read                             # read subset of a wallet API (own data → trust:self)
   #   transport: { type: http, url: "https://your-wallet/api/mcp" }
-  #   auth: { secret: cove_read }
+  #   auth: { secret: cove_read }                 #   → Authorization: Bearer <tok> (the default)
   #   tier: read
   #   trust: self
   #   tools: [get_balance, get_positions, simulate_swap]
+  # - name: memclaw                               # an HTTP server with a NON-STANDARD auth header
+  #   transport: { type: http, url: "https://memclaw.net/mcp" }
+  #   auth: { secret: memclaw, header: X-API-Key } #   → X-API-Key: <tok> (custom header ⇒ raw, no "Bearer ")
+  #   tier: read                                  #   set scheme: "Token"/"" to override the prefix
+  #   trust: public
 
 # The operator half of the capability handshake: a state-prompt requests a server in its `mcp:`
 # frontmatter; it's admitted only if listed here. mcp_whitelist:false = an OPEN tier (the soul may also

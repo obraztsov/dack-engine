@@ -309,9 +309,13 @@ pub struct McpAuth {
     /// Which env key the provider emits to use as the token. Defaults to the provider's sole key.
     #[serde(default)]
     pub key: Option<String>,
-    /// HTTP: header name to set (default `Authorization`) with `scheme` (default `Bearer`).
+    /// HTTP: the header name to carry the token (default `Authorization`). A custom header like
+    /// `X-API-Key` is supported for servers with non-standard auth.
     #[serde(default)]
     pub header: Option<String>,
+    /// HTTP: the prefix before the token, e.g. `Authorization: Bearer <tok>`. Default is HEADER-AWARE:
+    /// `Bearer` for the `Authorization` header, RAW (no prefix → `X-API-Key: <tok>`) for any other
+    /// header. Set explicitly to override — e.g. `Token`, or `""` to force a raw token.
     #[serde(default)]
     pub scheme: Option<String>,
     /// stdio: inject the token as this env var in the spawned server process.

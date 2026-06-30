@@ -1879,7 +1879,16 @@ fn build_mcp_config(
             let mut headers = serde_json::Map::new();
             if let (Some(auth), Some(tok)) = (&server.auth, token) {
                 let header = auth.header.clone().unwrap_or_else(|| "Authorization".into());
-                let scheme = auth.scheme.clone().unwrap_or_else(|| "Bearer".into());
+                // Scheme default is HEADER-AWARE: `Bearer` for the standard `Authorization` header,
+                // but RAW (no prefix) for a custom header like `X-API-Key`, which by convention carries
+                // the bare token. An explicit `scheme` always wins (incl. `scheme: ""` to force raw).
+                let scheme = auth.scheme.clone().unwrap_or_else(|| {
+                    if header.eq_ignore_ascii_case("Authorization") {
+                        "Bearer".into()
+                    } else {
+                        String::new()
+                    }
+                });
                 let value =
                     if scheme.is_empty() { tok.to_string() } else { format!("{scheme} {tok}") };
                 headers.insert(header, json!(value));
@@ -3044,6 +3053,44 @@ mod tests {
         assert_eq!(cfg["type"], "http");
         assert_eq!(cfg["url"], "https://cove/api/mcp");
         assert_eq!(cfg["headers"]["Authorization"], "Bearer tok123");
+    }
+
+    #[test]
+    fn mcp_config_http_supports_custom_header_and_scheme() {
+        use crate::config::{CapabilityTier, McpAuth, McpServerConfig, McpTransport};
+        let mk = |header: Option<&str>, scheme: Option<&str>| McpServerConfig {
+            name: "memclaw".into(),
+            transport: McpTransport::Http { url: "https://memclaw.net/mcp".into() },
+            auth: Some(McpAuth {
+                secret: "memclaw".into(),
+                key: None,
+                header: header.map(Into::into),
+                scheme: scheme.map(Into::into),
+                env: None,
+            }),
+            tier: CapabilityTier::Read,
+            tools: vec![],
+            trust: TrustTier::public(),
+            min_trust: None,
+            scope_env: std::collections::BTreeMap::new(),
+            env: std::collections::BTreeMap::new(),
+        };
+        let cfg = |s: &McpServerConfig| build_mcp_config(s, Some("mc_key"), &std::collections::BTreeMap::new());
+
+        // Custom header, no scheme → RAW token (the X-API-Key convention, header-aware default).
+        let raw = cfg(&mk(Some("X-API-Key"), None));
+        assert_eq!(raw["headers"]["X-API-Key"], "mc_key");
+        assert!(raw["headers"].get("Authorization").is_none());
+
+        // Custom header with an explicit scheme still prefixes it.
+        let scoped = cfg(&mk(Some("X-Custom"), Some("Token")));
+        assert_eq!(scoped["headers"]["X-Custom"], "Token mc_key");
+
+        // Authorization with a non-Bearer scheme.
+        assert_eq!(cfg(&mk(Some("Authorization"), Some("Token")))["headers"]["Authorization"], "Token mc_key");
+
+        // Explicit empty scheme forces raw even on Authorization.
+        assert_eq!(cfg(&mk(Some("Authorization"), Some("")))["headers"]["Authorization"], "mc_key");
     }
 
     #[test]

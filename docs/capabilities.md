@@ -117,6 +117,39 @@ stdio env; the token reaches the server, never the agent's context. The provider
 the agent only ever sees the bearer. Adding a new secret is a provider entry plus a script — see
 [docs/secrets-and-sandbox.md](secrets-and-sandbox.md).
 
+### Where the token goes (`auth.header` / `auth.scheme` / `auth.env`)
+
+For an **HTTP** server the harness sets a request header; for a **stdio** server it sets an env var:
+
+| `auth` field | Applies to | Meaning |
+|---|---|---|
+| `secret` | both | the `secrets_providers` entry whose value is the token |
+| `key` | both | which key the provider emits to use (defaults to its sole key) |
+| `header` | http | header name to carry the token. Default `Authorization`; set e.g. `X-API-Key` for non-standard servers |
+| `scheme` | http | prefix before the token (`Authorization: Bearer <tok>`). **Header-aware default**: `Bearer` for `Authorization`, **raw** (no prefix) for any other header. Set explicitly to override — e.g. `Token`, or `""` to force a raw token |
+| `env` | stdio | env var to inject the token into the spawned server process |
+
+The common cases:
+
+```yaml
+mcp_servers:
+  # Standard bearer — the default, nothing extra needed.
+  - name: cove-read
+    transport: { type: http, url: "https://cove.example/api/mcp" }
+    auth: { secret: cove_read }                 # → Authorization: Bearer <tok>
+    tier: read
+    trust: self
+
+  # Non-standard header + raw token (e.g. an X-API-Key service). `scheme` defaults to raw here.
+  - name: memclaw
+    transport: { type: http, url: "https://memclaw.net/mcp" }
+    auth: { secret: memclaw, header: X-API-Key } # → X-API-Key: <tok>  (no "Bearer " prefix)
+    tier: read
+    trust: public
+```
+
+The token VALUE is never in config — `auth.secret` points at a provider; only the header *shape* lives here.
+
 ## Testing without real effects (`dry_run`)
 
 `dry_run` makes the wall deny a list of tool-name prefixes while still letting the model compose the

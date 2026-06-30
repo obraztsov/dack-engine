@@ -417,11 +417,12 @@ impl RuntimeClient for OpenClaudeClient {
             }
         };
 
-        match tokio::time::timeout(self.timeout, drive).await {
+        // Per-invocation override (e.g. Reflect's longer budget) wins over the client default.
+        let budget = req.timeout.unwrap_or(self.timeout);
+        match tokio::time::timeout(budget, drive).await {
             Ok(result) => result,
-            Err(_elapsed) => Err(DackError::Runtime(format!(
-                "invoke exceeded its {:?} budget (LLM/bridge hung)",
-                self.timeout
+            Err(_elapsed) => Err(DackError::Timeout(format!(
+                "invoke exceeded its {budget:?} budget (LLM/bridge hung)"
             ))),
         }
     }
@@ -546,6 +547,7 @@ mod tests {
             isolate: false,
             mounts: Vec::new(),
             allowed_tools: None,
+            timeout: None,
         }
     }
 
@@ -659,6 +661,7 @@ mod tests {
             isolate,
             mounts,
             allowed_tools: None,
+            timeout: None,
         }
     }
 
@@ -743,9 +746,27 @@ mod tests {
         let rec = Arc::new(Recorder { asked: Mutex::new(vec![]), allow: true });
         let err = client.invoke(perceive_req(), rec).await.unwrap_err();
         assert!(
-            matches!(err, DackError::Runtime(m) if m.contains("budget")),
-            "a hung bridge must time out, not freeze the loop"
+            err.is_timeout() && matches!(err, DackError::Timeout(m) if m.contains("budget")),
+            "a hung bridge must time out (DackError::Timeout, retryable), not freeze the loop"
         );
+    }
+
+    #[tokio::test]
+    async fn per_invocation_timeout_override_beats_the_client_default() {
+        // A hang, a GENEROUS client default, but a TIGHT per-call override (how Reflect would get a
+        // LONGER budget, exercised here in reverse: a shorter override must win and fire fast).
+        let mock = "#!/bin/sh\n\
+            read invoke\n\
+            sleep 30\n";
+        let mut client = mock_client(mock, "override");
+        client.timeout = Duration::from_secs(30);
+        let mut req = perceive_req();
+        req.timeout = Some(Duration::from_millis(200));
+        let rec = Arc::new(Recorder { asked: Mutex::new(vec![]), allow: true });
+        let start = std::time::Instant::now();
+        let err = client.invoke(req, rec).await.unwrap_err();
+        assert!(err.is_timeout(), "the per-invocation override must fire");
+        assert!(start.elapsed() < Duration::from_secs(5), "timed out at the 200ms override, not the 30s default");
     }
 
     #[tokio::test]

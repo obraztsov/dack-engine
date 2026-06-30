@@ -699,6 +699,12 @@ pub struct DackConfig {
     /// A hung LLM/bridge elapses here rather than freezing the single-flight loop.
     #[serde(default = "default_invoke_timeout_secs")]
     pub invoke_timeout_secs: u64,
+    /// Optional LONGER budget (seconds) for a **Reflect** invocation — the daily self-modification
+    /// cycle, which may legitimately chew through prompts/skills/memory and deserves more than a chat
+    /// reply's budget (e.g. 900 = 15 min). `None` ⇒ Reflect uses `invoke_timeout_secs` like everything
+    /// else. Applies ONLY to Reflect; every other state keeps the default.
+    #[serde(default)]
+    pub reflect_invoke_timeout_secs: Option<u64>,
     /// MCP tool-name **prefixes** the wall treats as REVERSIBLE capabilities → `ToolClass::Post`
     /// (allowed in Express). The duck's act-phase tools, e.g. `mcp__twitter__` (post/reply).
     #[serde(default = "default_post_tools")]

@@ -183,6 +183,7 @@ impl Bus {
                     pop_after,
                     priority,
                     status: StimulusStatus::Pending,
+                    attempts: 0,
                     directive_body: def.directive_body.clone(),
                     entry,
                 })

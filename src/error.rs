@@ -27,6 +27,12 @@ pub enum DackError {
     #[error("runtime: {0}")]
     Runtime(String),
 
+    /// The model invocation exceeded its wall-clock budget (the LLM/bridge hung with no completion).
+    /// Kept DISTINCT from `Runtime` so the dispatch loop can RETRY a zero-completion hang (bounded) —
+    /// a hung bridge that did nothing is safe to re-attempt, where a generic runtime error is terminal.
+    #[error("timeout: {0}")]
+    Timeout(String),
+
     /// Repo-host adapter (Gitlawb / plain-git fallback).
     #[error("repo: {0}")]
     Repo(String),
@@ -51,6 +57,14 @@ pub enum DackError {
 
     #[error("not implemented (scaffold): {0}")]
     NotImplemented(&'static str),
+}
+
+impl DackError {
+    /// True for a model-invocation timeout (a hung bridge). The one error class the dispatch loop
+    /// retries (bounded) — a zero-completion hang is safe to re-attempt.
+    pub fn is_timeout(&self) -> bool {
+        matches!(self, DackError::Timeout(_))
+    }
 }
 
 pub type Result<T> = std::result::Result<T, DackError>;

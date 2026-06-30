@@ -128,6 +128,11 @@ pub struct InvocationRequest {
     /// full default toolset (some of which Docker-sandbox sub-work and die inside a container with no
     /// docker daemon). `None` (the duck) ⇒ the engine default; the wall gates every call regardless.
     pub allowed_tools: Option<Vec<String>>,
+    /// **Per-invocation wall-clock budget OVERRIDE.** `None` ⇒ the runtime client's configured default
+    /// (`invoke_timeout_secs`). The harness sets `Some` for a state that legitimately needs longer —
+    /// e.g. **Reflect** (`reflect_invoke_timeout_secs`), the daily self-modification cycle, which may
+    /// chew through prompts/skills/memory and deserves more than a chat reply's budget.
+    pub timeout: Option<std::time::Duration>,
 }
 
 /// The permission event surfaced by OpenClaude, as it *actually* arrives (grounded

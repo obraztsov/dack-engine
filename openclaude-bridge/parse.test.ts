@@ -49,6 +49,31 @@ test('multi-object batons are CONCATENATED, not dropped (later-wins would lose s
   expect(out.batons.map((b: any) => b.reply_to)).toEqual(['10', '20'])
 })
 
+test('EXACT-duplicate batons are dropped, distinct ones kept (repetition artifact filter)', () => {
+  const logs: string[] = []
+  const out: any = parseOutput(
+    '{"thought":"t","batons":[' +
+      '{"to_prompt":"telegram/express","gist":"reply A"},' +
+      '{"to_prompt":"telegram/express","gist":"reply A"},' + // exact dup → dropped
+      '{"to_prompt":"telegram/express","gist":"reply B"}]}', // distinct → kept
+    (m) => logs.push(m),
+  )
+  expect(out.batons.map((b: any) => b.gist)).toEqual(['reply A', 'reply B'])
+  expect(logs.join(' ')).toContain('dropped 1 exact-duplicate')
+})
+
+test('the live 4-object verbatim case collapses to the distinct batons (2 pairs → 2)', () => {
+  // The model re-emitted its decision JSON 4× → 2 verbatim pairs (what the runlog showed). Merge
+  // concatenates, then exact-dedup collapses each pair — the two DISTINCT wordings survive.
+  const text =
+    '{"thought":"x","batons":[{"to_prompt":"telegram/express","gist":"A"}]}\n' +
+    '{"thought":"x","batons":[{"to_prompt":"telegram/express","gist":"A"}]}\n' +
+    '{"thought":"x","batons":[{"to_prompt":"telegram/express","gist":"B"}]}\n' +
+    '{"thought":"x","batons":[{"to_prompt":"telegram/express","gist":"B"}]}'
+  const out: any = parseOutput(text)
+  expect(out.batons.map((b: any) => b.gist)).toEqual(['A', 'B'])
+})
+
 test('a NUMERIC baton reply_to is coerced to a string (Rust expects Option<String>)', () => {
   // The model emits the message_id as a JSON number; an integer would crash the Rust deserialize.
   const out: any = parseOutput(

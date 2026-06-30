@@ -21,6 +21,11 @@ pub trait Queue: Send + Sync {
 
     async fn update_status(&self, id: &StimulusId, status: StimulusStatus) -> Result<()>;
 
+    /// Re-pend a row after a zero-completion model timeout: set its new `attempts` count and gate it
+    /// behind `pop_after` (a backoff), so the dispatch loop re-attempts a hung-but-side-effect-free
+    /// cycle (bounded by the cap) instead of failing it terminally. Updates the same row in place.
+    async fn reschedule(&self, id: &StimulusId, attempts: u32, pop_after: i64) -> Result<()>;
+
     /// Boot reconciliation: requeue rows stuck in `dispatched` — a crash mid-run
     /// orphans the in-flight row (`next` flipped it `dispatched`, nothing advanced it). v1
     /// effects are reversible (post/memory, never Settle), so **requeue is safe**: the duck

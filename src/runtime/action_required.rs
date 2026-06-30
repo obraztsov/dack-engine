@@ -97,6 +97,14 @@ impl StatePolicyResponder {
         self
     }
 
+    /// Did this invocation ALLOW any OUTWARD action (Post / SettleTx)? Reads the dedup set, which is
+    /// populated only when an outward action passes every gate (scope + dry-run) and executes — so a
+    /// dry-run-blocked or denied action does NOT count. The dispatch loop uses this to refuse to retry
+    /// a timed-out wake that already had an irreversible/visible effect (no double-post on a re-run).
+    pub fn acted_outward(&self) -> bool {
+        !self.outward_seen.lock().unwrap().is_empty()
+    }
+
     /// Write-gating: a file-write target must sit under a `writable_dirs` prefix and must
     /// never be `runlogs/`. The target is first **relativized** against the soul
     /// repo (file tools emit absolute paths, grounded vs OpenClaude 0.15.0) — anything that
@@ -389,6 +397,23 @@ mod tests {
         let w = req("Write", json!({"file_path": "memory/log.md", "contents": "x"}));
         assert!(matches!(r.decide(&w).await, ActionDecision::Allow));
         assert!(matches!(r.decide(&w).await, ActionDecision::Allow));
+    }
+
+    /// `acted_outward` is the timeout-retry safety signal: it flips true ONLY once an outward action
+    /// (Post / SettleTx) is actually allowed — a read or a memory write must NOT set it (those are safe
+    /// to re-run after a hang).
+    #[tokio::test]
+    async fn acted_outward_flips_only_after_an_allowed_outward_action() {
+        let r = responder(ConsciousnessState::Express);
+        assert!(!r.acted_outward(), "clean before any action");
+        // A memory write is not outward → still clean.
+        let w = req("Write", json!({"file_path": "memory/log.md", "contents": "x"}));
+        assert!(matches!(r.decide(&w).await, ActionDecision::Allow));
+        assert!(!r.acted_outward(), "a memory write is not an outward action");
+        // An allowed Post is outward → now flipped (so a later timeout won't be retried).
+        let post = req("mcp__twitter__post", json!({"text": "hi"}));
+        assert!(matches!(r.decide(&post).await, ActionDecision::Allow));
+        assert!(r.acted_outward(), "an allowed post is an outward action");
     }
 
     /// The WORKER sandbox: a worker may Bash + spawn sub-helpers (`Agent`/`Task`) + write

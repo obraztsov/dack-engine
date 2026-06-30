@@ -154,6 +154,7 @@ async fn say(config_path: &str, instruction: String) -> Result<()> {
         // The operator's word is the highest-trust stimulus — let it jump the queue.
         priority: Priority::Urgent,
         status: StimulusStatus::Pending,
+        attempts: 0,
         directive_body: instruction,
         entry: config.default_entry.clone(),
     };

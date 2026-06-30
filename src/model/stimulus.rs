@@ -141,6 +141,11 @@ pub struct Stimulus {
     pub pop_after: Option<i64>,
     pub priority: Priority,
     pub status: StimulusStatus,
+    /// How many times this row has been RE-SCHEDULED after a zero-completion model timeout. Starts at
+    /// 0; the dispatch loop bumps it (capped) when it re-pends a hung-but-side-effect-free cycle, and
+    /// stops retrying past the cap. Durable (survives the re-enqueue + restarts) so the cap is real.
+    #[serde(default)]
+    pub attempts: u32,
     /// The trusted directive text (the `.md` body) carried alongside the untrusted
     /// payload. Delimited as trusted-briefing when assembled into Perceive context.
     pub directive_body: String,

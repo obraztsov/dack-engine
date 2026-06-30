@@ -58,6 +58,16 @@ impl Queue for InMemoryQueue {
         Ok(())
     }
 
+    async fn reschedule(&self, id: &StimulusId, attempts: u32, pop_after: i64) -> Result<()> {
+        let mut rows = self.rows.lock().unwrap();
+        if let Some(s) = rows.iter_mut().find(|s| &s.id == id) {
+            s.status = StimulusStatus::Pending;
+            s.attempts = attempts;
+            s.pop_after = Some(pop_after);
+        }
+        Ok(())
+    }
+
     async fn reclaim_orphans(&self) -> Result<usize> {
         let mut rows = self.rows.lock().unwrap();
         let mut n = 0;

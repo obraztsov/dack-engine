@@ -36,6 +36,8 @@ CREATE TABLE IF NOT EXISTS stimulus (
     entry          TEXT NOT NULL,
     -- Debounce gate (coalescing): earliest epoch-sec this row may be popped. NULL ⇒ immediate.
     pop_after      INTEGER,
+    -- Re-schedule count after a zero-completion model timeout (durable retry cap).
+    attempts       INTEGER NOT NULL DEFAULT 0,
     -- When `next()` leased this row (epoch secs). Queue-internal metadata (NOT on `Stimulus`):
     -- a boot sweep requeues `dispatched` rows; `started_at` dates the lease for future
     -- stale-lease detection. NULL until first dispatched.
@@ -53,7 +55,7 @@ CREATE TABLE IF NOT EXISTS cursor (
 
 /// The column list, in a fixed order shared by every SELECT and [`read_raw`].
 const COLS: &str =
-    "id,source,type,directive_tier,payload_tier,payload,provenance,received_at,dedup_key,priority,status,directive_body,entry,pop_after";
+    "id,source,type,directive_tier,payload_tier,payload,provenance,received_at,dedup_key,priority,status,directive_body,entry,pop_after,attempts";
 
 pub struct SqliteQueue {
     conn: Mutex<Connection>,
@@ -83,6 +85,8 @@ impl SqliteQueue {
         // Migration for a pre-existing DB created before `pop_after` (the debounce gate): add the
         // column if absent. A duplicate-column error means it's already there — ignore it.
         let _ = conn.execute("ALTER TABLE stimulus ADD COLUMN pop_after INTEGER", []);
+        // Same for `attempts` (the timeout-retry cap), added later still.
+        let _ = conn.execute("ALTER TABLE stimulus ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0", []);
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -123,6 +127,7 @@ struct RawRow {
     directive_body: String,
     entry: String,
     pop_after: Option<i64>,
+    attempts: i64,
 }
 
 fn read_raw(row: &rusqlite::Row) -> rusqlite::Result<RawRow> {
@@ -141,6 +146,7 @@ fn read_raw(row: &rusqlite::Row) -> rusqlite::Result<RawRow> {
         directive_body: row.get(11)?,
         entry: row.get(12)?,
         pop_after: row.get(13)?,
+        attempts: row.get(14)?,
     })
 }
 
@@ -158,6 +164,7 @@ fn raw_to_stimulus(r: RawRow) -> Result<Stimulus> {
         pop_after: r.pop_after,
         priority: enum_from_db(&r.priority)?,
         status: enum_from_db(&r.status)?,
+        attempts: r.attempts as u32,
         directive_body: r.directive_body,
         entry: r.entry, // a plain state-prompt id, stored verbatim.
     })
@@ -170,8 +177,8 @@ impl Queue for SqliteQueue {
         // OR IGNORE: re-enqueuing the same id (e.g. a retried fire) is a no-op, never a dup.
         conn.execute(
             "INSERT OR IGNORE INTO stimulus
-             (id,source,type,directive_tier,payload_tier,payload,provenance,received_at,dedup_key,priority,priority_rank,status,directive_body,entry,pop_after)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+             (id,source,type,directive_tier,payload_tier,payload,provenance,received_at,dedup_key,priority,priority_rank,status,directive_body,entry,pop_after,attempts)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
             params![
                 s.id.0,
                 s.source,
@@ -188,6 +195,7 @@ impl Queue for SqliteQueue {
                 s.directive_body,
                 s.entry,
                 s.pop_after,
+                s.attempts,
             ],
         )
         .map_err(db)?;
@@ -232,6 +240,18 @@ impl Queue for SqliteQueue {
         conn.execute(
             "UPDATE stimulus SET status=?1 WHERE id=?2",
             params![enum_to_db(&status)?, id.0],
+        )
+        .map_err(db)?;
+        Ok(())
+    }
+
+    async fn reschedule(&self, id: &StimulusId, attempts: u32, pop_after: i64) -> Result<()> {
+        // Re-pend the SAME row (no duplicate, plays nice with dedup/coalesce): clear the lease, set
+        // the new attempt count, and gate it behind `pop_after` so a hung provider isn't hammered.
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE stimulus SET status='pending', attempts=?1, pop_after=?2, started_at=NULL WHERE id=?3",
+            params![attempts, pop_after, id.0],
         )
         .map_err(db)?;
         Ok(())
@@ -361,6 +381,7 @@ mod tests {
             pop_after: None,
             priority: prio,
             status: StimulusStatus::Pending,
+            attempts: 0,
             directive_body: "duty".into(),
             entry: "perceive".into(),
         }
@@ -429,6 +450,25 @@ mod tests {
         assert_eq!(q.next().await.unwrap().unwrap().id.0, "ready");
         // The still-debounced row remains held.
         assert!(q.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn reschedule_repends_with_bumped_attempts_and_backoff_gate() {
+        let q = SqliteQueue::open_in_memory().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        q.enqueue(mk("t", Priority::Normal, now, "mention", None)).await.unwrap();
+        let leased = q.next().await.unwrap().unwrap();
+        assert_eq!(leased.attempts, 0, "a fresh row starts at attempt 0");
+        assert_eq!(leased.status, StimulusStatus::Dispatched);
+
+        // Re-schedule with the backoff gate in the FUTURE → re-pended but not yet poppable.
+        q.reschedule(&StimulusId("t".into()), 1, now + 3600).await.unwrap();
+        assert!(q.next().await.unwrap().is_none(), "the backoff gate (pop_after) holds the retry");
+
+        // Past the gate → poppable again, carrying the bumped, DURABLE attempt count.
+        q.reschedule(&StimulusId("t".into()), 1, now - 1).await.unwrap();
+        let again = q.next().await.unwrap().unwrap();
+        assert_eq!(again.attempts, 1, "the attempt count survived the reschedule (durable cap)");
     }
 
     #[tokio::test]

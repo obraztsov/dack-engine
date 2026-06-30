@@ -158,6 +158,7 @@ queue_max_depth: 10000                   # load-shed cap: evict OLDEST low-prio 
 db_path: "dack.sqlite"                   # embedded queue (ephemeral; losing it loses only the queue)
 webhook_addr: "127.0.0.1:8787"           # localhost-only webhook listener
 invoke_timeout_secs: 300                 # budget for one consciousness invocation
+# reflect_invoke_timeout_secs: 900       # optional LONGER budget for Reflect (daily self-mod); omit ⇒ uses the above
 
 # Dry-run (testing): the wall denies any tool whose name starts with a `block` prefix — the agent
 # composes the action (visible in the runlog) but it never executes. Tool-level + uniform across MCPs.

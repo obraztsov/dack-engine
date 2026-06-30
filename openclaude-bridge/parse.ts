@@ -11,8 +11,9 @@
  * silent drop.
  */
 
-/** Ensure the parsed/fallback output satisfies the Rust `AgentOutput` contract. */
-export function normalize(o: any, fallbackText: string): unknown {
+/** Ensure the parsed/fallback output satisfies the Rust `AgentOutput` contract. `log` receives a
+ * diagnostic if any exact-duplicate batons are dropped (the bridge passes `console.error`). */
+export function normalize(o: any, fallbackText: string, log: (m: string) => void = () => {}): unknown {
   const out = o && typeof o === 'object' ? { ...o } : {}
   if (typeof out.thought !== 'string') out.thought = fallbackText.trim().slice(0, 2000) || '(no output)'
   if (!out.transition || typeof out.transition !== 'object') out.transition = { to_prompt: null }
@@ -24,6 +25,21 @@ export function normalize(o: any, fallbackText: string): unknown {
     for (const b of out.batons) {
       if (b && typeof b.reply_to === 'number') b.reply_to = String(b.reply_to)
     }
+    // Drop EXACT-duplicate batons (byte-identical after the coercion above). A verbatim repeat is a
+    // known neural-text-degeneration artifact (the model re-emits the same object) — NOT a distinct
+    // intent, which is never byte-identical. DISTINCT/paraphrased batons are untouched, so genuine
+    // multi-replies survive. Logged so the rate stays visible.
+    const seen = new Set<string>()
+    const deduped = out.batons.filter((b: any) => {
+      const key = JSON.stringify(b)
+      if (seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+    if (deduped.length < out.batons.length) {
+      log(`[bridge:parse] dropped ${out.batons.length - deduped.length} exact-duplicate baton(s) (repetition artifact)`)
+    }
+    out.batons = deduped
   }
   return out
 }
@@ -82,18 +98,19 @@ export function tryParseOutput(
 
   // Fast path: a single clean object (the normal case — behaviour unchanged).
   try {
-    return { ok: true, output: normalize(JSON.parse(t), text) }
+    return { ok: true, output: normalize(JSON.parse(t), text, log) }
   } catch {
     /* fall through to the robust scan */
   }
 
   // Robust path: every top-level object the model emitted.
   const objs = extractJsonObjects(t)
-  if (objs.length === 1) return { ok: true, output: normalize(objs[0], text) }
+  if (objs.length === 1) return { ok: true, output: normalize(objs[0], text, log) }
   if (objs.length > 1) {
     // Merge later-wins for scalar fields (thought/transition/spawn), but CONCATENATE the `batons`
     // arrays across objects — the model sometimes splits its fan-out across several JSON objects, and
-    // a plain later-wins merge would silently DROP the earlier objects' batons.
+    // a plain later-wins merge would silently DROP the earlier objects' batons. `normalize` then drops
+    // any EXACT-duplicate batons (the verbatim "writes it N times" degeneration artifact).
     const merged: any = Object.assign({}, ...objs)
     const allBatons = objs.flatMap((o: any) => (Array.isArray(o.batons) ? o.batons : []))
     if (allBatons.length) merged.batons = allBatons
@@ -101,7 +118,7 @@ export function tryParseOutput(
       `[bridge:parse] multi-object output: ${objs.length} JSON objects — merged ` +
         `(${allBatons.length} batons concatenated)`,
     )
-    return { ok: true, output: normalize(merged, text) }
+    return { ok: true, output: normalize(merged, text, log) }
   }
 
   // Nothing parseable: keep the raw text in `thought` and terminate — but LOUD, never silent.

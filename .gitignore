@@ -1,5 +1,6 @@
 # openclaude directory, separate repo
-/openclaude-0.15.0
+/openclaude-0.18.0
+/openclaude-0.21.0
 
 # agent soul, not tracked in this repo
 /soul-template

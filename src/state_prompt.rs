@@ -158,13 +158,19 @@ pub struct StatePrompt {
     pub reply_key: Option<String>,
     /// De-bloat knobs for the injected context blocks (memory/runlog). `None` ⇒ both on (`ContextConfig::default`).
     pub context: Option<ContextConfig>,
-    /// The directive text (the body below the frontmatter fence, up to a `---resume---` marker if any).
-    /// Sent as the system-prompt body on a FRESH session. Trusted.
+    /// **Frame 1 — the SYSTEM frame.** The state's STABLE invariant rules (e.g. "you are in Express;
+    /// reply-only; one outward action"), appended to SOUL.md in the system message. Identical every
+    /// turn — fresh AND resume — so it stays in the cached prefix. The content of the prompt file ABOVE
+    /// the `---task---` marker (empty if there is no marker). Trusted.
+    pub system_frame: String,
+    /// **Frame 2 — the FIRST-USER frame.** The verbose state teaching (how-to, voice, examples), sent
+    /// once as part of the user message on a FRESH wake. It then lives in the replayed conversation
+    /// history, so a resume need not re-teach it. The content BETWEEN `---task---` and `---resume---`.
+    /// Trusted.
     pub body: String,
-    /// The LEAN body sent instead of `body` on a sticky-session RESUME (the text AFTER a `---resume---`
-    /// marker line). `None` = no marker → `body` is reused on resume (unchanged behavior). Lets a sticky
-    /// prompt stop re-teaching its whole self every turn and instead say "you're resuming — act only on
-    /// the new payload." Trusted.
+    /// **Frame 3 — the RESUME frame.** The LEAN continuation cue used in the user message on a
+    /// sticky-session RESUME instead of [`body`] (the history already carries Frame 2). The content
+    /// AFTER `---resume---`. `None` = no marker → `body` is reused. Trusted.
     pub resume_body: Option<String>,
 }
 
@@ -176,7 +182,7 @@ impl StatePrompt {
         let fm: StatePromptFrontmatter = serde_yaml::from_str(yaml).map_err(|e| {
             DackError::Stimulus(format!("state-prompt `{id}` frontmatter: {e}"))
         })?;
-        let (body, resume_body) = split_resume(body);
+        let (system_frame, body, resume_body) = split_frames(body);
         Ok(StatePrompt {
             id,
             state: fm.state,
@@ -186,6 +192,7 @@ impl StatePrompt {
             session: fm.session,
             reply_key: fm.reply_key,
             context: fm.context,
+            system_frame,
             body,
             resume_body,
         })
@@ -232,6 +239,23 @@ pub fn split_resume(body: &str) -> (String, Option<String>) {
         }
         None => (body.trim().to_string(), None),
     }
+}
+
+/// Split a state-prompt body into its THREE frames: `(system_frame, first_user, resume)`.
+/// - `---task---` separates the **system frame** (stable rules → the system message, above the marker)
+///   from the user-message frames (below). No `---task---` ⇒ empty system frame (back-compat).
+/// - `---resume---` (within the part below `---task---`) separates the **first-user** teaching from the
+///   lean **resume** cue, exactly as [`split_resume`].
+pub fn split_frames(body: &str) -> (String, String, Option<String>) {
+    let (system_frame, rest) = match body.lines().position(|l| l.trim() == "---task---") {
+        Some(i) => {
+            let lines: Vec<&str> = body.lines().collect();
+            (lines[..i].join("\n").trim().to_string(), lines[i + 1..].join("\n"))
+        }
+        None => (String::new(), body.to_string()),
+    };
+    let (first_user, resume) = split_resume(&rest);
+    (system_frame, first_user, resume)
 }
 
 #[cfg(test)]
@@ -300,6 +324,26 @@ mod tests {
         // No marker: body is the whole thing, resume_body None (unchanged behavior).
         let sp = StatePrompt::parse("settle", "---\nstate: settle\n---\nAct.").unwrap();
         assert_eq!(sp.body, "Act.");
+        assert_eq!(sp.resume_body, None);
+    }
+
+    #[test]
+    fn three_frame_split_separates_system_first_user_and_resume() {
+        // `---task---` splits the SYSTEM frame (stable rules → system msg) from the user-message frames;
+        // `---resume---` then splits the first-user teaching from the lean resume cue.
+        let sp = StatePrompt::parse(
+            "telegram/express",
+            "---\nstate: express\n---\nExpress: reply-only; one outward action.\n---task---\nThe full how-to and voice.\n---resume---\nContinuing this thread — reply in voice.",
+        )
+        .unwrap();
+        assert_eq!(sp.system_frame, "Express: reply-only; one outward action.");
+        assert_eq!(sp.body, "The full how-to and voice.");
+        assert_eq!(sp.resume_body.as_deref(), Some("Continuing this thread — reply in voice."));
+
+        // No `---task---` ⇒ empty system frame, the rest is the (user-message) body — back-compat.
+        let sp = StatePrompt::parse("p", "---\nstate: perceive\n---\nJust the body.").unwrap();
+        assert_eq!(sp.system_frame, "");
+        assert_eq!(sp.body, "Just the body.");
         assert_eq!(sp.resume_body, None);
     }
 

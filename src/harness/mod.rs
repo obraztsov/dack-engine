@@ -604,10 +604,12 @@ impl Harness {
         let is_resume = resume.is_some();
         let watermark = resume.as_ref().map(|(_, ts)| *ts);
 
-        // ORIENTATION first (where am I · what may I do here · what's plugged · how far this cycle
-        // walks) — grounds the model so it stops guessing paths / out-of-scope tools. Then the
-        // state's own context (directive+payload + memory/runlog, or the digested Baton). Then
-        // allowed transitions.
+        // Block order (USER message): ORIENTATION first (where am I · what may I do · what's plugged ·
+        // how far this cycle walks) — the small, stable frame that grounds the model. Then the state's
+        // TASK. Then context ordered STABLE→VOLATILE: the bulky stable blocks (memory index, directive)
+        // ride the cached prefix and stay out of the high-attention ends, while the actionable VOLATILE
+        // blocks (recent runlog, then the UNTRUSTED world-payload / the Baton) land last where recency
+        // attention is strongest. ALLOWED-TRANSITIONS closes as the trusted "now choose your next step" cue.
         let mut blocks = vec![orientation_block(
             prompt,
             &self.soul_root(),
@@ -615,6 +617,17 @@ impl Harness {
             cycle_trust,
             ceiling,
         )];
+        // The state's TASK frame → the USER message (no longer the system prompt): the full teaching
+        // (`body`) on a FRESH wake, the lean cue (`resume_body`) on a RESUME. Taught once, it then lives
+        // in the replayed history, so resumes stay lean and the system message stays a stable cached prefix.
+        let task = if is_resume {
+            prompt.resume_body.as_deref().unwrap_or(&prompt.body)
+        } else {
+            &prompt.body
+        };
+        if !task.trim().is_empty() {
+            blocks.push(ContextBlock { label: "task".into(), body: task.trim().to_string(), trusted: true });
+        }
         blocks.extend(self.context_blocks(step, stimulus, is_resume, watermark, &prompt.context()).await);
         blocks.push(transitions_block(&reachable));
         // The agent never receives a raw secret env: capability tokens are injected into
@@ -636,7 +649,7 @@ impl Harness {
 
         // Built AFTER the resume lookup: a sticky RESUME gets the lean `resume_body`, a fresh run the
         // full body.
-        let system_prompt = self.system_prompt_for_prompt(prompt, is_resume).await;
+        let system_prompt = self.system_prompt_for_prompt(prompt).await;
         let req = InvocationRequest {
             system_prompt,
             spec: spec.clone(),
@@ -669,8 +682,11 @@ impl Harness {
                 .map(|b| format!("\n--- block[{}]{} ---\n{}", b.label, if b.trusted { "" } else { " UNTRUSTED" }, b.body))
                 .collect();
             tracing::trace!(
-                "MODEL CONTEXT [{:?} · {}]:\n===== SYSTEM PROMPT =====\n{}\n===== CONTEXT BLOCKS ====={}\n===== END CONTEXT =====",
-                prompt.state, prompt.id, req.system_prompt, blocks
+                "MODEL CONTEXT [{:?} · {} · {}]:\n\
+                 ===== SYSTEM MESSAGE (role=system — SOUL + state `system_frame`, byte-stable → cached prefix) =====\n{}\n\
+                 ===== USER MESSAGE (role=user — assembled context blocks; `task` = first-user `body` on FRESH / lean `resume_body` on RESUME) ====={}\n\
+                 ===== END CONTEXT =====",
+                prompt.state, prompt.id, if is_resume { "RESUME" } else { "FRESH" }, req.system_prompt, blocks
             );
         }
         // Model-call latency: wall-clock around the whole bridge round-trip (incl. the wall/tool turns
@@ -1207,15 +1223,11 @@ impl Harness {
                 let (fresh_dir, resume_dir) =
                     crate::state_prompt::split_resume(&stimulus.directive_body);
                 let directive = if is_resume { resume_dir.unwrap_or(fresh_dir) } else { fresh_dir };
-                out.push(ContextBlock { label: "standing-directive".into(), body: directive, trusted: true });
-                out.push(ContextBlock {
-                    label: "world-payload".into(),
-                    body: stimulus.payload.to_string(),
-                    trusted: false, // delimited as untrusted regardless of content.
-                });
-                // Self-orientation: the skills catalogue + the memory-index head, so the model is TOLD
-                // what knowledge-tools and memory it has instead of discovering them by listing dirs.
-                // FRESH grounding only — never re-injected on a resume (the session already holds it).
+                // Ordered STABLE→VOLATILE. Self-orientation (skills catalogue + memory-index head) leads:
+                // it's the bulkiest STABLE block (byte-identical across wakes until the soul changes), so
+                // placing it before the volatile blocks lets it ride the cached prefix instead of breaking
+                // it — and keeps the long catalogue out of the high-attention ends. FRESH grounding only;
+                // a resume already holds it in the replayed session.
                 if ctx.memory && !is_resume {
                     let body = self.self_orientation().await;
                     if !body.trim().is_empty() {
@@ -1226,11 +1238,23 @@ impl Harness {
                         });
                     }
                 }
+                out.push(ContextBlock { label: "standing-directive".into(), body: directive, trusted: true });
                 out.extend(self.runlog_blocks(tag, is_resume, watermark, &ctx.runlog).await);
+                // The UNTRUSTED world-payload sits LAST: it's the most volatile block AND the thing the
+                // model acts on, so recency attention is strongest here; and a trusted block (the caller's
+                // allowed-transitions) still closes after it, so the model's final read is your instruction,
+                // not the stranger's text.
+                out.push(ContextBlock {
+                    label: "world-payload".into(),
+                    body: stimulus.payload.to_string(),
+                    trusted: false, // delimited as untrusted regardless of content.
+                });
             }
             StepInput::Act(baton) => {
-                out.push(baton_block(baton));
+                // Same shape: volatile runlog first, then the Baton (the digested gist to act on) LAST —
+                // freshest for the act decision (recency).
                 out.extend(self.runlog_blocks(tag, is_resume, watermark, &ctx.runlog).await);
+                out.push(baton_block(baton));
             }
         }
         out
@@ -1283,21 +1307,20 @@ impl Harness {
     /// `prompts/<id>.md` when the prompt was resolved, so a Reflect edit takes effect next wake. The
     /// bridge appends the structured-output instruction. An empty soul + body degrades to a minimal
     /// header rather than failing the run.
-    async fn system_prompt_for_prompt(&self, prompt: &StatePrompt, is_resume: bool) -> String {
+    /// The SYSTEM message: SOUL.md (the constant self) + the prompt's **system frame** (its stable,
+    /// invariant rules). This is IDENTICAL on a fresh wake and a resume — nothing per-turn or per-state-
+    /// teaching lives here — so it stays a stable, prefix-cached prefix. The per-turn teaching (the
+    /// prompt's `body`/`resume_body`) goes into the USER message as the `task` block instead (see
+    /// `run_step`). `is_resume` therefore no longer changes the system prompt.
+    async fn system_prompt_for_prompt(&self, prompt: &StatePrompt) -> String {
         let soul = self.repo.read_file(&RepoPath("SOUL.md".into())).await.unwrap_or_default();
         let soul = String::from_utf8_lossy(&soul);
-        // On a sticky RESUME use the lean `resume_body` (if the prompt declared a `---resume---` section)
-        // so we don't re-teach the whole prompt every turn; otherwise (fresh, or no section) the full body.
-        // SOUL.md (the constant self) still rides every turn.
-        let body = if is_resume {
-            prompt.resume_body.as_deref().unwrap_or(&prompt.body)
-        } else {
-            &prompt.body
-        };
-        if soul.trim().is_empty() && body.trim().is_empty() {
-            format!("You are a DACK actor in the {:?} state ({}).", prompt.state, prompt.id)
-        } else {
-            format!("{}\n\n---\n\n{}", soul.trim_end(), body.trim_end())
+        let frame = prompt.system_frame.trim();
+        match (soul.trim().is_empty(), frame.is_empty()) {
+            (true, true) => format!("You are a DACK actor in the {:?} state ({}).", prompt.state, prompt.id),
+            (false, true) => soul.trim_end().to_string(),
+            (true, false) => frame.to_string(),
+            (false, false) => format!("{}\n\n---\n\n{}", soul.trim_end(), frame),
         }
     }
 
@@ -3302,6 +3325,7 @@ mod tests {
             session: None,
             reply_key: None,
             context: None,
+            system_frame: String::new(),
             body: String::new(),
             resume_body: None,
         };
@@ -3428,7 +3452,7 @@ mod tests {
         // OPEN perceive: the inline public MCP is admitted, read-tier, with its wall prefix.
         let open = StatePrompt {
             id: "p".into(), state: ConsciousnessState::Perceive,
-            mcp: vec![inline(), McpRef::Import("cove-read".into())], transitions: vec![], model: None, session: None, reply_key: None, context: None, body: String::new(), resume_body: None,
+            mcp: vec![inline(), McpRef::Import("cove-read".into())], transitions: vec![], model: None, session: None, reply_key: None, context: None, system_frame: String::new(), body: String::new(), resume_body: None,
         };
         let (servers, inline_read) = harness.assemble_mcp_servers(&open, &stim, &TrustTier::self_(), None).await;
         assert!(servers.contains_key("rootai"), "inline admitted on an open tier");
@@ -3441,7 +3465,7 @@ mod tests {
         // LOCKED express (unconfigured → default locked): the same inline is rejected.
         let locked = StatePrompt {
             id: "e".into(), state: ConsciousnessState::Express,
-            mcp: vec![inline()], transitions: vec![], model: None, session: None, reply_key: None, context: None, body: String::new(), resume_body: None,
+            mcp: vec![inline()], transitions: vec![], model: None, session: None, reply_key: None, context: None, system_frame: String::new(), body: String::new(), resume_body: None,
         };
         let (servers, inline_read) = harness.assemble_mcp_servers(&locked, &stim, &TrustTier::self_(), None).await;
         assert!(servers.is_empty() && inline_read.is_empty(), "no self-plug on a locked tier");
@@ -3490,7 +3514,7 @@ mod tests {
         let stim = poisoned_stimulus();
         let express = StatePrompt {
             id: "e".into(), state: ConsciousnessState::Express,
-            mcp: vec![McpRef::Import("telegram".into())], transitions: vec![], model: None, session: None, reply_key: None, context: None, body: String::new(), resume_body: None,
+            mcp: vec![McpRef::Import("telegram".into())], transitions: vec![], model: None, session: None, reply_key: None, context: None, system_frame: String::new(), body: String::new(), resume_body: None,
         };
 
         // public cycle (rank 0) < org (rank 1) → telegram WITHHELD.
@@ -3571,7 +3595,7 @@ mod tests {
         let express = StatePrompt {
             id: "e".into(), state: ConsciousnessState::Express,
             mcp: vec![McpRef::Import("telegram".into())], transitions: vec![], model: None, session: None,
-            reply_key: None, context: None, body: String::new(), resume_body: None,
+            reply_key: None, context: None, system_frame: String::new(), body: String::new(), resume_body: None,
         };
 
         // No override → the top-level latest (message_id 20).
@@ -3631,7 +3655,7 @@ mod tests {
         let perceive = StatePrompt {
             id: "p".into(), state: ConsciousnessState::Perceive,
             mcp: vec![McpRef::Import("recall".into())], transitions: vec![], model: None, session: None,
-            reply_key: None, context: None, body: String::new(), resume_body: None,
+            reply_key: None, context: None, system_frame: String::new(), body: String::new(), resume_body: None,
         };
 
         // dedup_key set → RECALL_TAG carries the conversation tag (recall public → cycle stays public).
@@ -3880,6 +3904,7 @@ mod tests {
             session: None,
             reply_key: None,
             context: None,
+            system_frame: String::new(),
             body: "go".into(),
             resume_body: None,
         };
@@ -4028,6 +4053,7 @@ mod tests {
                 tag_key: true,
                 runlog: crate::state_prompt::RunlogContext { environment: 10, conversation: 20 },
             }),
+            system_frame: String::new(),
             body: "FULL-BODY-go".into(),
             resume_body: Some("LEAN-RESUME-only-new".into()),
         };
@@ -4051,18 +4077,24 @@ mod tests {
         );
         assert!(seen[2].session.is_none(), "a different thread starts its own fresh session");
 
-        // The lean `---resume---` body: a fresh wake gets the FULL body, a resume gets the LEAN one.
+        // The 3-frame split: the teaching/resume body now rides the USER message (the `task` block),
+        // NOT the system prompt — fresh gets the FULL body, a resume gets the LEAN cue. The system
+        // prompt no longer carries either (it's SOUL + the stable system frame).
+        let task_of = |i: usize| {
+            seen[i].blocks.iter().find(|b| b.label == "task").map(|b| b.body.clone()).unwrap_or_default()
+        };
         assert!(
-            seen[0].system_prompt.contains("FULL-BODY-go") && !seen[0].system_prompt.contains("LEAN-RESUME"),
-            "first (fresh) item uses the full body"
+            task_of(0).contains("FULL-BODY-go") && !task_of(0).contains("LEAN-RESUME"),
+            "first (fresh) item's task frame is the full body"
         );
         assert!(
-            seen[1].system_prompt.contains("LEAN-RESUME-only-new") && !seen[1].system_prompt.contains("FULL-BODY"),
-            "resumed item uses the lean resume body, not the full one"
+            task_of(1).contains("LEAN-RESUME-only-new") && !task_of(1).contains("FULL-BODY"),
+            "resumed item's task frame is the lean resume body"
         );
+        assert!(task_of(2).contains("FULL-BODY-go"), "a different thread's fresh item uses the full body again");
         assert!(
-            seen[2].system_prompt.contains("FULL-BODY-go"),
-            "a different thread's fresh item uses the full body again"
+            !seen[0].system_prompt.contains("FULL-BODY-go") && !seen[1].system_prompt.contains("LEAN-RESUME"),
+            "the body no longer leaks into the system prompt (it's the task block now)"
         );
 
         // Resume-aware blocks: memory + the global ENVIRONMENT view are FRESH-only; a RESUME drops both
@@ -4128,6 +4160,7 @@ mod tests {
             session: Some(SessionConfig { sticky: true, key: vec!["thread_id".into()] }),
             reply_key: None,
             context: None,
+            system_frame: String::new(),
             body: "go".into(),
             resume_body: None,
         };

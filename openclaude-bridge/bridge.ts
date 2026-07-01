@@ -42,7 +42,14 @@ if (process.env.DACK_BRIDGE_CWD) {
 // BEFORE the (dynamic) SDK import so even the SDK's init-time logs are redirected off the channel.
 console.log = (...a: unknown[]) => console.error('[bridge:log]', ...a)
 
-const { query } = await import('@gitlawb/openclaude/sdk')
+// PINNED + PATCHED SDK: a vendored copy of @gitlawb/openclaude 0.18.0's built `sdk.mjs`, with the
+// hard-coded "You are OpenClaude, a coding agent" identity prefix NEUTRALIZED (the 3 *_PREFIX consts
+// emptied → filter(Boolean) drops them) so the model's system prompt is ONLY our SOUL.md. Absolute
+// path via import.meta.dir so the earlier process.chdir() can't break resolution. We pin the binary
+// here rather than tracking @gitlawb/openclaude (it's drifting toward a coding-agent product + likely
+// to be dropped). See vendor/openclaude-0.18.0/README.md. Penalty passthrough is NOT patched (needs a
+// source build) — deferred to the own-bridge.
+const { query } = await import(`${import.meta.dir}/vendor/openclaude-0.18.0/sdk.mjs`)
 
 const emit = (obj: unknown) => process.stdout.write(JSON.stringify(obj) + '\n')
 

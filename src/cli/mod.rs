@@ -499,9 +499,16 @@ async fn run(config_path: &str) -> Result<()> {
     let runlog_repo = build_runlog_repo(&config, &runlog_root, &soul_did);
     let runlog: Arc<dyn RunLogWriter> =
         Arc::new(DailyFileRunLog::new(runlog_repo, soul_did.clone()));
+    // Shared runtime health registry (the "subconscious"): the broker records per-secret health,
+    // the loops record per-stimulus health, and Reflect / `dack status` read the one snapshot.
+    let health = Arc::new(crate::health::HealthRegistry::new(chrono::Utc::now().timestamp()));
     // Secrets broker from config — trusted provider scripts; shared by sensors (per-duty
-    // `secrets:`) and the Express act phase (per-route `secrets:`).
-    let broker = Arc::new(crate::secrets::providers::broker_from_config(&config));
+    // `secrets:`) and the Express act phase (per-route `secrets:`). It records each materialize
+    // outcome into `health`.
+    let broker = Arc::new(crate::secrets::providers::broker_from_config(
+        &config,
+        health.clone(),
+    ));
     let harness = Arc::new(Harness {
         config: config.clone(),
         queue: queue.clone(),
@@ -545,6 +552,24 @@ async fn run(config_path: &str) -> Result<()> {
         async move { h.reflect_scheduler(sd).await }
     });
 
+    // Persist the health snapshot to disk every 15s (and once on shutdown) so `dack status` — a
+    // SEPARATE process from this daemon — can read the live machinery health (the in-memory registry
+    // isn't visible cross-process). The file is the serde snapshot; the reader renders it.
+    tokio::spawn({
+        let health = health.clone();
+        let path = health_path(&config);
+        let mut sd = shutdown_rx.clone();
+        async move {
+            loop {
+                write_health_snapshot(&health, &path);
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {}
+                    _ = sd.changed() => { write_health_snapshot(&health, &path); break; }
+                }
+            }
+        }
+    });
+
     // Modules supervisor (the harness's ownership of long-running channels): spawn + restart-supervise
     // each enabled `modules:` entry (e.g. the Telegram ingress) through the Sandbox seam, injecting
     // its declared secrets. ONE `dack run` now starts the duck's whole runtime — mind + channels —
@@ -559,6 +584,26 @@ async fn run(config_path: &str) -> Result<()> {
             ModuleSupervisor::new(config.modules.clone(), broker.clone(), sandbox, module_cwd);
         let sd = shutdown_rx.clone();
         tokio::spawn(async move { supervisor.run(sd).await });
+    }
+
+    // Seed the configured duty roster into the health registry (the "stimulus configuration"), so
+    // Reflect / `dack status` see every duty — including a mis-scheduled one that never fires.
+    {
+        use crate::stimuli::Trigger;
+        let reg = registry.read().unwrap();
+        let duties = reg
+            .defs
+            .iter()
+            .map(|d| crate::health::DutyInfo {
+                id: d.frontmatter.id.clone(),
+                trigger: match &d.frontmatter.trigger {
+                    Trigger::Cron { schedule } => format!("cron {schedule}"),
+                    Trigger::Webhook { path } => format!("webhook {path}"),
+                },
+                entry: d.frontmatter.entry.clone(),
+            })
+            .collect();
+        health.set_duties(duties);
     }
 
     let ingestor = Arc::new(Ingestor {
@@ -719,8 +764,23 @@ fn bridge_env(config: &DackConfig) -> HashMap<String, String> {
     env
 }
 
-/// `dack status` — slice: queue depth + duty registration health. The
-/// alive/last-run/current-state fields fill in with the watchdog.
+/// Where the daemon persists its health snapshot — co-located with the queue db (which is already
+/// gitignored), e.g. `dack.sqlite` → `dack.health.json`.
+fn health_path(config: &DackConfig) -> std::path::PathBuf {
+    std::path::Path::new(&config.db_path).with_extension("health.json")
+}
+
+/// Best-effort atomic write of the health snapshot (tmp + rename). A write failure just means
+/// `dack status` shows a slightly-stale or absent view — never fatal to the daemon.
+fn write_health_snapshot(health: &crate::health::HealthRegistry, path: &std::path::Path) {
+    if let Ok(bytes) = serde_json::to_vec_pretty(&health.snapshot()) {
+        let tmp = path.with_extension("tmp");
+        let _ = std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, path));
+    }
+}
+
+/// `dack status` — queue depth + duty registration + the daemon's machinery health (secrets,
+/// stimuli, cycle stats) from the periodic snapshot the running daemon writes.
 async fn status(config_path: &str) -> Result<()> {
     let config = DackConfig::load(config_path)?;
     let depth = SqliteQueue::open(&config.db_path)?.depth().await?;
@@ -733,6 +793,18 @@ async fn status(config_path: &str) -> Result<()> {
     );
     for (path, err) in &reg.errors {
         println!("  ! {path}: {err}");
+    }
+    // Machinery health, from the daemon's on-disk snapshot (a separate process — this can't read the
+    // daemon's in-memory registry, so it reads the file the daemon writes every ~15s).
+    match std::fs::read(health_path(&config)) {
+        Ok(bytes) => match serde_json::from_slice::<crate::health::HealthSnapshot>(&bytes) {
+            Ok(snap) => println!(
+                "\nhealth (from the daemon's last snapshot):\n{}",
+                snap.render(chrono::Utc::now().timestamp())
+            ),
+            Err(e) => println!("\nhealth: snapshot unreadable ({e})"),
+        },
+        Err(_) => println!("\nhealth: no snapshot yet (is the daemon running?)"),
     }
     Ok(())
 }

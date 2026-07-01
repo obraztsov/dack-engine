@@ -160,12 +160,21 @@ impl Harness {
                     // panic in ONE dispatch (a malformed payload, a unicode edge, …) must NOT crash the
                     // whole duck — catch it, record a failed cycle, keep the loop alive. Essential for a
                     // hosted fleet: one bad message can never take a user's duck down.
+                    let health = self.broker.health();
                     match std::panic::AssertUnwindSafe(self.dispatch(stimulus, &wake_unretryable)).catch_unwind().await {
                         // Terminal states: a processed row never sticks in `dispatched`.
                         Ok(Ok(())) => {
+                            // Cycle health, keyed by `source` (= the duty id for ingested stimuli, so
+                            // it aggregates with the ingestion-level health for that duty).
+                            health.record_cycle(true);
+                            health.record_stimulus_ok(&snap.source, chrono::Utc::now().timestamp());
                             let _ = self.queue.update_status(&snap.id, StimulusStatus::Done).await;
                         }
-                        Ok(Err(e)) => self.handle_dispatch_error(&snap, e, &wake_unretryable).await,
+                        Ok(Err(e)) => {
+                            health.record_cycle(false);
+                            health.record_stimulus_err(&snap.source, &e.to_string());
+                            self.handle_dispatch_error(&snap, e, &wake_unretryable).await;
+                        }
                         Err(panic) => {
                             let msg = panic
                                 .downcast_ref::<&str>()
@@ -173,6 +182,8 @@ impl Harness {
                                 .or_else(|| panic.downcast_ref::<String>().cloned())
                                 .unwrap_or_else(|| "unknown panic".into());
                             tracing::error!("dispatch PANICKED ({}): {msg} — cycle failed, loop continues", snap.id);
+                            health.record_cycle(false);
+                            health.record_stimulus_err(&snap.source, &format!("panic: {msg}"));
                             self.log_dispatch_failure(&snap, &DackError::Runtime(format!("panic: {msg}"))).await;
                             let _ = self.queue.update_status(&snap.id, StimulusStatus::Failed).await;
                         }
@@ -628,7 +639,7 @@ impl Harness {
         if !task.trim().is_empty() {
             blocks.push(ContextBlock { label: "task".into(), body: task.trim().to_string(), trusted: true });
         }
-        blocks.extend(self.context_blocks(step, stimulus, is_resume, watermark, &prompt.context()).await);
+        blocks.extend(self.context_blocks(step, stimulus, prompt.state, is_resume, watermark, &prompt.context()).await);
         blocks.push(transitions_block(&reachable));
         // The agent never receives a raw secret env: capability tokens are injected into
         // the MCP transport server-side, never the agent's context. Sensor secrets live in ingest.
@@ -1209,6 +1220,7 @@ impl Harness {
         &self,
         step: &StepInput,
         stimulus: &Stimulus,
+        state: ConsciousnessState,
         is_resume: bool,
         watermark: Option<i64>,
         ctx: &crate::state_prompt::ContextConfig,
@@ -1239,6 +1251,21 @@ impl Harness {
                     }
                 }
                 out.push(ContextBlock { label: "standing-directive".into(), body: directive, trusted: true });
+                // Subconscious health (Reflect only, fresh only): the harness's own read of its
+                // machinery — dead/cooling secrets, failing or never-firing duties, cycle stats. So
+                // the duck NOTICES "my X token is dead" during self-review instead of degrading blind.
+                // Reflect can't act outward from here — the reflect prompt teaches it to record the
+                // issue in memory and note what the operator must do.
+                if state == ConsciousnessState::Reflect && !is_resume {
+                    let report = self.broker.health().snapshot().render(chrono::Utc::now().timestamp());
+                    out.push(ContextBlock {
+                        label: "subconscious-health".into(),
+                        body: format!(
+                            "(Trusted: the harness's own read of your machinery — this is self-knowledge, not world data.)\n\n{report}"
+                        ),
+                        trusted: true,
+                    });
+                }
                 out.extend(self.runlog_blocks(tag, is_resume, watermark, &ctx.runlog).await);
                 // The UNTRUSTED world-payload sits LAST: it's the most volatile block AND the thing the
                 // model acts on, so recency attention is strongest here; and a trusted block (the caller's
@@ -2429,7 +2456,7 @@ mod tests {
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
             runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
-        broker: Arc::new(SecretsBroker::new(vec![])),
+        broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         };
 
@@ -2521,7 +2548,7 @@ mod tests {
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
             runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
-        broker: Arc::new(SecretsBroker::new(vec![])),
+        broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         };
 
@@ -2578,7 +2605,7 @@ mod tests {
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
             runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
-            broker: Arc::new(SecretsBroker::new(vec![])),
+            broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         };
 
@@ -2633,7 +2660,7 @@ mod tests {
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
             runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
-            broker: Arc::new(SecretsBroker::new(vec![])),
+            broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         };
 
@@ -2701,7 +2728,7 @@ mod tests {
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
             runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
-            broker: Arc::new(SecretsBroker::new(vec![])),
+            broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         };
 
@@ -2752,7 +2779,7 @@ mod tests {
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
             runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
-            broker: Arc::new(SecretsBroker::new(vec![])),
+            broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         };
 
@@ -2820,7 +2847,7 @@ mod tests {
             repo: Arc::new(PlainGitRepo::new(tmp, "did:x")),
             identity: Arc::new(identity),
             runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
-            broker: Arc::new(SecretsBroker::new(vec![])),
+            broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         }
     }
@@ -2920,7 +2947,7 @@ mod tests {
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
             runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
-            broker: Arc::new(SecretsBroker::new(vec![])),
+            broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         };
 
@@ -3011,7 +3038,7 @@ mod tests {
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
             runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
-            broker: Arc::new(SecretsBroker::new(vec![])),
+            broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         };
 
@@ -3076,7 +3103,7 @@ mod tests {
             repo: Arc::new(PlainGitRepo::new(&soul, "did:dack:soul")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
             runlog: Arc::new(FileRunLog::new(soul.join("runlogs"))),
-            broker: Arc::new(SecretsBroker::new(vec![])),
+            broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         };
 
@@ -3143,7 +3170,7 @@ mod tests {
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
             runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
-            broker: Arc::new(SecretsBroker::new(vec![])),
+            broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         });
 
@@ -3311,7 +3338,7 @@ mod tests {
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
             runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
-            broker: Arc::new(SecretsBroker::new(vec![Arc::new(StaticEnvProvider::new("cove", vec!["DACK_COVE_TEST".into()]))])),
+            broker: Arc::new(SecretsBroker::new_test(vec![Arc::new(StaticEnvProvider::new("cove", vec!["DACK_COVE_TEST".into()]))])),
             sessions: Default::default(),
         };
         let stim = poisoned_stimulus();
@@ -3389,7 +3416,7 @@ mod tests {
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
             runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
-            broker: Arc::new(SecretsBroker::new(vec![])),
+            broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         };
         // A CLEAN self-tier cycle (directive + payload self → seed self → ceiling Reflect).
@@ -3443,7 +3470,7 @@ mod tests {
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
             runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
-            broker: Arc::new(SecretsBroker::new(vec![])),
+            broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         };
         let stim = poisoned_stimulus();
@@ -3508,7 +3535,7 @@ mod tests {
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
             runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
-            broker: Arc::new(SecretsBroker::new(vec![])),
+            broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         };
         let stim = poisoned_stimulus();
@@ -3584,7 +3611,7 @@ mod tests {
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
             runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
-            broker: Arc::new(SecretsBroker::new(vec![])),
+            broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         };
         let mut stim = poisoned_stimulus();
@@ -3649,7 +3676,7 @@ mod tests {
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
             runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
-            broker: Arc::new(SecretsBroker::new(vec![])),
+            broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         };
         let perceive = StatePrompt {
@@ -3696,7 +3723,7 @@ mod tests {
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
             runlog: rec.clone(),
-            broker: Arc::new(SecretsBroker::new(vec![])),
+            broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         };
         let out = AgentOutput {
@@ -3750,7 +3777,7 @@ mod tests {
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
             runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
-            broker: Arc::new(SecretsBroker::new(vec![])),
+            broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         };
         let allow = |tool: &str| ToolCallRecord { tool: tool.into(), decision: "allow".into(), input: None };
@@ -3818,7 +3845,7 @@ mod tests {
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
             runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
-            broker: Arc::new(SecretsBroker::new(vec![])),
+            broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         };
 
@@ -3891,7 +3918,7 @@ mod tests {
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
             runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
-            broker: Arc::new(SecretsBroker::new(vec![])),
+            broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         };
         let stim = poisoned_stimulus();
@@ -4037,7 +4064,7 @@ mod tests {
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
             runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
-            broker: Arc::new(SecretsBroker::new(vec![])),
+            broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         };
         let sticky = StatePrompt {
@@ -4148,7 +4175,7 @@ mod tests {
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
             runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
-            broker: Arc::new(SecretsBroker::new(vec![])),
+            broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         };
         let sticky = StatePrompt {

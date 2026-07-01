@@ -13,6 +13,9 @@
 /dack.sqlite
 /dack.sqlite-wal
 /dack.sqlite-shm
+# runtime health snapshot the daemon writes for `dack status` (ephemeral) + its write-tmp
+/dack.health.json
+/dack.health.tmp
 Cargo.lock        # binary crate, but harness is deployed as a built artifact; keep lock out of v1 churn
 
 # operator secrets & real config — never commit

@@ -38,6 +38,7 @@ pub mod config;
 pub mod agent_def;
 pub mod error;
 pub mod harness;
+pub mod health;
 pub mod identity;
 pub mod logging;
 pub mod model;

@@ -156,10 +156,19 @@ impl Ingestor {
     /// Drain the unified `FiredTrigger` channel forever. A failed duty is a logged line,
     /// never a crash of the loop (logging-not-rollback).
     pub async fn run(self: Arc<Self>, mut rx: mpsc::Receiver<FiredTrigger>) {
+        let health = self.broker.health().clone();
         while let Some(fired) = rx.recv().await {
             let def_id = fired.def_id.clone();
-            if let Err(e) = self.process(fired, Utc::now().timestamp()).await {
-                tracing::warn!("ingest: duty `{def_id}` failed: {e}");
+            let now = Utc::now().timestamp();
+            // Per-duty health: the trigger fired; a failure here is where a dead-secret sensor drop
+            // (env_for → Err) is finally *counted*, not just logged — so Reflect/`dack status` see it.
+            health.record_stimulus_fired(&def_id, now);
+            match self.process(fired, now).await {
+                Ok(_) => health.record_stimulus_ok(&def_id, now),
+                Err(e) => {
+                    tracing::warn!("ingest: duty `{def_id}` failed: {e}");
+                    health.record_stimulus_err(&def_id, &e.to_string());
+                }
             }
         }
     }
@@ -303,7 +312,7 @@ mod tests {
             bus: Arc::new(Bus::new(config, queue.clone())),
             queue: queue.clone(),
             sensor: Arc::new(SubprocessSensor::new()),
-            broker: Arc::new(SecretsBroker::new(vec![])),
+            broker: Arc::new(SecretsBroker::new_test(vec![])),
             registry: Arc::new(RwLock::new(Registry::load(&root).unwrap())),
         };
 
@@ -366,7 +375,7 @@ mod tests {
             bus: Arc::new(Bus::new(config, queue.clone())),
             queue: queue.clone(),
             sensor: Arc::new(SubprocessSensor::new()),
-            broker: Arc::new(SecretsBroker::new(vec![])),
+            broker: Arc::new(SecretsBroker::new_test(vec![])),
             registry: Arc::new(RwLock::new(Registry::load(&root).unwrap())),
         };
 
@@ -396,7 +405,7 @@ mod tests {
             bus: Arc::new(Bus::new(config, queue.clone())),
             queue,
             sensor: Arc::new(SubprocessSensor::new()),
-            broker: Arc::new(SecretsBroker::new(vec![])),
+            broker: Arc::new(SecretsBroker::new_test(vec![])),
             registry: Arc::new(RwLock::new(Registry::default())),
         };
         let ids = ingestor

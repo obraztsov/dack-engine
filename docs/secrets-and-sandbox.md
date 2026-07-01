@@ -27,6 +27,16 @@ In both cases the token reaches the thing that needs it and never the agent's mo
 new credential is a provider entry plus a script — never a harness change. The provider is the single
 place root creds live; everything downstream sees only the bearer.
 
+**Rotating-token providers** (e.g. the X OAuth2 provider, `secrets-providers/x_oauth2.py`) keep app
+creds *and* the rotating tokens in a **single JSON store** (`env: { X_STORE: secrets/x.json }`, mode
+0600). The provider is called on every consuming route, so it is built to be safe under contention and
+failure: a sibling `.lock` file (`flock`) serializes the read→refresh→write critical section (no
+double-spend of a rotating refresh token, even across two daemons); writes are atomic (tmp +
+`os.replace`) and merge-preserve the app creds; and a **circuit-breaker** (`cooldown_until`) makes a
+rejected refresh fail *fast* without re-hitting the endpoint, so a dead token can never storm the API.
+Re-auth is just pasting a fresh `refresh_token` into the store — the breaker auto-clears when the token
+changes.
+
 ### `forwarded_env`
 
 Reserved for **recoverable** values (an API key, a handle, a rate limit) — a leak means rotate, not

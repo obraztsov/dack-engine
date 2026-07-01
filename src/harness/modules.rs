@@ -197,7 +197,7 @@ mod tests {
     use std::io::Read;
 
     fn broker() -> Arc<SecretsBroker> {
-        Arc::new(SecretsBroker::new(vec![]))
+        Arc::new(SecretsBroker::new_test(vec![]))
     }
 
     /// A disabled module is never spawned, and `run` returns immediately when nothing is enabled.

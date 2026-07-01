@@ -90,7 +90,7 @@ tier_policy:
 secrets_providers:
   - name: x
     command: ["python3", "secrets-providers/x_oauth2.py"]
-    env: { X_CREDS_FILE: "agentdack.rw.x.txt", X_TOKEN_STORE: "agentdack.rw.x.txt.tokens.json" }
+    env: { X_STORE: "secrets/x.json" }              # one store: {client_id, client_secret, refresh_token, access_token, …}
     keys: [X_BEARER_TOKEN]
     trust: public                                  # the X bearer touches the public world
   # - name: telegram_bot

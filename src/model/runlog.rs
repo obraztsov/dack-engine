@@ -41,6 +41,10 @@ pub struct RunLogEntry {
     /// Anchor for `runlog_ref`, e.g. "run-0412".
     pub run_id: String,
     pub stimulus_id: StimulusId,
+    /// The duty/source id that emitted this cycle's stimulus (e.g. `telegram-op`, `twitter-mentions`);
+    /// `harness*` for synthesized wakes (reflect, back-online, workers). Feeds the per-source runlog stats.
+    #[serde(default)]
+    pub source: String,
     pub state: ConsciousnessState,
     /// A summary of the assembled invocation context.
     pub context_summary: String,

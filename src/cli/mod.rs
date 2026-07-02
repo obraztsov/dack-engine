@@ -499,6 +499,11 @@ async fn run(config_path: &str) -> Result<()> {
     let runlog_repo = build_runlog_repo(&config, &runlog_root, &soul_did);
     let runlog: Arc<dyn RunLogWriter> =
         Arc::new(DailyFileRunLog::new(runlog_repo, soul_did.clone()));
+    // Rebuild the runlog activity index from the retained day-files (a longer boot is acceptable) so
+    // the `environment` map's multi-day histograms are populated from the first wake.
+    if let Err(e) = runlog.rebuild_stats().await {
+        tracing::warn!("runlog stats rebuild failed (environment histograms start empty): {e}");
+    }
     // Shared runtime health registry (the "subconscious"): the broker records per-secret health,
     // the loops record per-stimulus health, and Reflect / `dack status` read the one snapshot.
     let health = Arc::new(crate::health::HealthRegistry::new(chrono::Utc::now().timestamp()));

@@ -236,6 +236,7 @@ impl Harness {
         let entry = RunLogEntry {
             run_id: format!("run-{}-error", stimulus.id.0),
             stimulus_id: stimulus.id.clone(),
+            source: stimulus.source.clone(),
             state: ConsciousnessState::Perceive,
             context_summary: format!("dispatch failed before completion: {err}"),
             baton: None,
@@ -1214,6 +1215,7 @@ impl Harness {
     /// - ENTRY (Perceive): the directive (lean `---resume---` half on a resume) + payload as SEPARATE
     ///   blocks. Plus, FRESH only, a memory tail (grounding). Plus the runlog (see `runlog_blocks`).
     /// - ACT (Express): the digested Baton (never raw bytes). Plus the runlog (resume = conversation diff).
+    ///
     /// `ctx` controls memory + the runlog views; memory is never re-sent on a resume (the session holds it;
     /// the duck `Read`s `memory/` on demand). The caller appends orientation (before) + transitions (after).
     async fn context_blocks(
@@ -1266,7 +1268,7 @@ impl Harness {
                         trusted: true,
                     });
                 }
-                out.extend(self.runlog_blocks(tag, is_resume, watermark, &ctx.runlog).await);
+                out.extend(self.runlog_blocks(tag, state, is_resume, watermark, &ctx.runlog).await);
                 // The UNTRUSTED world-payload sits LAST: it's the most volatile block AND the thing the
                 // model acts on, so recency attention is strongest here; and a trusted block (the caller's
                 // allowed-transitions) still closes after it, so the model's final read is your instruction,
@@ -1280,53 +1282,174 @@ impl Harness {
             StepInput::Act(baton) => {
                 // Same shape: volatile runlog first, then the Baton (the digested gist to act on) LAST —
                 // freshest for the act decision (recency).
-                out.extend(self.runlog_blocks(tag, is_resume, watermark, &ctx.runlog).await);
+                out.extend(self.runlog_blocks(tag, state, is_resume, watermark, &ctx.runlog).await);
                 out.push(baton_block(baton));
             }
         }
         out
     }
 
-    /// The runlog context views (harness-authored one-liners — NO raw payload). Two independent channels,
-    /// each emitted only when its count > 0 and its result is non-empty:
-    /// - **environment** (global recent tail): FRESH wakes only — broad orientation across all activity.
-    /// - **conversation** (entries tagged with this wake's `tag` = `dedup_key`): the recent tail on a
-    ///   FRESH wake, the **diff since `watermark`** on a RESUME — so the session sees only its own chat's
-    ///   history (no parallel-chat bloat) and, on a resume, only what happened while it slept.
+    /// The runlog context blocks — mirroring the fresh-vs-resume split:
+    /// - **FRESH** ("first user message in the session"): `environment` (a compact-prose map of the
+    ///   duck's short-term memory) + `thread` (the last N FULL safe entries of this conversation).
+    /// - **RESUME**: `environment-recent` (a lean GLOBAL diff of what else happened while it slept) +
+    ///   `thread-recent` (this conversation's FULL entries since it last woke, ≤ the configured lookback).
+    ///
+    /// Thread membership is by TAG (`= dedup_key`), so an entry another source tagged with this thread's
+    /// key is included. Safe entries exclude the raw untrusted payload, so these blocks are trusted.
     async fn runlog_blocks(
         &self,
         tag: Option<&str>,
+        state: ConsciousnessState,
         is_resume: bool,
         watermark: Option<i64>,
         cfg: &crate::state_prompt::RunlogContext,
     ) -> Vec<ContextBlock> {
         let mut out = Vec::new();
-        // Environment: global tail, FRESH only.
-        if cfg.environment > 0 && !is_resume {
-            let body = self.runlog.tail_filtered(None, cfg.environment, None).await.unwrap_or_default();
-            if !body.trim().is_empty() {
+        if !is_resume {
+            // FRESH: the map, then this thread's real history.
+            if cfg.environment > 0 {
+                if let Some(body) =
+                    self.environment_block(tag, cfg, state == ConsciousnessState::Reflect).await
+                {
+                    out.push(ContextBlock { label: "environment".into(), body, trusted: true });
+                }
+            }
+            if cfg.thread > 0 {
+                if let Some(t) = tag {
+                    let body =
+                        self.runlog.tail_entries(None, cfg.thread, Some(t)).await.unwrap_or_default();
+                    if !body.trim().is_empty() {
+                        out.push(ContextBlock {
+                            label: "thread".into(),
+                            body: format!("Recent history of THIS conversation (tag `{t}`), oldest→newest:\n\n{body}"),
+                            trusted: true,
+                        });
+                    }
+                }
+            }
+        } else {
+            // RESUME: the global diff since last wake, then this thread's new entries (≤ lookback).
+            let since = watermark.unwrap_or(0);
+            if let Some(body) = self.environment_recent_block(since).await {
                 out.push(ContextBlock { label: "environment-recent".into(), body, trusted: true });
             }
-        }
-        // Conversation: this-tag view — tail on fresh, diff on resume. Needs a tag to filter against.
-        if cfg.conversation > 0 {
-            if let Some(t) = tag {
-                let (label, since) = if is_resume {
-                    ("conversation-since-last-wake", Some(watermark.unwrap_or(0)))
-                } else {
-                    ("conversation-recent", None)
-                };
-                let body = self
-                    .runlog
-                    .tail_filtered(since, cfg.conversation, Some(t))
-                    .await
-                    .unwrap_or_default();
-                if !body.trim().is_empty() {
-                    out.push(ContextBlock { label: label.into(), body, trusted: true });
+            if cfg.thread > 0 {
+                if let Some(t) = tag {
+                    let floor = chrono::Utc::now().timestamp() - cfg.thread_recent_lookback_secs.max(0);
+                    let body = self
+                        .runlog
+                        .tail_entries(Some(since.max(floor)), 1000, Some(t))
+                        .await
+                        .unwrap_or_default();
+                    if !body.trim().is_empty() {
+                        out.push(ContextBlock {
+                            label: "thread-recent".into(),
+                            body: format!("THIS conversation (tag `{t}`) since you last woke:\n\n{body}"),
+                            trusted: true,
+                        });
+                    }
                 }
             }
         }
         out
+    }
+
+    /// The fresh-wake `environment` map — a compact-prose digest of the duck's short-term memory:
+    /// today's activity, this thread's activity, the recent live tags, and this thread's note +
+    /// co-tags. (Multi-day histograms + a by-source view arrive with the runlog-stats registry in a
+    /// later phase; today it's derived from today's runlog + the tag-notes catalogue.)
+    async fn environment_block(
+        &self,
+        tag: Option<&str>,
+        cfg: &crate::state_prompt::RunlogContext,
+        for_reflect: bool,
+    ) -> Option<String> {
+        let stats = self.runlog.stats().await.unwrap_or_default();
+        let ndays = cfg.environment.max(1);
+        let mut lines: Vec<String> = Vec::new();
+        // Runs/day across the retained history (most-recent `ndays`, newest first).
+        if !stats.days.is_empty() {
+            lines.push(format!("Runs/day: {}.", day_histogram(&stats.days, ndays)));
+        }
+        // By-source totals — ONLY in Reflect (its whole-system vantage): which duties are driving the
+        // duck's activity across the retained window, busiest first.
+        if for_reflect && !stats.by_source.is_empty() {
+            let mut totals: Vec<(&String, usize)> =
+                stats.by_source.iter().map(|(s, d)| (s, d.values().sum())).collect();
+            totals.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+            let joined = totals
+                .iter()
+                .take(12)
+                .map(|(s, c)| format!("{s} {c}"))
+                .collect::<Vec<_>>()
+                .join(" · ");
+            lines.push(format!("By source (recent): {joined}."));
+        }
+        // This thread's activity per day (only days it was active).
+        if let Some(t) = tag {
+            match stats.by_tag.get(t) {
+                Some(td) if !td.is_empty() => {
+                    lines.push(format!("This thread (`{t}`)/day: {}.", day_histogram(td, ndays)));
+                }
+                _ => lines.push(format!("This thread (`{t}`): no runs recorded yet.")),
+            }
+        }
+        // Recent live tags (latest-per-tag), newest first, with a trust abbreviation.
+        let recent = self.runlog.tag_notes(None, None, true, cfg.recent_tags).await.unwrap_or_default();
+        if !recent.is_empty() {
+            let joined = recent
+                .iter()
+                .rev()
+                .map(|r| format!("{}({})", r.tag, trust_abbrev(&r.trust)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(format!("Recent tags: {joined}."));
+        }
+        if let Some(t) = tag {
+            if let Some(n) = self.runlog.tag_notes(None, Some(t), true, 1).await.unwrap_or_default().last() {
+                lines.push(format!("This thread's note: \"{}\" ({}).", n.note, n.trust));
+            }
+            // Co-tags: other tags co-occurring with this thread's key in today's entries.
+            let metas = self.runlog.day_meta().await.unwrap_or_default();
+            let mut co: Vec<String> = Vec::new();
+            for m in metas.iter().filter(|m| m.tags.iter().any(|x| x == t)) {
+                for other in m.tags.iter().filter(|o| *o != t) {
+                    if !co.contains(other) {
+                        co.push(other.clone());
+                    }
+                }
+            }
+            if !co.is_empty() {
+                lines.push(format!("This thread's co-tags: {}.", co.join(", ")));
+            }
+        }
+        (!lines.is_empty()).then(|| lines.join("\n"))
+    }
+
+    /// The resume `environment-recent` block — a lean GLOBAL diff since the session last woke: new
+    /// runs (heading one-liners) + new tag-notes. So a resumed session learns what else happened in
+    /// the world while it slept (there is otherwise no global view on a resume).
+    async fn environment_recent_block(&self, since: i64) -> Option<String> {
+        let runs = self.runlog.tail_filtered(Some(since), 40, None).await.unwrap_or_default();
+        let notes = self.runlog.tag_notes(Some(since), None, false, 40).await.unwrap_or_default();
+        let mut parts: Vec<String> = Vec::new();
+        if !runs.trim().is_empty() {
+            parts.push(format!("Other runs since you last woke:\n{runs}"));
+        }
+        if !notes.is_empty() {
+            let joined = notes
+                .iter()
+                .map(|n| format!("- {}: \"{}\" ({})", n.tag, n.note, n.trust))
+                .collect::<Vec<_>>()
+                .join("\n");
+            parts.push(format!("New notes:\n{joined}"));
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join("\n\n"))
+        }
     }
 
     /// A state-prompt's system prompt = **SOUL.md** (the constant self) + the state-prompt's own
@@ -1485,6 +1608,7 @@ impl Harness {
             },
             stimulus_id: stimulus.id.clone(),
             state,
+            source: stimulus.source.clone(),
             context_summary: format!(
                 "source={} type={} directive_tier={:?} payload_tier={:?}",
                 stimulus.source, stimulus.type_, stimulus.directive_tier, stimulus.payload_tier
@@ -1931,6 +2055,27 @@ fn skill_catalogue_entry(dir_name: &str, skill_md: &str) -> Option<String> {
     Some(format!("- {name} — {}", truncate_chars(&desc, 240)))
 }
 
+/// A compact newest-first `date count · date count` histogram over the most-recent `n` days of a
+/// date→count map (dates sort lexically = chronologically).
+fn day_histogram(days: &std::collections::BTreeMap<String, usize>, n: usize) -> String {
+    days.iter()
+        .rev()
+        .take(n)
+        .map(|(d, c)| format!("{d} {c}"))
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// Short trust label for the compact `environment` prose (`public`→`pub`, `operator_signed`→`op`;
+/// `org`/`self` stay as-is).
+fn trust_abbrev(trust: &str) -> &str {
+    match trust {
+        "public" => "pub",
+        "operator_signed" => "op",
+        other => other,
+    }
+}
+
 fn orientation_block(
     prompt: &StatePrompt,
     soul_root: &std::path::Path,
@@ -1948,12 +2093,16 @@ fn orientation_block(
             .join(", ")
     };
     // Live facts only — SOUL.md says how to use them (navigation, the one-outward-action rule, …).
+    // `now` is AUTHORITATIVE and lives here (sent on every message, fresh + resume) so a resumed
+    // session never reads a stale clock — unlike the SDK's memoized date, which freezes at bridge start.
     let body = format!(
-        "state: {:?} (prompt `{}`)\n\
+        "now: {} (authoritative — this is the real current time)\n\
+         state: {:?} (prompt `{}`)\n\
          working_dir: {}\n\
          capabilities_this_step: {}\n\
          cycle_trust: {} -> may reach up to: {:?}\n\
          next_steps: see the allowed-transitions block.",
+        chrono::Utc::now().format("%Y-%m-%d %H:%M UTC (%a)"),
         prompt.state,
         prompt.id,
         soul_root.display(),
@@ -4078,7 +4227,7 @@ mod tests {
             context: Some(crate::state_prompt::ContextConfig {
                 memory: true,
                 tag_key: true,
-                runlog: crate::state_prompt::RunlogContext { environment: 10, conversation: 20 },
+                runlog: crate::state_prompt::RunlogContext { thread: 20, ..Default::default() },
             }),
             system_frame: String::new(),
             body: "FULL-BODY-go".into(),
@@ -4124,18 +4273,21 @@ mod tests {
             "the body no longer leaks into the system prompt (it's the task block now)"
         );
 
-        // Resume-aware blocks: memory + the global ENVIRONMENT view are FRESH-only; a RESUME drops both
-        // and instead carries the CONVERSATION diff (what happened in this chat while it slept). (Tag
-        // scoping itself is unit-tested in `runlog::tail_filtered_gates_by_time_and_tag`; FileRunLog here
-        // doesn't filter, so this asserts the BLOCK ASSEMBLY — which label appears when.)
+        // Resume-aware blocks (the fresh-vs-resume split): a FRESH wake carries `self-orientation` +
+        // the `environment` map + the `thread` history; a RESUME drops those and instead carries the
+        // `environment-recent` GLOBAL diff + the `thread-recent` conversation diff. (Tag/since filtering
+        // is unit-tested in the runlog module; FileRunLog here doesn't filter, so this asserts BLOCK
+        // ASSEMBLY — which label appears when.)
         let has = |i: usize, label: &str| seen[i].blocks.iter().any(|b| b.label == label);
-        assert!(has(0, "self-orientation"), "fresh wake carries the self-orientation block (grounding)");
+        assert!(has(0, "self-orientation"), "fresh wake carries self-orientation (grounding)");
+        assert!(has(0, "environment"), "fresh wake carries the environment map");
         assert!(!has(1, "self-orientation"), "RESUME drops self-orientation (the session already has it)");
-        assert!(!has(1, "environment-recent"), "RESUME drops the global environment view (fresh-only)");
-        assert!(has(1, "conversation-since-last-wake"), "RESUME injects the conversation DIFF block");
-        assert!(!has(1, "conversation-recent"), "a resume uses the diff label, not the fresh tail");
+        assert!(!has(1, "environment"), "RESUME drops the fresh environment map (fresh-only)");
+        assert!(has(1, "environment-recent"), "RESUME injects the GLOBAL diff since last wake");
+        assert!(has(1, "thread-recent"), "RESUME injects the conversation (thread) DIFF block");
+        assert!(!has(1, "thread"), "a resume uses thread-recent, not the fresh thread block");
         assert!(has(2, "self-orientation"), "a different thread's fresh wake carries self-orientation again");
-        assert!(has(2, "environment-recent"), "a fresh wake (with prior runlog) carries the environment view");
+        assert!(has(2, "environment"), "a fresh wake carries the environment map");
         // The block actually surfaces the skill catalogue + the memory-index head (not an empty shell).
         let orient0 = seen[0].blocks.iter().find(|b| b.label == "self-orientation").unwrap();
         assert!(orient0.body.contains("- demo — a demo skill"), "skills catalogue surfaced");

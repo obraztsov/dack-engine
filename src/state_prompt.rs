@@ -69,6 +69,18 @@ fn default_environment() -> usize {
     10
 }
 
+fn default_thread_depth() -> usize {
+    10
+}
+
+fn default_thread_recent_lookback() -> i64 {
+    3600
+}
+
+fn default_recent_tags() -> usize {
+    25
+}
+
 /// How much runlog to inject, as TWO independent views (the de-bloat for sticky sessions):
 /// - `environment`: the GLOBAL recent tail (last N), FRESH wakes only — broad orientation across all
 ///   activity. `0` = off. Dropped on a resume (the session already carries it; it's broad noise there).
@@ -77,15 +89,31 @@ fn default_environment() -> usize {
 ///   have anything tagged to filter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunlogContext {
+    /// Show the fresh-wake `environment` map (short-term-memory digest); days of history it
+    /// summarizes (`0` = off). On a resume it's replaced by the lean `environment-recent` diff.
     #[serde(default = "default_environment")]
     pub environment: usize,
-    #[serde(default)]
-    pub conversation: usize,
+    /// Fresh-wake `thread` block: the last N **full safe entries** (thought + gist + batons + tool
+    /// audit, raw payload excluded) of the current thread (`0` = off; needs a thread key `tag_key`).
+    #[serde(default = "default_thread_depth")]
+    pub thread: usize,
+    /// Resume `thread-recent` block: include this thread's entries since `max(watermark, now - this)`
+    /// seconds — the "since you last woke, but at most this far back" diff.
+    #[serde(default = "default_thread_recent_lookback")]
+    pub thread_recent_lookback_secs: i64,
+    /// `environment` block: how many recent tags to list.
+    #[serde(default = "default_recent_tags")]
+    pub recent_tags: usize,
 }
 
 impl Default for RunlogContext {
     fn default() -> Self {
-        Self { environment: 10, conversation: 0 }
+        Self {
+            environment: default_environment(),
+            thread: default_thread_depth(),
+            thread_recent_lookback_secs: default_thread_recent_lookback(),
+            recent_tags: default_recent_tags(),
+        }
     }
 }
 
@@ -289,25 +317,26 @@ mod tests {
 
     #[test]
     fn context_config_parses_tag_key_and_runlog_views() {
-        // Absent → defaults: memory on, no tag_key, environment 10, conversation 0.
+        // Absent → defaults: memory on, no tag_key, environment 10, thread 10.
         let sp = StatePrompt::parse("p", "---\nstate: perceive\n---\nx").unwrap();
         assert!(sp.context.is_none());
         let c = sp.context();
         assert!(c.memory && !c.tag_key);
-        assert_eq!((c.runlog.environment, c.runlog.conversation), (10, 0));
-        // Declared → tag_key on + two-view runlog; unset fields keep their defaults.
+        assert_eq!((c.runlog.environment, c.runlog.thread), (10, 10));
+        assert_eq!((c.runlog.thread_recent_lookback_secs, c.runlog.recent_tags), (3600, 25));
+        // Declared → tag_key on + runlog knobs; unset fields keep their defaults.
         let sp = StatePrompt::parse(
             "p",
-            "---\nstate: perceive\ncontext: { tag_key: true, runlog: { environment: 40, conversation: 40 } }\n---\nx",
+            "---\nstate: perceive\ncontext: { tag_key: true, runlog: { environment: 40, thread: 20 } }\n---\nx",
         )
         .unwrap();
         let c = sp.context();
         assert!(c.memory && c.tag_key);
-        assert_eq!((c.runlog.environment, c.runlog.conversation), (40, 40));
-        // Partial runlog → named field overrides, the other defaults.
-        let sp = StatePrompt::parse("p", "---\nstate: perceive\ncontext: { runlog: { conversation: 20 } }\n---\nx").unwrap();
+        assert_eq!((c.runlog.environment, c.runlog.thread), (40, 20));
+        // Partial runlog → named field overrides, the others default.
+        let sp = StatePrompt::parse("p", "---\nstate: perceive\ncontext: { runlog: { thread: 5 } }\n---\nx").unwrap();
         let c = sp.context();
-        assert_eq!((c.runlog.environment, c.runlog.conversation), (10, 20));
+        assert_eq!((c.runlog.environment, c.runlog.thread), (10, 5));
     }
 
     #[test]

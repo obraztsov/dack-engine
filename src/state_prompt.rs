@@ -77,8 +77,8 @@ fn default_thread_recent_lookback() -> i64 {
     3600
 }
 
-fn default_recent_tags() -> usize {
-    25
+fn default_recent_notes() -> usize {
+    20
 }
 
 /// How much runlog to inject, as TWO independent views (the de-bloat for sticky sessions):
@@ -101,9 +101,10 @@ pub struct RunlogContext {
     /// seconds — the "since you last woke, but at most this far back" diff.
     #[serde(default = "default_thread_recent_lookback")]
     pub thread_recent_lookback_secs: i64,
-    /// `environment` block: how many recent tags to list.
-    #[serde(default = "default_recent_tags")]
-    pub recent_tags: usize,
+    /// `environment` block: how many recent sticky-notes (newest-first, tag + trust + text) to show —
+    /// the duck's cross-thread short-term memory.
+    #[serde(default = "default_recent_notes")]
+    pub recent_notes: usize,
 }
 
 impl Default for RunlogContext {
@@ -112,7 +113,7 @@ impl Default for RunlogContext {
             environment: default_environment(),
             thread: default_thread_depth(),
             thread_recent_lookback_secs: default_thread_recent_lookback(),
-            recent_tags: default_recent_tags(),
+            recent_notes: default_recent_notes(),
         }
     }
 }
@@ -323,7 +324,7 @@ mod tests {
         let c = sp.context();
         assert!(c.memory && !c.tag_key);
         assert_eq!((c.runlog.environment, c.runlog.thread), (10, 10));
-        assert_eq!((c.runlog.thread_recent_lookback_secs, c.runlog.recent_tags), (3600, 25));
+        assert_eq!((c.runlog.thread_recent_lookback_secs, c.runlog.recent_notes), (3600, 20));
         // Declared → tag_key on + runlog knobs; unset fields keep their defaults.
         let sp = StatePrompt::parse(
             "p",

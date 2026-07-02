@@ -1395,16 +1395,17 @@ impl Harness {
                 _ => lines.push(format!("This thread (`{t}`): no runs recorded yet.")),
             }
         }
-        // Recent live tags (latest-per-tag), newest first, with a trust abbreviation.
-        let recent = self.runlog.tag_notes(None, None, true, cfg.recent_tags).await.unwrap_or_default();
+        // Recent sticky notes (latest-per-tag), newest first, WITH their text + trust — the duck's
+        // cross-thread short-term memory. The current thread's own note is highlighted separately
+        // below, so drop it from this list to avoid duplication.
+        let recent = self.runlog.tag_notes(None, None, true, cfg.recent_notes).await.unwrap_or_default();
+        let recent: Vec<_> = recent.into_iter().filter(|r| Some(r.tag.as_str()) != tag).collect();
         if !recent.is_empty() {
-            let joined = recent
-                .iter()
-                .rev()
-                .map(|r| format!("{}({})", r.tag, trust_abbrev(&r.trust)))
-                .collect::<Vec<_>>()
-                .join(", ");
-            lines.push(format!("Recent tags: {joined}."));
+            let mut s = String::from("Recent notes (your sticky memory across threads, newest first):");
+            for r in recent.iter().rev() {
+                s.push_str(&format!("\n- {} ({}): \"{}\"", r.tag, trust_abbrev(&r.trust), r.note));
+            }
+            lines.push(s);
         }
         if let Some(t) = tag {
             if let Some(n) = self.runlog.tag_notes(None, Some(t), true, 1).await.unwrap_or_default().last() {

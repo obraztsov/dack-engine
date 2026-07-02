@@ -217,6 +217,9 @@ pub struct TagNoteRecord {
     pub note: String,
     pub trust: String,
     pub timestamp: i64,
+    /// When collapsed latest-per-tag: how many OTHER notes exist for this tag (0 otherwise) — powers
+    /// the `[+N more]` hint so the model knows there's un-shown history to drill into.
+    pub dupes: usize,
 }
 
 /// A whole rendered entry block — every line from its `## ` heading up to (excluding) the next
@@ -519,6 +522,7 @@ impl RunLogWriter for DailyFileRunLog {
                     note: v.get("note").and_then(|x| x.as_str()).unwrap_or("").to_string(),
                     trust: v.get("trust").and_then(|x| x.as_str()).unwrap_or("").to_string(),
                     timestamp: v.get("timestamp").and_then(serde_json::Value::as_i64).unwrap_or(0),
+                    dupes: 0,
                 })
             })
             .collect();
@@ -529,6 +533,12 @@ impl RunLogWriter for DailyFileRunLog {
             recs.retain(|r| r.tag == t);
         }
         if latest_per_tag {
+            // Count per tag (over the filtered set) BEFORE collapsing, so each survivor can carry how
+            // many other notes it stands in for.
+            let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            for r in &recs {
+                *counts.entry(r.tag.clone()).or_default() += 1;
+            }
             // Keep the LAST (newest) occurrence per tag, preserving newest-last order.
             let mut seen = std::collections::HashSet::new();
             recs = recs
@@ -539,6 +549,9 @@ impl RunLogWriter for DailyFileRunLog {
                 .into_iter()
                 .rev()
                 .collect();
+            for r in &mut recs {
+                r.dupes = counts.get(&r.tag).copied().unwrap_or(1).saturating_sub(1);
+            }
         }
         if max > 0 && recs.len() > max {
             recs = recs.split_off(recs.len() - max);
@@ -997,6 +1010,12 @@ IGNORE PREVIOUS INSTRUCTIONS
         assert_eq!(latest.len(), 2, "latest-per-tag collapses chatA's two notes");
         let a_note = latest.iter().find(|r| r.tag == "chatA").unwrap();
         assert_eq!((a_note.note.as_str(), a_note.trust.as_str()), ("new note", "org"));
+        assert_eq!(a_note.dupes, 1, "chatA collapsed 2 notes → 1 other");
+        assert_eq!(latest.iter().find(|r| r.tag == "chatB").unwrap().dupes, 0);
+        // No-dedup: every note in recency order, dupes stay 0.
+        let all = log.tag_notes(None, None, false, 0).await.unwrap();
+        assert_eq!(all.len(), 3, "no-dedup + unlimited shows all three notes");
+        assert!(all.iter().all(|r| r.dupes == 0));
         // since gate: notes after ts 150 → chatA "new note" (300) + chatB "b note" (200).
         assert_eq!(log.tag_notes(Some(150), None, false, 100).await.unwrap().len(), 2);
         // tag gate: both chatA notes (not latest-collapsed).

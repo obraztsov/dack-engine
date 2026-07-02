@@ -102,9 +102,15 @@ pub struct RunlogContext {
     #[serde(default = "default_thread_recent_lookback")]
     pub thread_recent_lookback_secs: i64,
     /// `environment` block: how many recent sticky-notes (newest-first, tag + trust + text) to show —
-    /// the duck's cross-thread short-term memory.
+    /// the duck's cross-thread short-term memory. **`0` = unlimited** (inject every note; the catalogue
+    /// is itself capped, so this is bounded — used by the digest so no fact is collapsed away).
     #[serde(default = "default_recent_notes")]
     pub recent_notes: usize,
+    /// Collapse recent notes to the LATEST per tag (with a `[+N more]` counter) vs show EVERY note in
+    /// recency order. Chats want `true` (broad — one note per thread, small cap covers many); the digest
+    /// wants `false` (see all the facts, nothing collapsed) so it can consolidate them into `memory/`.
+    #[serde(default = "default_true")]
+    pub dedup_notes: bool,
 }
 
 impl Default for RunlogContext {
@@ -114,6 +120,7 @@ impl Default for RunlogContext {
             thread: default_thread_depth(),
             thread_recent_lookback_secs: default_thread_recent_lookback(),
             recent_notes: default_recent_notes(),
+            dedup_notes: true,
         }
     }
 }
@@ -325,6 +332,7 @@ mod tests {
         assert!(c.memory && !c.tag_key);
         assert_eq!((c.runlog.environment, c.runlog.thread), (10, 10));
         assert_eq!((c.runlog.thread_recent_lookback_secs, c.runlog.recent_notes), (3600, 20));
+        assert!(c.runlog.dedup_notes, "dedup defaults on (chats collapse to latest-per-tag)");
         // Declared → tag_key on + runlog knobs; unset fields keep their defaults.
         let sp = StatePrompt::parse(
             "p",

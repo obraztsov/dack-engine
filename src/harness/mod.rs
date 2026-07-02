@@ -1398,18 +1398,25 @@ impl Harness {
         // Recent sticky notes (latest-per-tag), newest first, WITH their text + trust — the duck's
         // cross-thread short-term memory. The current thread's own note is highlighted separately
         // below, so drop it from this list to avoid duplication.
-        let recent = self.runlog.tag_notes(None, None, true, cfg.recent_notes).await.unwrap_or_default();
+        let recent = self
+            .runlog
+            .tag_notes(None, None, cfg.dedup_notes, cfg.recent_notes)
+            .await
+            .unwrap_or_default();
         let recent: Vec<_> = recent.into_iter().filter(|r| Some(r.tag.as_str()) != tag).collect();
         if !recent.is_empty() {
-            let mut s = String::from("Recent notes (your sticky memory across threads, newest first):");
+            let collapsed = if cfg.dedup_notes { "latest per tag" } else { "all, newest first" };
+            let mut s = format!("Recent notes (your sticky memory across threads, {collapsed}):");
             for r in recent.iter().rev() {
-                s.push_str(&format!("\n- {} ({}): \"{}\"", r.tag, trust_abbrev(&r.trust), r.note));
+                let more = if r.dupes > 0 { format!(" [+{} more]", r.dupes) } else { String::new() };
+                s.push_str(&format!("\n- {} ({}): \"{}\"{more}", r.tag, trust_abbrev(&r.trust), r.note));
             }
             lines.push(s);
         }
         if let Some(t) = tag {
             if let Some(n) = self.runlog.tag_notes(None, Some(t), true, 1).await.unwrap_or_default().last() {
-                lines.push(format!("This thread's note: \"{}\" ({}).", n.note, n.trust));
+                let more = if n.dupes > 0 { format!(" [+{} more]", n.dupes) } else { String::new() };
+                lines.push(format!("This thread's note: \"{}\" ({}){more}.", n.note, n.trust));
             }
             // Co-tags: other tags co-occurring with this thread's key in today's entries.
             let metas = self.runlog.day_meta().await.unwrap_or_default();

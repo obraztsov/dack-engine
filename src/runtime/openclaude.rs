@@ -51,11 +51,20 @@ const ALWAYS_DISALLOWED: &[&str] = &["Bash", "PowerShell", "REPL", "KillShell"];
 /// `<function=Bash>` tool calls that executed nothing — so the worker built nothing.
 fn disallowed_for(spec: &crate::state::StateSpec) -> Vec<String> {
     let worker_keeps_bash = spec.tool_scope.allows(crate::state::ToolClass::Shell);
-    ALWAYS_DISALLOWED
+    let mut out: Vec<String> = ALWAYS_DISALLOWED
         .iter()
         .filter(|t| !(worker_keeps_bash && **t == "Bash"))
         .map(|s| s.to_string())
-        .collect()
+        .collect();
+    // Defense-in-depth: NETWORK egress (WebFetch/WebSearch = `Net`) is a distinct class scoped to
+    // Perceive (+ the worker). Where a state's scope does NOT admit `Net`, hide these at the SDK layer
+    // too — so an Express/Settle/Reflect cycle isn't even offered the network (the wall denies it
+    // regardless, but not offering it stops an injected model from trying / burning a turn).
+    if !spec.tool_scope.allows(crate::state::ToolClass::Net) {
+        out.push("WebFetch".into());
+        out.push("WebSearch".into());
+    }
+    out
 }
 
 /// Rust → bridge.

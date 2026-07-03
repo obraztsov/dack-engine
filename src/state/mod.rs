@@ -45,9 +45,16 @@ pub enum ModelTier {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolClass {
-    /// Pure reads — FileRead, Grep, Glob, LSP, WebFetch/WebSearch (read), MCP resource
-    /// reads, ToolSearch, Task{Get,List,Output}. Safe in every state.
+    /// Pure LOCAL reads — FileRead, Grep, Glob, LSP, MCP resource reads, ToolSearch,
+    /// Task{Get,List,Output}. Safe in every state. (NETWORK reads are the separate `Net` class.)
     Read,
+    /// Network egress — `WebFetch` (fetch an arbitrary URL) / `WebSearch`. Distinct from a local
+    /// `Read`: it reaches the OUTSIDE network, so it is a callback / SSRF / **exfiltration** surface —
+    /// a prompt-injected cycle could be steered to fetch `attacker/?leak=<secret>` or probe an internal
+    /// address, and the request LEAVES regardless of the firebreak. Scoped to **Perceive only**
+    /// (read-only context-gathering) — NOT Express/Settle/Reflect, so an injected ACT cycle can't reach
+    /// the network. The sandboxed worker keeps it (research in a throwaway workspace).
+    Net,
     /// File write/edit — the single OpenClaude Write/Edit/NotebookEdit tool. **The path,
     /// not the tool, decides memory-vs-soul**: gated by `writable_dirs` (memory/ in
     /// Express/Settle; soul dirs in Reflect). One class; the per-path gate does the rest.
@@ -108,8 +115,9 @@ pub fn default_spec(state: ConsciousnessState) -> StateSpec {
             prompt_path: "prompts/perceive.md",
             model: ModelTier::CheapLocal,
             // Read-only: holds NO write tools at all, so raw-stimulus processing
-            // cannot mutate state.
-            tool_scope: ToolScope { allowed: vec![Read] },
+            // cannot mutate state. Net (WebFetch/WebSearch) is admitted HERE ONLY — context-gathering
+            // is a Perceive job, and a fetch here can't be chained to an outward act (that's Express).
+            tool_scope: ToolScope { allowed: vec![Read, Net] },
             writable_dirs: vec![],
         },
         Express => StateSpec {
@@ -163,7 +171,7 @@ pub fn worker_spec() -> StateSpec {
         prompt_path: "",
         model: ModelTier::Mixed,
         tool_scope: ToolScope {
-            allowed: vec![Read, FileWrite, Shell, Other],
+            allowed: vec![Read, Net, FileWrite, Shell, Other],
         },
         // "" = anything under the workspace (the responder's relativize root); the soul stays out.
         writable_dirs: vec![""],
@@ -253,6 +261,21 @@ mod tests {
                 "{s:?} must not have raw Shell in scope (it bypasses writable_dirs)"
             );
         }
+    }
+
+    #[test]
+    fn network_egress_is_perceive_only() {
+        // Net (WebFetch/WebSearch) = context-gathering, admitted ONLY in Perceive — an ACT/self-mod
+        // cycle (Express/Settle/Reflect) must never reach the network (exfil/SSRF/callback surface).
+        assert!(default_spec(Perceive).tool_scope.allows(ToolClass::Net), "Perceive gathers context");
+        for s in [Express, Settle, Reflect] {
+            assert!(
+                !default_spec(s).tool_scope.allows(ToolClass::Net),
+                "{s:?} must NOT reach the network (WebFetch/WebSearch)"
+            );
+        }
+        // The sandboxed worker keeps network for research.
+        assert!(super::worker_spec().tool_scope.allows(ToolClass::Net), "worker may research online");
     }
 
     #[test]

@@ -62,8 +62,13 @@ pub fn classify_tool(
             (ToolClass::Read, None)
         }
 
-        // Non-file reads (no path to gate).
-        "LSP" | "WebFetch" | "WebSearch" | "ReadMcpResource" | "ListMcpResources" | "ToolSearch"
+        // NETWORK egress — reaches an arbitrary external URL / a search provider. Its OWN class
+        // (`Net`), scoped to Perceive only (+ the sandboxed worker) — an exfil/SSRF/callback surface an
+        // injected ACT cycle must never reach, so it is NOT lumped with local reads.
+        "WebFetch" | "WebSearch" => (ToolClass::Net, None),
+
+        // Non-file LOCAL/harness reads (no path to gate, no network egress).
+        "LSP" | "ReadMcpResource" | "ListMcpResources" | "ToolSearch"
         | "TaskGet" | "TaskList" | "TaskOutput" => (ToolClass::Read, None),
 
         // File writes — the path decides memory vs soul (gated by writable_dirs).
@@ -128,6 +133,15 @@ mod tests {
         let (c, p) = classify_tool("Write", &json!({"file_path": "memory/log.md"}), &settle(), &post(), &read());
         assert_eq!(c, ToolClass::FileWrite);
         assert_eq!(p.as_deref(), Some("memory/log.md"));
+    }
+
+    #[test]
+    fn network_egress_is_its_own_net_class_not_read() {
+        // WebFetch/WebSearch reach the outside network → `Net` (Perceive-only), NOT `Read` (every state).
+        assert_eq!(classify_tool("WebFetch", &json!({"url": "http://x"}), &settle(), &post(), &read()).0, ToolClass::Net);
+        assert_eq!(classify_tool("WebSearch", &json!({"query": "x"}), &settle(), &post(), &read()).0, ToolClass::Net);
+        // A LOCAL non-file read stays Read.
+        assert_eq!(classify_tool("ToolSearch", &json!({}), &settle(), &post(), &read()).0, ToolClass::Read);
     }
 
     #[test]

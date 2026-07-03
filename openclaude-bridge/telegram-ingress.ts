@@ -72,6 +72,13 @@ bot.on('message', async (ctx) => {
   const m = ctx.message
   const fromId = m.from?.id ?? null
   const { path, why } = routeFor(cfg, fromId, m.chat.id)
+  // When the user ACTUALLY sent this message (Telegram `m.date`, unix seconds) → a readable UTC
+  // string the model can compare against its `now` block. A coalesced wake keeps each message's
+  // `sent_at` in `items[]`, so the model can tell messages that arrived WHILE it was thinking/replying
+  // from genuine impatient repeats — and see the real gaps between them.
+  const sent_at = m.date
+    ? new Date(m.date * 1000).toISOString().replace('T', ' ').replace(/\..+Z$/, ' UTC')
+    : null
   const body = {
     chat_id: m.chat.id,
     message_id: m.message_id,
@@ -79,6 +86,7 @@ bot.on('message', async (ctx) => {
     from_username: m.from?.username ?? null,
     from_user_id: fromId,
     chat_type: m.chat.type,
+    sent_at,
     // The THREAD key = the chat id (NOT per-message). The harness coalesces by this (a chat's
     // messages fold into one debounced wake) and keys the chat's sticky session on it. The
     // per-message id stays in `message_id` above (for reply-targeting + context).

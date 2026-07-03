@@ -20,6 +20,7 @@ import {
   clamp,
   cursorPage,
   findEntry,
+  fmtTime,
   listRecentTags,
   loadEntries,
   readTagNotes,
@@ -111,7 +112,7 @@ server.registerTool(
   async ({ run_id }: { run_id: string }) => {
     const e = findEntry(RUNLOG_DIR, run_id, READ_DAYS)
     if (!e) return asText({ ok: false, error: `entry "${run_id}" not found in the last ${READ_DAYS} days` })
-    return asText({ ok: true, run_id, tag: e.tags[0] ?? null, trust: e.trust || null, timestamp: e.timestamp, entry: renderEntryFull(e) })
+    return asText({ ok: true, run_id, tag: e.tags[0] ?? null, trust: e.trust || null, at: fmtTime(e.timestamp), entry: renderEntryFull(e) })
   },
 )
 
@@ -140,7 +141,13 @@ server.registerTool(
     inputSchema: { tag: z.string().optional(), min_trust: z.string().optional() },
   },
   async ({ tag, min_trust }: { tag?: string; min_trust?: string }) => {
-    return asText({ ok: true, notes: readTagNotes(RUNLOG_DIR, { tag, minTrust: min_trust }) })
+    const notes = readTagNotes(RUNLOG_DIR, { tag, minTrust: min_trust }).map((n) => ({
+      tag: n.tag,
+      note: n.note,
+      trust: n.trust,
+      at: fmtTime(n.timestamp),
+    }))
+    return asText({ ok: true, notes })
   },
 )
 

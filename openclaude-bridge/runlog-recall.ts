@@ -260,6 +260,14 @@ export function truncMark(s: string, n: number, runId: string): string {
   return `${s.slice(0, n).trimEnd()}… [+${s.length - n} chars — read_entry "${runId}" for the full entry]`
 }
 
+/** Unix seconds → a readable `YYYY-MM-DD HH:MM:SS UTC` — the SAME format as the harness `now` clock and
+ * the telegram/twitter `sent_at`, so every timestamp the model reads is directly comparable. Empty for a
+ * missing/zero stamp. */
+export function fmtTime(sec: number): string {
+  if (!sec) return ''
+  return new Date(sec * 1000).toISOString().replace('T', ' ').replace(/\..+Z$/, ' UTC')
+}
+
 /** Render the duck's OWN reasoning+output (thoughts + sent) per entry, labelled with its `run_id` +
  * tag + origin trust — and NEVER the raw incoming text. This is the firebreak-clean view, safe at
  * self-trust. Each field is TRUNCATED to a gist with a `[+N chars — read_entry …]` marker; the caller
@@ -276,7 +284,7 @@ export function renderThoughtLog(
   for (const e of entries) {
     const tag = e.tags[0] ?? '?'
     const trust = e.trust || '?'
-    if (e.thought) lines.push(`[${e.runId} · ${tag} · ${trust}] thought: ${truncMark(e.thought, maxThought, e.runId)}`)
+    if (e.thought) lines.push(`[${e.runId} · ${tag} · ${trust} · ${fmtTime(e.timestamp)}] thought: ${truncMark(e.thought, maxThought, e.runId)}`)
     for (const s of e.sent) lines.push(`  ↳ you: ${truncMark(s, maxSent, e.runId)}`)
   }
   return lines.join('\n')
@@ -347,7 +355,7 @@ export function findEntry(dir: string, runId: string, days: number): Entry | nul
  * for the public `recall` server (it taints); the self server leaves it false (firebreak-clean). */
 export function renderEntryFull(e: Entry, opts: { includeIncoming?: boolean } = {}): string {
   const tag = e.tags[0] ?? '?'
-  const lines: string[] = [`[${e.runId} · ${tag} · ${e.trust || '?'} · ${e.state}]`]
+  const lines: string[] = [`[${e.runId} · ${tag} · ${e.trust || '?'} · ${e.state} · ${fmtTime(e.timestamp)}]`]
   if (opts.includeIncoming) for (const inc of e.incoming) if (inc.text) lines.push(`[@${inc.from}]: ${inc.text}`)
   if (e.thought) lines.push(`thought: ${e.thought}`)
   for (const s of e.sent) lines.push(`  ↳ you: ${s}`)

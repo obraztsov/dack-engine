@@ -1317,8 +1317,9 @@ impl Harness {
             }
             if cfg.thread > 0 {
                 if let Some(t) = tag {
-                    let body =
-                        self.runlog.tail_entries(None, cfg.thread, Some(t)).await.unwrap_or_default();
+                    let body = humanize_entry_times(
+                        &self.runlog.tail_entries(None, cfg.thread, Some(t)).await.unwrap_or_default(),
+                    );
                     if !body.trim().is_empty() {
                         out.push(ContextBlock {
                             label: "thread".into(),
@@ -1337,11 +1338,13 @@ impl Harness {
             if cfg.thread > 0 {
                 if let Some(t) = tag {
                     let floor = chrono::Utc::now().timestamp() - cfg.thread_recent_lookback_secs.max(0);
-                    let body = self
-                        .runlog
-                        .tail_entries(Some(since.max(floor)), 1000, Some(t))
-                        .await
-                        .unwrap_or_default();
+                    let body = humanize_entry_times(
+                        &self
+                            .runlog
+                            .tail_entries(Some(since.max(floor)), 1000, Some(t))
+                            .await
+                            .unwrap_or_default(),
+                    );
                     if !body.trim().is_empty() {
                         out.push(ContextBlock {
                             label: "thread-recent".into(),
@@ -1409,14 +1412,25 @@ impl Harness {
             let mut s = format!("Recent notes (your sticky memory across threads, {collapsed}):");
             for r in recent.iter().rev() {
                 let more = if r.dupes > 0 { format!(" [+{} more]", r.dupes) } else { String::new() };
-                s.push_str(&format!("\n- {} ({}): \"{}\"{more}", r.tag, trust_abbrev(&r.trust), r.note));
+                s.push_str(&format!(
+                    "\n- {} ({} · {}): \"{}\"{more}",
+                    r.tag,
+                    trust_abbrev(&r.trust),
+                    fmt_utc(r.timestamp),
+                    r.note
+                ));
             }
             lines.push(s);
         }
         if let Some(t) = tag {
             if let Some(n) = self.runlog.tag_notes(None, Some(t), true, 1).await.unwrap_or_default().last() {
                 let more = if n.dupes > 0 { format!(" [+{} more]", n.dupes) } else { String::new() };
-                lines.push(format!("This thread's note: \"{}\" ({}){more}.", n.note, n.trust));
+                lines.push(format!(
+                    "This thread's note: \"{}\" ({} · {}){more}.",
+                    n.note,
+                    n.trust,
+                    fmt_utc(n.timestamp)
+                ));
             }
             // Co-tags: other tags co-occurring with this thread's key in today's entries.
             let metas = self.runlog.day_meta().await.unwrap_or_default();
@@ -2063,6 +2077,14 @@ fn skill_catalogue_entry(dir_name: &str, skill_md: &str) -> Option<String> {
     Some(format!("- {name} — {}", truncate_chars(&desc, 240)))
 }
 
+/// Unix seconds → readable `YYYY-MM-DD HH:MM:SS UTC` — the SAME format as the `now` clock, message
+/// `sent_at`, and the recall tools, so every timestamp the model reads is directly comparable.
+fn fmt_utc(ts: i64) -> String {
+    chrono::DateTime::from_timestamp(ts, 0)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_default()
+}
+
 /// A compact newest-first `date count · date count` histogram over the most-recent `n` days of a
 /// date→count map (dates sort lexically = chronologically).
 fn day_histogram(days: &std::collections::BTreeMap<String, usize>, n: usize) -> String {
@@ -2072,6 +2094,22 @@ fn day_histogram(days: &std::collections::BTreeMap<String, usize>, n: usize) -> 
         .map(|(d, c)| format!("{d} {c}"))
         .collect::<Vec<_>>()
         .join(" · ")
+}
+
+/// Rewrite a rendered entry's raw `- timestamp: <epoch>` lines into a readable `- at: <UTC>` so the
+/// thread blocks carry times the model can compare against its `now` clock (when it last replied vs
+/// when new messages arrived).
+fn humanize_entry_times(text: &str) -> String {
+    text.lines()
+        .map(|l| {
+            l.strip_prefix("- timestamp: ")
+                .and_then(|ts| ts.trim().parse::<i64>().ok())
+                .and_then(|epoch| chrono::DateTime::from_timestamp(epoch, 0))
+                .map(|dt| format!("- at: {}", dt.format("%Y-%m-%d %H:%M:%S UTC")))
+                .unwrap_or_else(|| l.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Short trust label for the compact `environment` prose (`public`→`pub`, `operator_signed`→`op`;
@@ -2110,7 +2148,7 @@ fn orientation_block(
          capabilities_this_step: {}\n\
          cycle_trust: {} -> may reach up to: {:?}\n\
          next_steps: see the allowed-transitions block.",
-        chrono::Utc::now().format("%Y-%m-%d %H:%M UTC (%a)"),
+        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC (%a)"),
         prompt.state,
         prompt.id,
         soul_root.display(),

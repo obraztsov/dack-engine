@@ -33,6 +33,7 @@ import {
   renderEntryFull,
   renderTranscript,
   searchEntries,
+  fmtTime,
 } from './runlog-recall'
 
 // The MCP's cwd is the daemon's launch dir (where `openclaude-bridge/` lives), NOT the soul repo — so a
@@ -171,7 +172,11 @@ server.registerTool(
   },
   async ({ query, days, limit }: { query: string; days?: number; limit?: number }) => {
     const entries = loadEntries(RUNLOG_DIR, recentDates(RUNLOG_DIR, clamp(days, 14, 60)))
-    return asText({ ok: true, query, hits: searchEntries(entries, query, clamp(limit, 20, 100)) })
+    const hits = searchEntries(entries, query, clamp(limit, 20, 100)).map(({ when, ...h }) => ({
+      ...h,
+      at: fmtTime(when),
+    }))
+    return asText({ ok: true, query, hits })
   },
 )
 

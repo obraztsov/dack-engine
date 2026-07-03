@@ -42,6 +42,18 @@ post or settle capability.
 The wall classifies by the `mcp__<name>__` prefix and enforces the class per state — independent of
 what the model attempts.
 
+**The wall gates capability by state, not intent.** It answers one question — *is this tool class
+allowed in this state?* — not whether the model *should* act, or has acted before. In particular, a
+verbatim-**duplicate** outward call (the same reply or the same trade twice in one run) is **allowed**:
+if the model holds the key (it's in the right state-prompt with the capability), it may act, even
+identically. This is deliberate. A repeat is usually a legitimate **retry after a transient send
+failure** — the wall *allowing* a call is not the call *succeeding* (the MCP result comes back later,
+unseen by the wall) — so blocking a retry silently drops the real action while telling the model it went
+through (observed live: a Telegram reply lost to a socket hiccup, its retry blocked, the model wrongly
+concluding it delivered). Where an irreversible or costly repeat genuinely must be prevented, that bound
+belongs **outside the harness**: the chain rejects a replayed transaction (nonce), and the provider caps
+spend (e.g. cove's hourly / daily trading limits). Set those at the provider / on-chain, not in the wall.
+
 ## Trust (taint)
 
 `trust` is the taint label of the *data* a server puts in play. Calling any of its tools degrades the

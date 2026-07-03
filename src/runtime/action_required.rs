@@ -48,11 +48,12 @@ pub struct StatePolicyResponder {
     /// `memory_write_min_trust` (org+). When `false`, a `memory/` write is denied (an untrusted in-run
     /// cycle leaves tags; the digest consolidates). `true` by default (tests / no restriction).
     pub long_term_writable: bool,
-    /// Verbatim `(tool, input)` fingerprints of OUTWARD actions (Post / SettleTx) already ALLOWED
-    /// this invocation. A repeated identical one is a model loop, not intent — denied, so a weak
-    /// model that re-calls `post`/`buy_token` can't double-post or double-trade. A DISTINCT outward
-    /// action (a different reply, a different trade) is unaffected. Per-invocation (one responder
-    /// per run); interior-mutable because `decide` takes `&self`.
+    /// `(tool, input)` fingerprints of OUTWARD actions (Post / SettleTx) that ran this invocation —
+    /// tracked so [`acted_outward`](Self::acted_outward) can gate the timeout-retry path (never re-run
+    /// a wake that already posted/traded → no double-post on a re-run). Duplicates are NOT blocked: a
+    /// verbatim repeat is usually a legitimate retry after a send glitch (the wall allowing a call is
+    /// not the send succeeding), and irreversibility is bounded EXTERNALLY (chain nonce + provider
+    /// limits), not by the wall. Per-invocation; interior-mutable because `decide` takes `&self`.
     outward_seen: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
@@ -230,19 +231,22 @@ impl ActionResponder for StatePolicyResponder {
             }
         }
 
-        // (2.5) Single-outward dedup: an OUTWARD action (Post / SettleTx) repeated VERBATIM in the
-        // same run is a model loop (we saw mimo re-call `post` 6×), not intent — deny the duplicate
-        // so a glitch can't double-post or double-trade. A DISTINCT outward action (a different
-        // reply, a different trade) still passes. Read/FileWrite are unaffected (they may repeat).
+        // (2.5) Record OUTWARD actions (Post / SettleTx) so `acted_outward()` can gate the
+        // timeout-retry path (never re-run a wake that already posted/traded → no double-post on a
+        // re-run). We DO NOT block a verbatim-duplicate outward call. A repeat is usually a legitimate
+        // RETRY after a send glitch — the wall ALLOWING a call is NOT the send SUCCEEDING (the MCP
+        // result returns later, unseen here), so blocking a retry drops the real message AND misleads
+        // the model into thinking it delivered (observed live: a reply to avanturismo silently lost).
+        // The model is reliable (measured duplicate rate ~0.4%, single retries, no loops). Where an
+        // irreversible/costly repeat genuinely must be prevented, that bound is EXTERNAL — the chain
+        // rejects a replayed tx (nonce), the provider caps spend (cove hourly/daily limits) — not the
+        // wall's job to guess intent. If you hold the key (the right state-prompt + access), you may
+        // act, even identically; block it on-chain / at the provider, not here.
         if matches!(class, ToolClass::Post | ToolClass::SettleTx) {
-            let fingerprint = format!("{}\u{1}{}", req.tool, req.input);
-            if !self.outward_seen.lock().unwrap().insert(fingerprint) {
-                return ActionDecision::Deny(format!(
-                    "duplicate outward action — `{}` with identical input already done this cycle \
-                     (one outward action per run)",
-                    req.tool
-                ));
-            }
+            self.outward_seen
+                .lock()
+                .unwrap()
+                .insert(format!("{}\u{1}{}", req.tool, req.input));
         }
 
         // (3) Irreversible authority needs NO extra runtime predicate (the `allow_settle`
@@ -378,25 +382,25 @@ mod tests {
         ));
     }
 
-    /// The single-outward dedup guard: an identical Post repeated in one run is denied (the model
-    /// loop), but a DISTINCT post still passes, and ordinary reads/writes may repeat freely.
+    /// Duplicate outward actions are ALLOWED: a verbatim repeat is usually a legit retry after a send
+    /// glitch (blocking it drops the real message + misleads the model), and irreversibility is bounded
+    /// externally (chain nonce + provider limits), not by the wall. The fingerprint is still recorded so
+    /// `acted_outward()` keeps guarding the timeout-retry path.
     #[tokio::test]
-    async fn duplicate_outward_action_is_denied_distinct_is_allowed() {
+    async fn duplicate_outward_action_is_allowed_but_records_acted_outward() {
         let r = responder(ConsciousnessState::Express);
         let post = req("mcp__twitter__post", json!({"text": "the harness blinked"}));
         // First time: allowed.
         assert!(matches!(r.decide(&post).await, ActionDecision::Allow));
-        // Verbatim repeat (the loop): denied.
-        assert!(matches!(r.decide(&post).await, ActionDecision::Deny(_)));
-        // A DISTINCT post (different text): allowed.
+        // Verbatim repeat: NOW allowed too (a retry, not a loop-block).
+        assert!(matches!(r.decide(&post).await, ActionDecision::Allow));
+        // A distinct post: allowed.
         assert!(matches!(
             r.decide(&req("mcp__twitter__post", json!({"text": "different thought"}))).await,
             ActionDecision::Allow
         ));
-        // Non-outward actions (a memory write) may repeat — the guard only covers Post/SettleTx.
-        let w = req("Write", json!({"file_path": "memory/log.md", "contents": "x"}));
-        assert!(matches!(r.decide(&w).await, ActionDecision::Allow));
-        assert!(matches!(r.decide(&w).await, ActionDecision::Allow));
+        // …but the outward action WAS recorded → the timeout-retry guard still refuses to re-run it.
+        assert!(r.acted_outward(), "an allowed post flips acted_outward (no double-post on timeout re-run)");
     }
 
     /// `acted_outward` is the timeout-retry safety signal: it flips true ONLY once an outward action

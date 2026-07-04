@@ -1862,8 +1862,8 @@ async fn run_worker_detached(
     // inside the container (no docker-in-docker). The container IS the isolation — a docker worker is a
     // single agent. (A host worker keeps its sub-helpers) The bridge disallows the `Task`
     // tool whenever `agents` is empty, so the model can't even attempt a sub-agent here.
-    let agents = if isolated {
-        BTreeMap::new()
+    let (agents, sub_helper_tools) = if isolated {
+        (BTreeMap::new(), Vec::new())
     } else {
         worker_sub_helper_defs(&repo, &spawn.agent).await
     };
@@ -1886,7 +1886,19 @@ async fn run_worker_detached(
         mounts,
         // Pin the engine to the agent def's declared tools — so the SDK does NOT offer its full
         // default toolset (parts of which Docker-sandbox sub-work and die inside the worker container).
-        allowed_tools: def.fm.tools.clone(),
+        // WIDEN the lead's list with every injected sub-helper's tools: the SDK validates each
+        // registered agent against this ONE invocation-wide allowlist, so a sub-helper like `researcher`
+        // (WebFetch/WebSearch) must be covered or `injectAgents` rejects it and aborts ALL sub-helper
+        // injection. A docker worker has no sub-helpers (`sub_helper_tools` empty → lead-only, unchanged).
+        // The wall (`worker_spec`) + throwaway sandbox stay the real bound; this only widens SDK offers.
+        allowed_tools: def.fm.tools.clone().map(|mut lead| {
+            for t in &sub_helper_tools {
+                if !lead.contains(t) {
+                    lead.push(t.clone());
+                }
+            }
+            lead
+        }),
         timeout: None, // a worker uses the client default budget.
     };
     tracing::info!(
@@ -1956,11 +1968,15 @@ async fn reap_worker_container(name: &str) {
 
 /// The sub-helper defs a worker registers as `options.agents` — every `agents/**/*.md` EXCEPT the
 /// lead being run (no lead self-recursion). Sub-helper defs cap their own nesting via `disallowedTools`.
+/// Also returns the UNION of every sub-helper's declared tools: the SDK validates each registered
+/// agent's tools against the invocation-wide `allowedTools`, so the caller must widen that allowlist to
+/// cover them (else `injectAgents` rejects e.g. `researcher`'s WebFetch and aborts all injection).
 async fn worker_sub_helper_defs(
     repo: &Arc<dyn RepoHost>,
     except: &str,
-) -> BTreeMap<String, serde_json::Value> {
+) -> (BTreeMap<String, serde_json::Value>, Vec<String>) {
     let mut map = BTreeMap::new();
+    let mut tools: Vec<String> = Vec::new();
     let entries = repo.list_dir(&RepoPath("agents".into()), 2).await.unwrap_or_default();
     for p in entries {
         let Some(id) = p.0.strip_prefix("agents/").and_then(|s| s.strip_suffix(".md")) else {
@@ -1971,11 +1987,18 @@ async fn worker_sub_helper_defs(
         }
         if let Ok(bytes) = repo.read_file(&p).await {
             if let Ok(def) = AgentDef::parse(id, &String::from_utf8_lossy(&bytes)) {
+                if let Some(ts) = &def.fm.tools {
+                    for t in ts {
+                        if !tools.contains(t) {
+                            tools.push(t.clone());
+                        }
+                    }
+                }
                 map.insert(id.to_string(), def.to_options_value());
             }
         }
     }
-    map
+    (map, tools)
 }
 
 /// Inject a worker's result as a `worker_completion` stimulus — UNTRUSTED `public` payload (the
@@ -4434,7 +4457,7 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
         std::fs::create_dir_all(tmp.join("agents")).unwrap();
         std::fs::write(tmp.join("agents/coder.md"), "---\ndescription: coder\ntools: [Read, Write, Bash, Task]\n---\nBuild it well.").unwrap();
-        std::fs::write(tmp.join("agents/researcher.md"), "---\ndescription: research\ntools: [Read]\ndisallowedTools: [Task]\n---\nResearch it.").unwrap();
+        std::fs::write(tmp.join("agents/researcher.md"), "---\ndescription: research\ntools: [Read, WebSearch, WebFetch]\ndisallowedTools: [Task]\n---\nResearch it.").unwrap();
 
         let runtime = Arc::new(RecordingRuntime {
             seen: std::sync::Mutex::new(Vec::new()),
@@ -4463,6 +4486,14 @@ mod tests {
             assert!(req.spec.tool_scope.allows(crate::state::ToolClass::Shell), "worker may Bash");
             assert!(req.agents.contains_key("researcher"), "sub-helper registered for Task");
             assert!(!req.agents.contains_key("coder"), "the lead is not its own sub-helper");
+            // allowed_tools = the lead's tools WIDENED by every sub-helper's — so the SDK's injectAgents
+            // can validate the researcher sub-helper (WebFetch/WebSearch) it would otherwise reject.
+            let allowed = req.allowed_tools.as_ref().expect("worker pins an allowlist");
+            assert!(allowed.contains(&"Bash".to_string()), "lead's own tools kept");
+            assert!(
+                allowed.contains(&"WebFetch".to_string()) && allowed.contains(&"WebSearch".to_string()),
+                "sub-helper (researcher) tools folded in so injectAgents accepts it"
+            );
             assert!(
                 req.system_prompt.contains("Build it well.") && req.system_prompt.contains("build a parser"),
                 "def prompt + brief composed into the worker system prompt"

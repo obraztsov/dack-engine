@@ -792,6 +792,19 @@ pub struct CapabilityPrefixes {
 /// `gl` identity directories per liability-boundary role. Each is a path to a dir
 /// holding `identity.pem` (+ `ucan.json`). All optional: unset roles are simply absent (the
 /// harness falls back where it can). The Soul key is harness-only — never forwarded.
+/// Which backend signs and derives DIDs for the configured identity dirs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityBackend {
+    /// Native Ed25519 — reads the PKCS8 `identity.pem` directly, signs in-process. No external
+    /// tools; keys are made with `dack keygen`. The default, and what makes a fresh deploy possible.
+    #[default]
+    Local,
+    /// Legacy: shell out to the gitlawb `gl` CLI (`gl identity show`/`sign`). Requires the `gl`
+    /// binary on PATH. Only for setups that already manage keys through gitlawb.
+    Gitlawb,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IdentityDirs {
     #[serde(default)]
@@ -800,6 +813,9 @@ pub struct IdentityDirs {
     pub operator: Option<String>,
     #[serde(default)]
     pub builder: Option<String>,
+    /// Signing/DID backend (default `local`, native Ed25519). Set `gitlawb` to use the `gl` CLI.
+    #[serde(default)]
+    pub backend: IdentityBackend,
 }
 
 impl IdentityDirs {

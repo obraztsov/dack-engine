@@ -20,7 +20,9 @@ use crate::harness::ingest::{spawn_stimuli_watcher, Ingestor};
 use crate::harness::modules::ModuleSupervisor;
 use crate::harness::Harness;
 use crate::sandbox::{DockerSandbox, HostSandbox, IsolationPolicy, NetworkPolicy, Sandbox};
+use crate::config::IdentityBackend;
 use crate::identity::gitlawb::GitlawbIdentity;
+use crate::identity::local::LocalIdentity;
 use crate::identity::{IdentityProvider, IdentityRole};
 use crate::model::stimulus::{Priority, Stimulus, StimulusId, StimulusStatus, StimulusType, TrustTier};
 use crate::queue::{Queue, SqliteQueue};
@@ -69,6 +71,17 @@ pub enum Command {
     /// Commit external/hand edits to the soul tree (memory/prompts/stimuli) as the operator, so
     /// the daemon's per-run integrity tripwire doesn't revert them.
     Reconcile,
+    /// Generate a native Ed25519 identity keypair (`<dir>/identity.pem`, mode 0600) and print its
+    /// `did:key`. No external tools — this is how a fresh deploy creates the operator/soul/builder
+    /// DIDs. Refuses to overwrite an existing key.
+    Keygen {
+        /// Role label (operator | soul | builder) — used only in the printed guidance.
+        #[arg(long, default_value = "operator")]
+        role: String,
+        /// Directory to write `identity.pem` into (e.g. `identities/operator`).
+        #[arg(long)]
+        dir: String,
+    },
 }
 
 /// Dispatch a parsed CLI command. `run`/`status`/`log` are the daemon + read surfaces; `say`/
@@ -94,6 +107,33 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         )),
         Command::ReflectNow => reflect_now(&cli.config).await,
         Command::Reconcile => reconcile(&cli.config).await,
+        Command::Keygen { role, dir } => keygen(&role, &dir),
+    }
+}
+
+/// `dack keygen --role <r> --dir <d>` — generate a native Ed25519 identity (no `gl`, no gitlawb).
+/// Writes `<dir>/identity.pem` (0600) and prints the `did:key` to paste into `dack.config.yaml`.
+fn keygen(role: &str, dir: &str) -> Result<()> {
+    let did = crate::identity::local::generate(std::path::Path::new(dir))?;
+    println!("dack: generated {role} identity → {dir}/identity.pem (mode 0600, never commit it)");
+    println!("  did:key: {}", did.0);
+    if role == "operator" {
+        println!("  → set `operator_did: \"{}\"` in dack.config.yaml,", did.0);
+        println!("    and `identities: {{ operator: \"{dir}\" }}`.");
+    } else {
+        println!("  → set `identities: {{ {role}: \"{dir}\" }}` in dack.config.yaml.");
+    }
+    Ok(())
+}
+
+/// Build the configured identity provider. Native `LocalIdentity` (default) needs no external tools;
+/// `GitlawbIdentity` (legacy) shells out to the `gl` CLI. Both derive the same `did:key` from the
+/// same `identity.pem`, so switching backends never changes an actor's DID.
+async fn build_identity(config: &DackConfig) -> Result<Arc<dyn IdentityProvider>> {
+    let dirs = config.identity_dirs();
+    match config.identities.backend {
+        IdentityBackend::Local => Ok(Arc::new(LocalIdentity::resolve(dirs)?)),
+        IdentityBackend::Gitlawb => Ok(Arc::new(GitlawbIdentity::resolve("gl", dirs).await?)),
     }
 }
 
@@ -127,7 +167,7 @@ async fn log_cmd(config_path: &str, follow: bool) -> Result<()> {
 /// so the soul/operator private keys never have to meet.
 async fn say(config_path: &str, instruction: String) -> Result<()> {
     let config = DackConfig::load(config_path)?;
-    let identity = GitlawbIdentity::resolve("gl", config.identity_dirs()).await?;
+    let identity = build_identity(&config).await?;
     if identity.did(IdentityRole::Operator).is_none() {
         return Err(DackError::Config(
             "dack say: no operator identity dir (identities.operator) — cannot sign".into(),
@@ -467,10 +507,10 @@ async fn run(config_path: &str) -> Result<()> {
     // The runtime extensibility point: only openclaude+opengateway is wired; any other engine or
     // connector is a clear `NotImplemented` (the config slot exists, the adapter doesn't yet).
     let runtime: Arc<dyn RuntimeClient> = build_runtime(&config)?;
-    // Identity: resolve the configured `gl` role dirs. The Soul dir signs soul commits + the
-    // `gitlawb://` push; its key never enters agent env.
-    let identity: Arc<dyn IdentityProvider> =
-        Arc::new(GitlawbIdentity::resolve("gl", config.identity_dirs()).await?);
+    // Identity: resolve the configured role dirs via the selected backend (native `local` by
+    // default; `gitlawb` shells to `gl`). The Soul dir attributes soul commits (+ signs a
+    // `gitlawb://` push, if any); its key never enters agent env.
+    let identity: Arc<dyn IdentityProvider> = build_identity(&config).await?;
     let soul_did = identity
         .did(IdentityRole::Soul)
         .map(|d| d.0.clone())

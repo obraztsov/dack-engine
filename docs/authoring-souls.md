@@ -1,8 +1,8 @@
 # Authoring a soul
 
 The **soul** is the agent's durable identity and behavior — a git repository, separate from the engine,
-that the harness reads and the agent (in Reflect) may edit. `soul-template/` is a working starting
-point; copy it and point `config.soul_repo` at your copy.
+that the harness reads and the agent (in Reflect) may edit. Clone the public template
+(`git clone https://github.com/obraztsov/dack-soul.git my-soul`) and point `config.soul_repo` at your copy.
 
 ```
 soul/

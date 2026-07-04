@@ -65,6 +65,32 @@ precedence:
 The adapter's config (`telegram-ingress.config.json`, operator-owned and gitignored) is where the
 Telegram-specific rails live — chat/user → webhook path. The harness only knows path → tier.
 
+Its format (every key optional; defaults shown — the file it reads comes from the module's
+`TELEGRAM_INGRESS_CONFIG` env, else `telegram-ingress.config.json`):
+
+```json
+{
+  "harness_webhook": "http://127.0.0.1:8787",
+  "operator_user_id": 80375347,
+  "op_path": "/telegram/op",
+  "pub_path": "/telegram/pub",
+  "groups": { "-1001234567890": "/telegram/trusted" }
+}
+```
+
+- `harness_webhook` — base URL of the harness listener (match `webhook_addr`).
+- `operator_user_id` — your Telegram numeric user id; a message from it (in any chat) routes to
+  `op_path`. `null`/omitted = no operator recognition.
+- `groups` — a `chat_id → webhook path` map; a message in a listed group routes to that path.
+- `op_path` / `pub_path` — operator and fallback (everyone-else) paths.
+
+Routing per message: operator id → `op_path`; else a `groups[chat_id]` hit → that path; else `pub_path`.
+Each path's **trust tier** is set by `config.webhooks` in `dack.config.yaml` (above), never here. The
+adapter needs the bot token in its env (`TELEGRAM_BOT_TOKEN`, injected via the module's
+`secrets: [telegram_bot]`; it also falls back to `secrets/telegram.token`). Each POST it sends carries
+`{chat_id, message_id, text, from_username, from_user_id, chat_type, sent_at, dedup_key}` — where
+`dedup_key` (the chat id) is the per-conversation coalescing key.
+
 ### Egress — reply (destination-locked)
 
 `telegram-mcp.ts` is an MCP server exposing one tool, `reply{text}`. The harness injects the source

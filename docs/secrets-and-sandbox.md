@@ -37,6 +37,54 @@ rejected refresh fail *fast* without re-hitting the endpoint, so a dead token ca
 Re-auth is just pasting a fresh `refresh_token` into the store — the breaker auto-clears when the token
 changes.
 
+### Secret file formats
+
+The files a deployer creates by hand (all mode `0600`, all under a gitignored `secrets/`):
+
+**`secrets/x.json`** — the X/Twitter OAuth2 store (`secrets-providers/x_oauth2.py`, pointed at by
+`env: { X_STORE: secrets/x.json }`). You **seed** three fields; the provider writes the rest on first
+refresh and rotates them thereafter:
+
+```json
+{
+  "client_id":     "<your X app client id>",
+  "client_secret": "<your X app client secret>",
+  "refresh_token": "<a valid OAuth2 refresh token>"
+}
+```
+
+After the first run the store also holds the rotating `access_token`, `expires_at`, and the breaker
+fields (`cooldown_until`, `failed_refresh_token`) — leave those to the provider. **Re-auth** after a
+revoked token = paste a fresh `refresh_token` and restart; the mismatch auto-clears the breaker. The
+provider reads `X_STORE` (required) and optional `X_REFRESH_SKEW` (seconds, default 300), and emits
+`{"X_BEARER_TOKEN": "<access token>"}` on stdout. A sibling `secrets/x.json.lock` is created
+automatically (never edit it).
+
+**Raw single-token files** — for any simple bearer, `secrets-providers/file_token.py` reads a file and
+emits it under a chosen key. The file is just the token on one line:
+
+```
+# secrets/telegram.token
+123456789:AA…your-bot-token…
+```
+
+Wire it with a provider whose `env` names the key + file:
+
+```yaml
+secrets_providers:
+  - name: telegram_bot
+    command: ["python3", "secrets-providers/file_token.py"]
+    env: { TOKEN_KEY: TELEGRAM_BOT_TOKEN, TOKEN_FILE: "secrets/telegram.token" }
+    keys: [TELEGRAM_BOT_TOKEN]
+    trust: org
+```
+
+The same pattern covers `secrets/cove_read.token`, `secrets/cove_trade.token`, or any other
+single-token credential — one `file_token.py` provider per file.
+
+**Model gateway key** — not a `secrets/` file: it's `runtime.connector.api_key` in the gitignored
+config (or, if you omit it there, the `OPENAI_API_KEY` env var of the daemon process).
+
 ### `forwarded_env`
 
 Reserved for **recoverable** values (an API key, a handle, a rate limit) — a leak means rotate, not

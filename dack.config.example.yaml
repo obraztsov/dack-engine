@@ -7,11 +7,14 @@
 # This is a commented, runnable example. The exhaustive field reference is docs/configuration.md.
 
 # ── Required ──────────────────────────────────────────────────────────────────────────────────
-# The trusted operator DID. `dack say` signs an instruction with the operator key; the harness
-# verifies it against this DID — that is what makes a stimulus `operator_signed` (the top trust tier).
+# The trusted operator DID. Generate it (native Ed25519, no gitlawb):
+#   dack keygen --role operator --dir identities/operator   → prints the did:key to paste here
+# `dack say` signs an instruction with that operator key; the harness verifies it against this DID —
+# that is what makes a stimulus `operator_signed` (the top trust tier).
 operator_did: "did:key:z6MkOperatorReplaceMe"
 
-# Where the agent's durable bundle (SOUL.md, prompts/, stimuli/, memory/) lives. Copy soul-template/.
+# Where the agent's durable bundle (SOUL.md, prompts/, stimuli/, memory/) lives. Start from the public
+# template:  git clone https://github.com/obraztsov/dack-soul.git my-soul
 soul_repo: "my-soul"
 
 # ── Runtime: how the agent reaches a model ──────────────────────────────────────────────────────
@@ -145,8 +148,10 @@ secrets:
 # soul_remote: "gitlawb://did:key:z6MkYourSoulDidReplaceMe/my-soul"
 
 identities:
-  soul: "identities/soul"          # signs soul commits + gitlawb pushes; NEVER in agent env
-  operator: "identities/operator"  # signs `dack say`
+  operator: "identities/operator"  # signs `dack say`  — make it with `dack keygen --role operator …`
+  soul: "identities/soul"          # attributes soul commits; harness-only, NEVER in agent env
+  # builder: "identities/builder"  # env-forwardable outward-creation key (optional)
+  # backend: local                 # default: native Ed25519 (no external tools). `gitlawb` = the `gl` CLI.
 
 # ── Behavior knobs (all optional; defaults shown) ────────────────────────────────────────────────
 default_entry: perceive                  # state-prompt that `dack say` / the boot ping enter at

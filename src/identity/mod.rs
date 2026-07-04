@@ -43,4 +43,6 @@ pub trait IdentityProvider: Send + Sync {
     async fn verify(&self, did: &Did, payload: &[u8], sig: &Signature) -> Result<bool>;
 }
 
+pub mod ed25519;
 pub mod gitlawb;
+pub mod local;

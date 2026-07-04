@@ -78,9 +78,10 @@ policy to `docker run` flags. This is how delegated **workers** get OS-level iso
 ## The soul repo
 
 The agent's durable identity is a git repository — the **soul** — separate from this source tree
-(`soul-template/` is a starting template). It holds the agent's prompts, memory, stimuli, skills, and
-runlogs. The harness commits to it as the agent's own DID and (optionally) pushes signed updates to a
-Gitlawb node, so the agent's history is cryptographically attributable to it. An **integrity tripwire**
+(cloned from a public template into its own repo). It holds the agent's prompts, memory, stimuli, skills,
+and runlogs. The harness commits to it as the agent's own DID and pushes it to one or more git remotes —
+a plain `git push` to GitHub by default, optionally a best-effort signed Gitlawb mirror — so the agent's
+history is attributable to it. An **integrity tripwire**
 reverts any change to the soul made outside a Reflect cycle, so self-modification stays gated.
 
 See [authoring souls](authoring-souls.md) for the bundle layout and [operations](operations.md) for the
@@ -126,7 +127,7 @@ pretty text on a TTY or JSON when containerized. This is distinct from the runlo
 | `src/config/` | `dack.config.yaml` parsing + the trust lattice |
 | `src/secrets/` | secrets-provider broker |
 | `src/repo/` | the soul git host (plain-git / signed `gitlawb://`) |
-| `src/identity/` | `gl` identity resolution + signing |
+| `src/identity/` | identity resolution + signing (native Ed25519 / legacy `gl`) |
 | `src/runlog/` | the agent "syslog" |
 | `src/stimuli/` | duty (`STIMULUS.md`) registry + hot-reload |
 | `src/webserver/` | the localhost webhook listener |

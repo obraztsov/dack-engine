@@ -201,7 +201,8 @@ each cycle. Backend is inferred per URL — `gitlawb://…` signs a ref-update, 
 | `soul_remotes` | list | `[]` | Push destinations (see entry fields below). Empty ⇒ local-only (commits, no push). |
 | `soul_remote` | string | none | **Legacy** single remote. Still honored — treated as a one-element best-effort `soul_remotes` list. Prefer `soul_remotes`. |
 | `gitlawb_node` | string | `https://node.gitlawb.com` | Default node for any `gitlawb://` entry that omits its own `node:` (and for the legacy `soul_remote`). |
-| `identities` | object | `{}` | `gl` identity directories per role: `soul`, `operator`, `builder` (each holds `identity.pem` + `ucan.json`). The Soul dir signs soul commits + gitlawb pushes and never enters agent env. |
+| `identities` | object | `{}` | Identity key directories per role: `operator`, `soul`, `builder` (each holds a PKCS8 `identity.pem`). Create with `dack keygen --role <role> --dir <dir>`. The operator key signs `dack say`; the Soul dir attributes soul commits and never enters agent env. |
+| `identities.backend` | `local` \| `gitlawb` | `local` | Signing/DID backend. `local` = native Ed25519, no external tools (reads `identity.pem` directly). `gitlawb` = shell out to the `gl` CLI (requires it on `PATH`). Both derive the same `did:key` from the same key. |
 | `secrets.soul_did_key` | ref | — | Reference to the Soul DID key (resolved by the harness; never forwarded). |
 
 ### `soul_remotes[]` — one push destination

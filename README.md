@@ -31,12 +31,15 @@ model safe; it makes the *system* safe around an untrusted model:
 ## Quickstart
 
 ```sh
-make build                                   # cargo build --release + bun install (the runtime bridge)
-cp -r soul-template my-soul                  # the agent's identity + prompts
-cp dack.config.example.yaml dack.config.yaml # set operator_did + your model endpoint
-cargo run --release -- run                   # boot the agent
-cargo run --release -- say "Say hi."         # hand it a trusted instruction
+make build                                            # cargo build --release + bun install (the bridge)
+dack keygen --role operator --dir identities/operator # native Ed25519 identity → prints your did:key
+git clone https://github.com/obraztsov/dack-soul.git my-soul   # the agent's prompts + memory template
+cp dack.config.example.yaml dack.config.yaml          # set operator_did (from keygen), soul_repo, model
+dack run                                               # boot the agent  (binary: target/release/dack)
+dack say "Say hi."                                     # hand it a trusted, signed instruction
 ```
+
+No gitlawb required — identities are native Ed25519 keys (`dack keygen`).
 
 Full walkthrough: **[docs/getting-started.md](docs/getting-started.md)**.
 

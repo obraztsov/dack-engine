@@ -14,7 +14,7 @@ All commands are `dack <command>` (or `cargo run --release -- <command>`).
 | `dack log [--follow]` | Tail the runlog — the agent's "syslog". |
 | `dack pause` | Soft kill-switch: stop popping the queue (work keeps queuing). |
 | `dack resume` | Resume popping the queue. |
-| `dack kill` | Hard stop. |
+| `dack kill` | Not implemented — use SIGTERM (`systemctl stop` / Ctrl-C) for a graceful drain. |
 | `dack reflect-now` | Force a Reflect (self-modification) run now, overriding the scheduled cadence. |
 | `dack reconcile` | Commit your hand-edits to the soul tree as the operator, so the integrity tripwire doesn't revert them. |
 
@@ -93,7 +93,7 @@ the first push).
 
 ### Identities
 
-`gl` identity directories provide the signing keys, one per role:
+Identity directories provide the signing keys, one per role:
 
 ```yaml
 identities:
@@ -102,10 +102,11 @@ identities:
   builder: "identities/builder"
 ```
 
-Create each with `gl identity new --dir identities/<role>` (each directory holds `identity.pem` +
-`ucan.json`). **Gitignore `/identities/`** — these are private keys. The Soul key in particular is
-harness-only: it signs the agent's commits but is never forwarded into the agent's environment, so the
-model can never sign as itself.
+Create each with `dack keygen --role <role> --dir identities/<role>` — native Ed25519, each directory
+holding a private `identity.pem`. (Legacy: set `identities: { backend: gitlawb }` to shell out to the
+`gl` CLI instead; it derives the same `did:key`.) **Gitignore `/identities/`** — these are private keys.
+The Soul key in particular is harness-only: it signs the agent's commits but is never forwarded into the
+agent's environment, so the model can never sign as itself.
 
 ## Hand-editing the soul
 
@@ -139,7 +140,8 @@ enable `runtime.worker_sandbox`; see [workers](workers.md). Worker `workspaces/`
 
 - Gitignore `dack.config.yaml`, `/identities/`, `/secrets/`, and the soul's `workspaces/`.
 - Run `dack run` under a supervisor with a restart policy.
-- Set `soul_remote` + `identities.soul` for signed, attributable history.
+- Set `soul_remotes` + `identities.soul` to push the soul off-box for attributable history (a plain-git
+  remote is author-attributable; add a `gitlawb://` mirror if you want cryptographically *signed* pushes).
 - Keep the model endpoint reachable; a hung invocation elapses at `invoke_timeout_secs` and the loop
   continues rather than freezing.
 - Use `dry_run` to rehearse outward actions before going live.

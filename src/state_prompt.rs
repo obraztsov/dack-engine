@@ -136,13 +136,18 @@ pub struct ContextConfig {
     pub memory: bool,
     #[serde(default)]
     pub tag_key: bool,
+    /// Extra tags STAMPED on every runlog entry (and tag-note) this prompt produces — e.g. `[telegram]`
+    /// on a telegram prompt, `[twitter]` on a twitter one. The channel/topic auto-tag that feeds digest
+    /// routing + tag-intersection, merged with the conversation key + baton tags. (v0.2.0)
+    #[serde(default)]
+    pub auto_tags: Vec<String>,
     #[serde(default)]
     pub runlog: RunlogContext,
 }
 
 impl Default for ContextConfig {
     fn default() -> Self {
-        Self { memory: true, tag_key: false, runlog: RunlogContext::default() }
+        Self { memory: true, tag_key: false, auto_tags: Vec::new(), runlog: RunlogContext::default() }
     }
 }
 

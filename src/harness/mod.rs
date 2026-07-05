@@ -756,14 +756,15 @@ impl Harness {
         let accessed = self.accessed_trust(&tool_calls);
         // Honor the structured memory line (gated to a write-capable state); free-form tool writes
         // to memory/ are caught by the sweep. Then reconcile + author the runlog.
-        self.honor_tag_notes(cycle_trust, &out).await;
+        let ctx = prompt.context();
+        self.honor_tag_notes(cycle_trust, &out, &ctx.auto_tags).await;
         // The tripwire reverts out-of-allowlist soul writes and alarms via the harness logs; its return
         // is consumed there, so the runlog write below doesn't need it.
         self.reconcile_soul(prompt.state, &stimulus.id.0).await;
         // Runlog tags: the conversation key (when the prompt opts in via `tag_key`) + any tags the acting
         // baton carries — so a tagged view can recall this conversation later.
         let mut tags: Vec<String> = Vec::new();
-        if prompt.context().tag_key {
+        if ctx.tag_key {
             if let Some(k) = &stimulus.dedup_key {
                 tags.push(k.clone());
             }
@@ -773,6 +774,13 @@ impl Harness {
                 if !tags.contains(t) {
                     tags.push(t.clone());
                 }
+            }
+        }
+        // Channel/topic AUTO-TAGS: stamped on every entry from this prompt (e.g. `telegram`) — feeds
+        // digest routing + tag-intersection.
+        for t in &ctx.auto_tags {
+            if !tags.contains(t) {
+                tags.push(t.clone());
             }
         }
         let runlog_ref = self
@@ -1601,7 +1609,7 @@ impl Harness {
     /// write. The harness AUTO-STAMPS each note's `trust` from the cycle's taint (`cycle_trust`), so
     /// provenance is unfakeable: a public chat's note is `public`, a digest's is `self`. The digest reads
     /// these (with their provenance) and consolidates durable facts into long-term memory. Best-effort.
-    async fn honor_tag_notes(&self, cycle_trust: &TrustTier, out: &AgentOutput) {
+    async fn honor_tag_notes(&self, cycle_trust: &TrustTier, out: &AgentOutput, auto_tags: &[String]) {
         let Some(notes) = out.tag_notes.as_ref().filter(|n| !n.is_empty()) else {
             return;
         };
@@ -1612,9 +1620,15 @@ impl Harness {
             if tag.is_empty() || note.is_empty() {
                 continue;
             }
-            // Tags = the note's own tag (thread/topic) — B3b-2 folds in the cycle's channel auto-tags so
-            // a `digest` note routes to its channel digest. `kind` (memory|digest) is model-chosen.
-            let tags = [tag];
+            // Note tags = the note's own tag (thread/topic) + the cycle's channel AUTO-TAGS — so a
+            // `digest` note routes to its channel digest, and any note is findable by channel.
+            // `kind` (memory|digest) is model-chosen.
+            let mut tags: Vec<&str> = vec![tag];
+            for a in auto_tags {
+                if !tags.contains(&a.as_str()) {
+                    tags.push(a);
+                }
+            }
             if let Err(e) = self.runlog.append_note(n.kind.as_str(), &tags, note, trust, now).await {
                 tracing::warn!("tag-note append failed: {e}");
             }
@@ -3970,9 +3984,9 @@ mod tests {
         };
 
         // A PUBLIC cycle leaves a note → stamped `public` (the cycle's taint, not anything the model said).
-        harness.honor_tag_notes(&TrustTier::public(), &out).await;
+        harness.honor_tag_notes(&TrustTier::public(), &out, &[]).await;
         // A SELF cycle (e.g. the digest) → stamped `self`.
-        harness.honor_tag_notes(&TrustTier::self_(), &out).await;
+        harness.honor_tag_notes(&TrustTier::self_(), &out, &[]).await;
 
         let notes = rec.notes.lock().unwrap();
         assert_eq!(notes.len(), 2, "both cycles left a note (no state/trust gate)");
@@ -4316,6 +4330,7 @@ mod tests {
             context: Some(crate::state_prompt::ContextConfig {
                 memory: true,
                 tag_key: true,
+                auto_tags: Vec::new(),
                 runlog: crate::state_prompt::RunlogContext { thread: 20, ..Default::default() },
             }),
             system_frame: String::new(),

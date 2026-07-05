@@ -28,7 +28,7 @@ use crate::model::stimulus::{Priority, Stimulus, StimulusId, StimulusStatus, Sti
 use crate::queue::{Queue, SqliteQueue};
 use crate::repo::multi::{MultiRemoteRepo, PushTarget};
 use crate::repo::{CommitMeta, RepoHost, RepoPath};
-use crate::runlog::{DailyFileRunLog, RunLogWriter};
+use crate::runlog::{sqlite::SqliteRunLog, RunLogWriter};
 use crate::runtime::openclaude::{OpenClaudeClient, WorkerBackend};
 use crate::runtime::RuntimeClient;
 use crate::sensor::{SensorRunner, SubprocessSensor};
@@ -165,21 +165,26 @@ async fn build_identity(config: &DackConfig) -> Result<Arc<dyn IdentityProvider>
     }
 }
 
-/// `dack log` — the "agent syslog": print today's runlog, and with `--follow` stream
-/// new entries as the duck writes them (naive size-poll; the runlog is append-only).
+/// `dack log` — the "agent syslog": print the recent runlog tail from the SQLite store, and with
+/// `--follow` poll for newer entries (keyed on run_id so each is printed once; append-only).
 async fn log_cmd(config_path: &str, follow: bool) -> Result<()> {
     use std::io::Write;
     let config = DackConfig::load(config_path)?;
-    let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    let path = PathBuf::from(&config.soul_repo).join(format!("runlogs/{date}.md"));
-    let mut shown = 0usize;
+    let rl = SqliteRunLog::open(&config.runlog_db)?;
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut first = true;
     loop {
-        let text = tokio::fs::read_to_string(&path).await.unwrap_or_default();
-        if text.len() > shown {
-            print!("{}", &text[shown..]);
+        // Newest 200 (chronological); on follow, print only entries we haven't shown.
+        for block in rl.tail(if first { 200 } else { 50 }).await?.split("\n## ") {
+            let block = if block.starts_with("## ") { block.to_string() } else { format!("## {block}") };
+            let run_id = block.lines().next().and_then(|h| h.strip_prefix("## ")).and_then(|h| h.split(" · ").next()).unwrap_or("").to_string();
+            if run_id.is_empty() || !seen.insert(run_id) {
+                continue;
+            }
+            println!("{block}");
             std::io::stdout().flush().ok();
-            shown = text.len();
         }
+        first = false;
         if !follow {
             break;
         }
@@ -330,88 +335,6 @@ fn build_soul_repo(
     ))
 }
 
-/// The RUNLOG repo — rooted at `<soul>/runlogs/`, its OWN git repo (the soul gitignores `runlogs/`), so
-/// chat detail + telegram handles never reach the public soul. Local-only unless `runlog_remote` is set
-/// (then also pushed there — a private backup). Mirror of `build_soul_repo` with the single optional remote.
-fn build_runlog_repo(
-    config: &DackConfig,
-    runlog_root: &std::path::Path,
-    author_did: &str,
-) -> Arc<dyn RepoHost> {
-    let remotes: &[crate::config::SoulRemote] = match &config.runlog_remote {
-        Some(r) => std::slice::from_ref(r),
-        None => &[],
-    };
-    let targets = remotes_to_targets(remotes, config);
-    if targets.is_empty() {
-        tracing::info!("runlog repo local-only (no runlog_remote) — private + disposable");
-    } else {
-        tracing::info!(
-            "runlog push target: {}",
-            targets.iter().map(|t| t.name()).collect::<Vec<_>>().join(", ")
-        );
-    }
-    Arc::new(MultiRemoteRepo::new(
-        runlog_root.to_path_buf(),
-        author_did.to_string(),
-        targets,
-    ))
-}
-
-/// Ensure the runlog repo at `runlog_root` is a healthy git repo before we use it. Healthy (`.git`
-/// present + `git status` succeeds) ⇒ no-op. Missing or **corrupt** ⇒ discard the local state entirely
-/// (`rm -rf`) and restore-or-fresh: clone from `runlog_remote` if set (the durable backup), else `git
-/// init` a fresh EMPTY repo. Boot never tries to salvage whatever loose files are there — the remote is
-/// the source of truth, the local repo is disposable. (Today's valid runlogs are preserved by the
-/// one-time manual migration that hand-inits this repo; there's no remote to clone from yet.)
-fn ensure_runlog_repo(runlog_root: &std::path::Path, runlog_remote: Option<&crate::config::SoulRemote>) {
-    let git = |args: &[&str], cwd: &std::path::Path| {
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(cwd)
-            .args(args)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    };
-    let healthy = runlog_root.join(".git").exists() && git(&["status", "--porcelain"], runlog_root);
-    if healthy {
-        return;
-    }
-    tracing::warn!(
-        "runlog repo at {} missing/corrupt — discarding local state + {}",
-        runlog_root.display(),
-        if runlog_remote.is_some() { "cloning from remote" } else { "init fresh empty" }
-    );
-    let _ = std::fs::remove_dir_all(runlog_root);
-    if let Some(r) = runlog_remote {
-        // Clone the durable backup. SSH (`git@…`) authenticates with the ambient key; an HTTPS+token
-        // remote would need credential injection (TODO when such a remote is wired). gitlawb:// isn't
-        // plain-cloneable → falls through to a fresh repo.
-        let cloneable = !r.url.starts_with("gitlawb://");
-        if cloneable
-            && std::process::Command::new("git")
-                .args(["clone", "-q", &r.url])
-                .arg(runlog_root)
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
-        {
-            tracing::info!("runlog repo restored from {}", remote_label(&r.url));
-            return;
-        }
-        tracing::warn!("runlog clone unavailable — starting a fresh empty repo");
-    }
-    let _ = std::fs::create_dir_all(runlog_root);
-    for args in [
-        vec!["init", "-q", "-b", "main"],
-        vec!["config", "user.name", "dack"],
-        vec!["config", "user.email", "dack@local"],
-    ] {
-        git(&args, runlog_root);
-    }
-}
-
 /// A short, human label for a remote URL (logs only): the host for `https`/`ssh`/`git@`,
 /// `gitlawb:<repo>` for a `gitlawb://` URL, else the URL itself.
 fn remote_label(url: &str) -> String {
@@ -549,29 +472,11 @@ async fn run(config_path: &str) -> Result<()> {
     // self-hosted). The Soul DID attributes the commit history; a gitlawb push adds cryptographic
     // provenance. Best-effort per target unless `required`, so a down mirror never blocks a cycle.
     let repo = build_soul_repo(&config, &repo_root, &soul_did);
-    // Runlogs (chat detail + telegram handles) live in their OWN private git repo at `<soul>/runlogs/`,
-    // NEVER the public soul. `runlogs/` MUST be gitignored in the soul or the soul-integrity tripwire
-    // would commit/revert them every cycle — hard-fail rather than silently leak or clobber.
-    let soul_gitignore = repo_root.join(".gitignore");
-    let runlogs_ignored = std::fs::read_to_string(&soul_gitignore)
-        .map(|s| s.lines().any(|l| l.trim().trim_end_matches('/') == "runlogs"))
-        .unwrap_or(false);
-    if !runlogs_ignored {
-        return Err(DackError::Config(format!(
-            "`runlogs/` must be gitignored in {} — runlogs are a separate private repo; the public soul must not track them",
-            soul_gitignore.display()
-        )));
-    }
-    let runlog_root = repo_root.join("runlogs");
-    ensure_runlog_repo(&runlog_root, config.runlog_remote.as_ref());
-    let runlog_repo = build_runlog_repo(&config, &runlog_root, &soul_did);
-    let runlog: Arc<dyn RunLogWriter> =
-        Arc::new(DailyFileRunLog::new(runlog_repo, soul_did.clone()));
-    // Rebuild the runlog activity index from the retained day-files (a longer boot is acceptable) so
-    // the `environment` map's multi-day histograms are populated from the first wake.
-    if let Err(e) = runlog.rebuild_stats().await {
-        tracing::warn!("runlog stats rebuild failed (environment histograms start empty): {e}");
-    }
+    // Runlogs (short-term memory) live in a SQLite store OUTSIDE the soul (`runlog_db`, harness cwd) —
+    // harness-authored, read-only to the recall MCPs. No git repo: losing it loses only short-term
+    // memory (durable = prompts + long-term `memory/`); a fresh DB is created on a missing/corrupt file.
+    let runlog: Arc<dyn RunLogWriter> = Arc::new(SqliteRunLog::open(&config.runlog_db)?);
+    tracing::info!("runlog store: {} (sqlite)", config.runlog_db);
     // Shared runtime health registry (the "subconscious"): the broker records per-secret health,
     // the loops record per-stimulus health, and Reflect / `dack status` read the one snapshot.
     let health = Arc::new(crate::health::HealthRegistry::new(chrono::Utc::now().timestamp()));
@@ -882,47 +787,3 @@ async fn status(config_path: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn git_ok(args: &[&str], cwd: &std::path::Path) -> bool {
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(cwd)
-            .args(args)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    }
-
-    #[test]
-    fn ensure_runlog_repo_inits_noops_and_discards_on_corruption() {
-        let dir = std::env::temp_dir().join(format!("dack-runlogrepo-{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-
-        // Missing → inits a fresh empty git repo.
-        ensure_runlog_repo(&dir, None);
-        assert!(dir.join(".git").exists() && git_ok(&["status", "--porcelain"], &dir), "fresh repo");
-
-        // Commit a runlog file.
-        std::fs::write(dir.join("2026-06-28.md"), "# runlog\n").unwrap();
-        assert!(git_ok(&["add", "-A"], &dir) && git_ok(&["commit", "-q", "-m", "x"], &dir));
-
-        // Healthy → no-op, the committed file is preserved.
-        ensure_runlog_repo(&dir, None);
-        assert!(dir.join("2026-06-28.md").exists(), "a healthy repo is left untouched");
-
-        // Missing/corrupt .git (no remote) → DISCARD local state entirely + re-init fresh empty;
-        // boot does NOT salvage loose files.
-        std::fs::remove_dir_all(dir.join(".git")).unwrap();
-        ensure_runlog_repo(&dir, None);
-        assert!(dir.join(".git").exists() && git_ok(&["status", "--porcelain"], &dir), "re-init'd");
-        assert!(
-            !dir.join("2026-06-28.md").exists(),
-            "corrupt recovery wipes local files (remote is the source of truth, not local salvage)"
-        );
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-}

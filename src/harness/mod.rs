@@ -112,11 +112,15 @@ impl Harness {
             Ok(n) => tracing::info!("reclaimed {n} orphaned dispatched row(s) at boot"),
             Err(e) => tracing::error!("boot reclaim failed: {e}"),
         }
-        // Short-term memory retention: age off runlog day-files beyond the keep window.
-        match self.runlog.prune_old_days(self.config.runlog_retention_days).await {
-            Ok(0) => {}
-            Ok(n) => tracing::info!("runlog retention: dropped {n} day-file(s) beyond {}d", self.config.runlog_retention_days),
-            Err(e) => tracing::warn!("runlog retention prune failed: {e}"),
+        // Short-term memory HARD GC (the multi-GB guard): delete entries beyond `runlog_hard_days` and
+        // tag-notes beyond `tag_note_hard_days`. The SOFT surfaced window is per-prompt frontmatter.
+        match self.runlog.hard_gc(self.config.runlog_hard_days, self.config.tag_note_hard_days).await {
+            Ok((0, 0)) => {}
+            Ok((e, n)) => tracing::info!(
+                "runlog hard-GC: dropped {e} entr(ies) >{}d + {n} tag-note(s) >{}d",
+                self.config.runlog_hard_days, self.config.tag_note_hard_days
+            ),
+            Err(err) => tracing::warn!("runlog hard-GC failed: {err}"),
         }
         // Downtime → character: a restart enqueues a self-tier "back online" wake
         // that Perceives then Expresses (the duck may comment on having been away).
@@ -1162,6 +1166,18 @@ impl Harness {
                     // even if a future sensor only carries `message_id` per item. The override item is
                     // raw payload, read ONLY here for env vars; it never reaches the model.
                     let mut extra_env = std::collections::BTreeMap::new();
+                    // Every MCP server sees RUNLOG_DB (ABSOLUTE): the recall servers read the SQLite
+                    // short-term memory from it. Their cwd is the soul (not the harness cwd), so a
+                    // relative path wouldn't resolve. Benign for servers that don't use it.
+                    {
+                        let p = std::path::PathBuf::from(&self.config.runlog_db);
+                        let abs = if p.is_absolute() {
+                            p
+                        } else {
+                            std::env::current_dir().map(|d| d.join(&p)).unwrap_or(p)
+                        };
+                        extra_env.insert("RUNLOG_DB".to_string(), abs.to_string_lossy().into_owned());
+                    }
                     for (var, field) in &server.scope_env {
                         // Reserved field `dedup_key` resolves to the Stimulus's conversation key (not a
                         // payload field) — the platform-agnostic conversation TAG (telegram chat_id /

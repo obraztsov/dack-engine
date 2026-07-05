@@ -166,8 +166,9 @@ impl SqliteRunLog {
 
     /// Hard garbage collection (the multi-GB guard): delete entries older than `entry_days` and any
     /// tag-note older than `note_days`. Returns `(entries_deleted, notes_deleted)`. FTS + child rows are
-    /// swept alongside (`entry_tags`/`note_tags` cascade; the FTS row is deleted explicitly).
-    pub fn hard_gc(&self, entry_days: i64, note_days: i64, now: i64) -> Result<(usize, usize)> {
+    /// swept alongside (`entry_tags`/`note_tags` cascade; the FTS row is deleted explicitly). The trait
+    /// [`hard_gc`](RunLogWriter::hard_gc) wraps this with the current time.
+    pub fn gc(&self, entry_days: i64, note_days: i64, now: i64) -> Result<(usize, usize)> {
         let conn = self.conn.lock().unwrap();
         let entry_cut = day_of(now - entry_days * 86_400);
         // FTS first (no FK to cascade it), keyed on the rows about to go.
@@ -619,11 +620,9 @@ impl RunLogWriter for SqliteRunLog {
         Ok(())
     }
 
-    async fn prune_old_days(&self, keep_days: u64) -> Result<usize> {
-        // Entry hard-GC (the note ceiling is applied separately via `hard_gc`).
+    async fn hard_gc(&self, entry_days: u64, note_days: u64) -> Result<(usize, usize)> {
         let now = chrono::Utc::now().timestamp();
-        let (entries, _) = self.hard_gc(keep_days as i64, i64::MAX / 86_400, now)?;
-        Ok(entries)
+        self.gc(entry_days as i64, note_days as i64, now)
     }
 }
 
@@ -728,7 +727,7 @@ mod tests {
         // stats see both days
         assert_eq!(rl.stats().await.unwrap().days.len(), 2);
         // hard GC: entries > 30d gone, note ceiling 90d
-        let (entries_del, _) = rl.hard_gc(30, 90, now).unwrap();
+        let (entries_del, _) = rl.gc(30, 90, now).unwrap();
         assert_eq!(entries_del, 1, "the 40-day-old entry is swept");
         // its FTS row went too
         assert!(rl.search("b", &["thought"], 10).unwrap().is_empty(), "GC swept the FTS row");

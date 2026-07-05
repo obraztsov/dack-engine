@@ -105,9 +105,16 @@ pub trait RunLogWriter: Send + Sync {
     }
 
     /// Retention: keep only the most recent `keep_days` `<date>.md` files, deleting older ones (so
-    /// short-term memory ages off). Returns the count deleted. Default: no-op.
+    /// short-term memory ages off). Returns the count deleted. Default: no-op. (Legacy file backend.)
     async fn prune_old_days(&self, _keep_days: u64) -> Result<usize> {
         Ok(0)
+    }
+
+    /// Hard garbage-collection ceiling (the multi-GB guard, v0.2.0 SQLite): delete entries older than
+    /// `entry_days` and any tag-note older than `note_days`. Returns `(entries_deleted, notes_deleted)`.
+    /// The SOFT surfaced window is separate (per-prompt frontmatter). Default: no-op.
+    async fn hard_gc(&self, _entry_days: u64, _note_days: u64) -> Result<(usize, usize)> {
+        Ok((0, 0))
     }
 }
 

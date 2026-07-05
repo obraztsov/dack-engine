@@ -82,6 +82,16 @@ pub enum Command {
         #[arg(long)]
         dir: String,
     },
+    /// One-shot (v0.2.0 cutover): convert the old markdown runlogs (`<soul>/runlogs/*.md` +
+    /// `tag-notes.ndjson`) into the SQLite runlog store. Idempotent — safe to re-run.
+    MigrateRunlogs {
+        /// Source runlogs dir (default: `<soul_repo>/runlogs`).
+        #[arg(long)]
+        from: Option<String>,
+        /// Target SQLite db (default: config `runlog_db`).
+        #[arg(long)]
+        to: Option<String>,
+    },
 }
 
 /// Dispatch a parsed CLI command. `run`/`status`/`log` are the daemon + read surfaces; `say`/
@@ -108,7 +118,25 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         Command::ReflectNow => reflect_now(&cli.config).await,
         Command::Reconcile => reconcile(&cli.config).await,
         Command::Keygen { role, dir } => keygen(&role, &dir),
+        Command::MigrateRunlogs { from, to } => migrate_runlogs(&cli.config, from, to).await,
     }
+}
+
+/// `dack migrate-runlogs` — the one-shot md→SQLite conversion (B1). Reads the old markdown day-files +
+/// `tag-notes.ndjson` and imports them into the SQLite runlog store. Idempotent.
+async fn migrate_runlogs(config_path: &str, from: Option<String>, to: Option<String>) -> Result<()> {
+    let config = DackConfig::load(config_path)?;
+    let from = from
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(&config.soul_repo).join("runlogs"));
+    let to = to.map(PathBuf::from).unwrap_or_else(|| PathBuf::from(&config.runlog_db));
+    println!("dack: migrating runlogs {} → {}", from.display(), to.display());
+    let m = crate::runlog::migrate::migrate(&from, &to)?;
+    println!(
+        "dack: migrated {} day-file(s) → {} entries, {} tag-notes (idempotent).",
+        m.day_files, m.entries, m.notes
+    );
+    Ok(())
 }
 
 /// `dack keygen --role <r> --dir <d>` — generate a native Ed25519 identity (no `gl`, no gitlawb).

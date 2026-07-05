@@ -16,6 +16,7 @@ use crate::error::Result;
 use crate::model::runlog::{Outcome, RunLogEntry};
 use crate::repo::{CommitMeta, RepoHost, RepoPath};
 
+pub mod migrate;
 pub mod sqlite;
 
 #[async_trait]

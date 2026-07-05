@@ -84,6 +84,24 @@ struct Rendered {
     incoming: String,
 }
 
+/// A backfilled entry parsed out of an old markdown day-file (the B1 conversion). Carries the exact
+/// original rendered `heading`/`safe_body` plus the denormalized columns.
+pub struct ImportedEntry {
+    pub run_id: String,
+    pub source: String,
+    pub state: String,
+    pub trust: String,
+    pub outcome: String,
+    pub ts: i64,
+    pub context_summary: String,
+    pub thought: String,
+    pub sent: Vec<String>,
+    pub incoming: String,
+    pub heading: String,
+    pub safe_body: String,
+    pub tags: Vec<String>,
+}
+
 impl SqliteRunLog {
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
         Self::init(Connection::open(path).map_err(db)?)
@@ -185,6 +203,80 @@ impl SqliteRunLog {
             binds.push(t);
         }
         conn.execute(&sql, binds.as_slice()).map_err(db)
+    }
+
+    /// One-shot BACKFILL import (the md→SQLite conversion) — insert an entry from already-parsed +
+    /// already-rendered parts (the original day-file block, minus the raw fence). Idempotent on
+    /// `run_id` (a re-run skips existing rows), so the migration can be re-run safely. Distinct from
+    /// [`insert`](Self::insert): no re-render, so the exact original `safe_body` (proposal/batons/tool
+    /// audit) is preserved verbatim.
+    pub fn import_entry(&self, e: &ImportedEntry) -> Result<bool> {
+        use rusqlite::OptionalExtension;
+        let day = day_of(e.ts);
+        let sent_json = serde_json::to_string(&e.sent).unwrap_or_else(|_| "[]".into());
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(db)?;
+        let exists: Option<i64> = tx
+            .query_row("SELECT rowid FROM entries WHERE run_id = ?1", params![e.run_id], |r| r.get(0))
+            .optional()
+            .map_err(db)?;
+        if exists.is_some() {
+            return Ok(false); // already imported — idempotent skip
+        }
+        tx.execute(
+            "INSERT INTO entries
+               (run_id, stimulus_id, source, state, trust, outcome, ts, day,
+                context_summary, thought, sent, incoming, heading, safe_body)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+            params![
+                e.run_id, "", e.source, e.state, e.trust, e.outcome, e.ts, day,
+                e.context_summary, e.thought, sent_json, e.incoming, e.heading, e.safe_body,
+            ],
+        )
+        .map_err(db)?;
+        let rowid = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO entries_fts (rowid, thought, sent, incoming) VALUES (?1,?2,?3,?4)",
+            params![rowid, e.thought, e.sent.join(" "), e.incoming],
+        )
+        .map_err(db)?;
+        for t in &e.tags {
+            tx.execute(
+                "INSERT OR IGNORE INTO entry_tags (run_id, tag, ts) VALUES (?1,?2,?3)",
+                params![e.run_id, t, e.ts],
+            )
+            .map_err(db)?;
+        }
+        tx.commit().map_err(db)?;
+        Ok(true)
+    }
+
+    /// One-shot BACKFILL import of a `tag-notes.ndjson` note (as a `memory` note). Idempotent on
+    /// `(tag, note, ts)` so a re-run doesn't duplicate.
+    pub fn import_note(&self, tag: &str, note: &str, trust: &str, ts: i64) -> Result<bool> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(db)?;
+        let dup: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM tag_notes n JOIN note_tags nt ON nt.note_id = n.id
+                 WHERE nt.tag = ?1 AND n.note = ?2 AND n.ts = ?3",
+                params![tag, note, ts],
+                |r| r.get(0),
+            )
+            .map_err(db)?;
+        if dup > 0 {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO tag_notes (kind, note, trust, ts, delivered_at) VALUES ('memory', ?1, ?2, ?3, NULL)",
+            params![note, trust, ts],
+        )
+        .map_err(db)?;
+        let id = tx.last_insert_rowid();
+        tx.execute("INSERT OR IGNORE INTO note_tags (note_id, tag) VALUES (?1, ?2)", params![id, tag])
+            .map_err(db)?;
+        tx.commit().map_err(db)?;
+        Ok(true)
     }
 
     // ── internal helpers ──

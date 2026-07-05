@@ -16,6 +16,8 @@ use crate::error::Result;
 use crate::model::runlog::{Outcome, RunLogEntry};
 use crate::repo::{CommitMeta, RepoHost, RepoPath};
 
+pub mod sqlite;
+
 #[async_trait]
 pub trait RunLogWriter: Send + Sync {
     /// Append one entry to today's runlog and return its `runlog_ref`
@@ -717,6 +719,7 @@ mod tests {
             outcome: Outcome::Ok,
             timestamp: 1000,
             tags: vec![],
+            trust: "self".into(),
         }
     }
 

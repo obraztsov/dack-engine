@@ -654,6 +654,18 @@ pub struct DackConfig {
     /// Embedded SQLite queue path (ephemeral;). Losing it loses only the queue.
     #[serde(default = "default_db_path")]
     pub db_path: String,
+    /// SQLite runlog store (short-term memory) — harness cwd, OUTSIDE the soul. Separate from the queue
+    /// db. Losing it loses only short-term memory (durable = prompts + long-term `memory/`); a fresh one
+    /// is created on boot. Read-only by the recall MCPs. (v0.2.0)
+    #[serde(default = "default_runlog_db")]
+    pub runlog_db: String,
+    /// Hard-GC ceiling: delete runlog ENTRIES older than this (the multi-GB guard; the surfaced window
+    /// is smaller + per-prompt frontmatter). Large by design.
+    #[serde(default = "default_runlog_hard_days")]
+    pub runlog_hard_days: u64,
+    /// Hard-GC ceiling: delete any TAG-NOTE older than this. Large by design.
+    #[serde(default = "default_tag_note_hard_days")]
+    pub tag_note_hard_days: u64,
     /// Localhost bind for the webhook listener ( — nothing public without a proxy).
     #[serde(default = "default_webhook_addr")]
     pub webhook_addr: String,
@@ -895,6 +907,15 @@ fn default_entry_prompt() -> String {
 }
 fn default_soul_repo() -> String {
     ".".to_string()
+}
+fn default_runlog_db() -> String {
+    "runlogs.sqlite".to_string()
+}
+fn default_runlog_hard_days() -> u64 {
+    30
+}
+fn default_tag_note_hard_days() -> u64 {
+    90
 }
 fn default_db_path() -> String {
     "dack.sqlite".to_string()

@@ -247,6 +247,7 @@ impl Harness {
             timestamp: stimulus.received_at,
             // Tag a dispatch-failure entry with its conversation so a chat's resume diff still sees it.
             tags: stimulus.dedup_key.clone().into_iter().collect(),
+            trust: stimulus.payload_tier.name().to_string(),
         };
         let _ = self.runlog.append(&entry).await;
     }
@@ -1642,6 +1643,7 @@ impl Harness {
             outcome,
             timestamp: stimulus.received_at,
             tags,
+            trust: stimulus.payload_tier.name().to_string(),
         };
         self.runlog.append(&entry).await
     }

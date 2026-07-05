@@ -65,4 +65,9 @@ pub struct RunLogEntry {
     /// its own tag so parallel chats don't bloat its context. Empty = untagged (only in the global view).
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Origin TRUST of this cycle — the `payload_tier` name (`self` / `org` / `public` / …), the trust
+    /// of the data it digested. Stored per-entry so recall can floor by trust (the self-recall boundary)
+    /// instead of tainting flat-`public`. Empty only for legacy/backfilled entries.
+    #[serde(default)]
+    pub trust: String,
 }

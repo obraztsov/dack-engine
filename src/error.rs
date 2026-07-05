@@ -49,6 +49,10 @@ pub enum DackError {
     #[error("queue: {0}")]
     Queue(String),
 
+    /// The runlog store (SQLite short-term memory).
+    #[error("runlog: {0}")]
+    Runlog(String),
+
     /// The `action_required` responder rejected a tool call — this is
     /// a *normal* outcome (the wall doing its job), surfaced as an error only when
     /// a caller treated a denial as fatal.

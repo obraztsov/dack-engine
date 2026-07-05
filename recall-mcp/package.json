@@ -1,0 +1,16 @@
+{
+  "name": "recall-mcp",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "SQLite runlog recall MCP servers (recall + recall-self) for the dack harness (v0.2.0)",
+  "scripts": {
+    "recall": "bun run src/recall.ts",
+    "recall-self": "bun run src/recall-self.ts",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.25.0"
+  }
+}

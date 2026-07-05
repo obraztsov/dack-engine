@@ -81,16 +81,16 @@ pub trait RunLogWriter: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Append a "sticky note" to the SHORT-TERM tag-notes catalogue. Append-only + harness-authored (the
-    /// agent can't write the runlog directly). `max` is legacy (retention is now the hard-GC ceiling).
-    /// Default: no-op (test writers).
-    async fn append_tag_note(
+    /// Append a TYPED "sticky note" (`kind` = `"memory"` | `"digest"`) with one or more `tags` (M:N),
+    /// stamped with the cycle's `trust` (unfakeable provenance). Append-only + harness-authored (the
+    /// agent can't write the runlog directly). Default: no-op (test writers).
+    async fn append_note(
         &self,
-        _tag: &str,
+        _kind: &str,
+        _tags: &[&str],
         _note: &str,
         _trust: &str,
         _timestamp: i64,
-        _max: usize,
     ) -> Result<()> {
         Ok(())
     }

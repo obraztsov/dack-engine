@@ -1606,14 +1606,16 @@ impl Harness {
             return;
         };
         let now = chrono::Utc::now().timestamp();
-        let max = self.config.tag_notes_max;
         let trust = cycle_trust.name(); // provenance = the writing cycle's taint, not model-asserted.
         for n in notes {
             let (tag, note) = (n.tag.trim(), n.note.trim());
             if tag.is_empty() || note.is_empty() {
                 continue;
             }
-            if let Err(e) = self.runlog.append_tag_note(tag, note, trust, now, max).await {
+            // Tags = the note's own tag (thread/topic) — B3b-2 folds in the cycle's channel auto-tags so
+            // a `digest` note routes to its channel digest. `kind` (memory|digest) is model-chosen.
+            let tags = [tag];
+            if let Err(e) = self.runlog.append_note(n.kind.as_str(), &tags, note, trust, now).await {
                 tracing::warn!("tag-note append failed: {e}");
             }
         }
@@ -2726,8 +2728,8 @@ mod tests {
         async fn tail_filtered(&self, _s: Option<i64>, _m: usize, _t: Option<&str>) -> Result<String> {
             Ok(String::new())
         }
-        async fn append_tag_note(&self, tag: &str, note: &str, trust: &str, _ts: i64, _max: usize) -> Result<()> {
-            self.notes.lock().unwrap().push((tag.into(), note.into(), trust.into()));
+        async fn append_note(&self, _kind: &str, tags: &[&str], note: &str, trust: &str, _ts: i64) -> Result<()> {
+            self.notes.lock().unwrap().push((tags.first().copied().unwrap_or("").into(), note.into(), trust.into()));
             Ok(())
         }
     }
@@ -3963,7 +3965,7 @@ mod tests {
             sessions: Default::default(),
         };
         let out = AgentOutput {
-            tag_notes: Some(vec![TagNote { tag: "chatX".into(), note: "trading-curious".into() }]),
+            tag_notes: Some(vec![TagNote { tag: "chatX".into(), note: "trading-curious".into(), kind: Default::default() }]),
             ..Default::default()
         };
 

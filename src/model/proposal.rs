@@ -135,6 +135,29 @@ pub struct SpawnRequest {
 pub struct TagNote {
     pub tag: String,
     pub note: String,
+    /// `memory` (default) — operating memory for THIS conversation, surfaced in context and queryable
+    /// by tag. `digest` — an item to hand to a digest job (routed by the cycle's channel auto-tag),
+    /// retired once a digest consolidates it. Distinct roles in context assembly + behaviour (v0.2.0).
+    #[serde(default)]
+    pub kind: NoteKind,
+}
+
+/// The two sticky-note types. No others — each has a distinct role in context assembly + GC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoteKind {
+    #[default]
+    Memory,
+    Digest,
+}
+
+impl NoteKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NoteKind::Memory => "memory",
+            NoteKind::Digest => "digest",
+        }
+    }
 }
 
 /// The full agent return value.

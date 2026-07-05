@@ -597,25 +597,26 @@ impl RunLogWriter for SqliteRunLog {
         Ok(out)
     }
 
-    async fn append_tag_note(
+    async fn append_note(
         &self,
-        tag: &str,
+        kind: &str,
+        tags: &[&str],
         note: &str,
         trust: &str,
         timestamp: i64,
-        _max: usize, // retention is now the hard-GC ceiling, not a per-append cap
     ) -> Result<()> {
-        // B0: the current single-tag call → a `memory` note with one tag. B3 adds kind + M:N tags.
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(db)?;
         tx.execute(
-            "INSERT INTO tag_notes (kind, note, trust, ts, delivered_at) VALUES ('memory', ?1, ?2, ?3, NULL)",
-            params![note, trust, timestamp],
+            "INSERT INTO tag_notes (kind, note, trust, ts, delivered_at) VALUES (?1, ?2, ?3, ?4, NULL)",
+            params![kind, note, trust, timestamp],
         )
         .map_err(db)?;
         let id = tx.last_insert_rowid();
-        tx.execute("INSERT OR IGNORE INTO note_tags (note_id, tag) VALUES (?1, ?2)", params![id, tag])
-            .map_err(db)?;
+        for t in tags {
+            tx.execute("INSERT OR IGNORE INTO note_tags (note_id, tag) VALUES (?1, ?2)", params![id, t])
+                .map_err(db)?;
+        }
         tx.commit().map_err(db)?;
         Ok(())
     }
@@ -707,9 +708,9 @@ mod tests {
     #[tokio::test]
     async fn tag_notes_latest_per_tag_counts_dupes() {
         let rl = SqliteRunLog::open_in_memory().unwrap();
-        rl.append_tag_note("chatX", "note one", "org", 1000, 200).await.unwrap();
-        rl.append_tag_note("chatX", "note two", "org", 1001, 200).await.unwrap();
-        rl.append_tag_note("chatY", "other", "public", 1002, 200).await.unwrap();
+        rl.append_note("memory", &["chatX"], "note one", "org", 1000).await.unwrap();
+        rl.append_note("memory", &["chatX"], "note two", "org", 1001).await.unwrap();
+        rl.append_note("memory", &["chatY"], "other", "public", 1002).await.unwrap();
         let latest = rl.tag_notes(None, Some("chatX"), true, 50).await.unwrap();
         assert_eq!(latest.len(), 1);
         assert_eq!(latest[0].note, "note two", "newest per tag");
@@ -732,6 +733,20 @@ mod tests {
         // its FTS row went too
         assert!(rl.search("b", &["thought"], 10).unwrap().is_empty(), "GC swept the FTS row");
         assert_eq!(rl.search("a", &["thought"], 10).unwrap(), vec!["recent".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn append_note_writes_typed_multi_tag_notes() {
+        let rl = SqliteRunLog::open_in_memory().unwrap();
+        // a digest note tagged with its thread AND its channel (M:N)
+        rl.append_note("digest", &["chatX", "telegram"], "summarize chatX", "self", 1000).await.unwrap();
+        rl.append_note("memory", &["chatX"], "al likes ducks", "org", 1001).await.unwrap();
+        // both of the digest note's tags resolve to it
+        assert_eq!(rl.tag_notes(None, Some("telegram"), false, 10).await.unwrap().len(), 1);
+        assert_eq!(rl.tag_notes(None, Some("chatX"), false, 10).await.unwrap().len(), 2, "chatX has the digest + memory note");
+        // the digest note retires via its channel tag; the memory note is untouched
+        assert_eq!(rl.mark_digest_delivered(&["telegram"], 2000).unwrap(), 1);
+        assert_eq!(rl.mark_digest_delivered(&["telegram"], 3000).unwrap(), 0, "idempotent");
     }
 
     #[tokio::test]

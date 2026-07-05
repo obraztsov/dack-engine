@@ -2641,7 +2641,7 @@ mod tests {
         use crate::identity::gitlawb::GitlawbIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
-        use crate::runlog::FileRunLog;
+        use crate::runlog::sqlite::SqliteRunLog;
         use crate::runtime::openclaude::OpenClaudeClient;
         use std::collections::HashMap;
 
@@ -2691,7 +2691,7 @@ mod tests {
             }),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
-            runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
+            runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
         broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         };
@@ -2703,8 +2703,8 @@ mod tests {
         assert_eq!(invocations, 2, "Perceive then a fresh Express");
         // The harness authored a runlog entry for the Perceive run.
         assert!(
-            std::fs::read_dir(tmp.join("runlogs")).unwrap().next().is_some(),
-            "a runlog file was written"
+            !harness.runlog.tail(10).await.unwrap().is_empty(),
+            "a runlog entry was written"
         );
 
         std::fs::remove_dir_all(&tmp).ok();
@@ -2761,7 +2761,7 @@ mod tests {
         use crate::identity::gitlawb::GitlawbIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
-        use crate::runlog::FileRunLog;
+        use crate::runlog::sqlite::SqliteRunLog;
         use std::collections::HashMap;
 
         let tmp = std::env::temp_dir().join(format!("dack-fb-{}", std::process::id()));
@@ -2783,7 +2783,7 @@ mod tests {
             runtime: runtime.clone(),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
-            runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
+            runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
         broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         };
@@ -2818,7 +2818,7 @@ mod tests {
         use crate::identity::gitlawb::GitlawbIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
-        use crate::runlog::FileRunLog;
+        use crate::runlog::sqlite::SqliteRunLog;
         use std::collections::HashMap;
 
         let tmp = std::env::temp_dir().join(format!("dack-nosec-{}", std::process::id()));
@@ -2840,7 +2840,7 @@ mod tests {
             runtime: runtime.clone(),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
-            runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
+            runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         };
@@ -2865,7 +2865,7 @@ mod tests {
         use crate::identity::gitlawb::GitlawbIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
-        use crate::runlog::FileRunLog;
+        use crate::runlog::sqlite::SqliteRunLog;
         use std::collections::HashMap;
 
         let tmp = std::env::temp_dir().join(format!("dack-pte-{}", std::process::id()));
@@ -2895,7 +2895,7 @@ mod tests {
             runtime: runtime.clone(),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
-            runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
+            runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         };
@@ -2925,7 +2925,7 @@ mod tests {
         use crate::identity::gitlawb::GitlawbIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
-        use crate::runlog::FileRunLog;
+        use crate::runlog::sqlite::SqliteRunLog;
         use std::collections::HashMap;
 
         let tmp = std::env::temp_dir().join(format!("dack-pubsettle-{}", std::process::id()));
@@ -2963,7 +2963,7 @@ mod tests {
             runtime: runtime.clone(),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
-            runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
+            runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         };
@@ -2984,7 +2984,7 @@ mod tests {
         use crate::identity::gitlawb::GitlawbIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
-        use crate::runlog::FileRunLog;
+        use crate::runlog::sqlite::SqliteRunLog;
         use std::collections::HashMap;
 
         let tmp = std::env::temp_dir().join(format!("dack-pts-{}", std::process::id()));
@@ -3014,7 +3014,7 @@ mod tests {
             runtime: runtime.clone(),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
-            runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
+            runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         };
@@ -3071,7 +3071,7 @@ mod tests {
         use crate::identity::gitlawb::GitlawbIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
-        use crate::runlog::FileRunLog;
+        use crate::runlog::sqlite::SqliteRunLog;
         let config = Arc::new(DackConfig::from_yaml("operator_did: \"did:x\"").unwrap());
         let queue: Arc<dyn Queue> = Arc::new(InMemoryQueue::new());
         let identity = GitlawbIdentity::resolve("gl", std::collections::HashMap::new()).await.unwrap();
@@ -3082,7 +3082,7 @@ mod tests {
             runtime,
             repo: Arc::new(PlainGitRepo::new(tmp, "did:x")),
             identity: Arc::new(identity),
-            runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
+            runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         }
@@ -3150,7 +3150,7 @@ mod tests {
         use crate::identity::gitlawb::GitlawbIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
-        use crate::runlog::FileRunLog;
+        use crate::runlog::sqlite::SqliteRunLog;
         use std::collections::{HashMap, VecDeque};
 
         let tmp = std::env::temp_dir().join(format!("dack-defer-{}", std::process::id()));
@@ -3182,7 +3182,7 @@ mod tests {
             runtime: runtime.clone(),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
-            runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
+            runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         };
@@ -3251,7 +3251,7 @@ mod tests {
         use crate::identity::gitlawb::GitlawbIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
-        use crate::runlog::FileRunLog;
+        use crate::runlog::sqlite::SqliteRunLog;
         use std::collections::{BTreeMap, HashMap, VecDeque};
 
         let tmp = std::env::temp_dir().join(format!("dack-ttl-{}", std::process::id()));
@@ -3273,7 +3273,7 @@ mod tests {
             runtime: runtime.clone(),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
-            runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
+            runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         };
@@ -3306,7 +3306,7 @@ mod tests {
         use crate::identity::gitlawb::GitlawbIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
-        use crate::runlog::FileRunLog;
+        use crate::runlog::sqlite::SqliteRunLog;
         use std::collections::HashMap;
         use tokio::process::Command;
 
@@ -3338,7 +3338,7 @@ mod tests {
             }),
             repo: Arc::new(PlainGitRepo::new(&soul, "did:dack:soul")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
-            runlog: Arc::new(FileRunLog::new(soul.join("runlogs"))),
+            runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         };
@@ -3377,7 +3377,7 @@ mod tests {
         use crate::identity::gitlawb::GitlawbIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
-        use crate::runlog::FileRunLog;
+        use crate::runlog::sqlite::SqliteRunLog;
         use std::collections::HashMap;
 
         let tmp = std::env::temp_dir().join(format!("dack-runloop-{}", std::process::id()));
@@ -3405,7 +3405,7 @@ mod tests {
             runtime: runtime.clone(),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
-            runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
+            runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         });
@@ -3543,7 +3543,7 @@ mod tests {
         use crate::identity::gitlawb::GitlawbIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
-        use crate::runlog::FileRunLog;
+        use crate::runlog::sqlite::SqliteRunLog;
         use crate::secrets::providers::StaticEnvProvider;
         use std::collections::HashMap;
 
@@ -3573,7 +3573,7 @@ mod tests {
             runtime: Arc::new(RecordingRuntime { seen: std::sync::Mutex::new(Vec::new()), out: perceive_output() , usage: None }),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
-            runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
+            runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![Arc::new(StaticEnvProvider::new("cove", vec!["DACK_COVE_TEST".into()]))])),
             sessions: Default::default(),
         };
@@ -3619,7 +3619,7 @@ mod tests {
         use crate::identity::gitlawb::GitlawbIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
-        use crate::runlog::FileRunLog;
+        use crate::runlog::sqlite::SqliteRunLog;
         use std::collections::HashMap;
 
         let tmp = std::env::temp_dir().join(format!("dack-reflect-{}", std::process::id()));
@@ -3651,7 +3651,7 @@ mod tests {
             runtime: runtime.clone(),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
-            runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
+            runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         };
@@ -3682,7 +3682,7 @@ mod tests {
         use crate::identity::gitlawb::GitlawbIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
-        use crate::runlog::FileRunLog;
+        use crate::runlog::sqlite::SqliteRunLog;
         use std::collections::HashMap;
 
         // perceive is OPEN (may inline) but imports nothing; express is LOCKED (default).
@@ -3705,7 +3705,7 @@ mod tests {
             runtime: Arc::new(RecordingRuntime { seen: std::sync::Mutex::new(Vec::new()), out: perceive_output() , usage: None }),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
-            runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
+            runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         };
@@ -3745,7 +3745,7 @@ mod tests {
         use crate::identity::gitlawb::GitlawbIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
-        use crate::runlog::FileRunLog;
+        use crate::runlog::sqlite::SqliteRunLog;
         use std::collections::HashMap;
 
         // org sits between public and self in the lattice; telegram is a post-tier server gated org.
@@ -3770,7 +3770,7 @@ mod tests {
             runtime: Arc::new(RecordingRuntime { seen: std::sync::Mutex::new(Vec::new()), out: perceive_output() , usage: None }),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
-            runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
+            runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         };
@@ -3823,7 +3823,7 @@ mod tests {
         use crate::identity::gitlawb::GitlawbIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
-        use crate::runlog::FileRunLog;
+        use crate::runlog::sqlite::SqliteRunLog;
         use std::collections::HashMap;
 
         let config = Arc::new(
@@ -3846,7 +3846,7 @@ mod tests {
             runtime: Arc::new(RecordingRuntime { seen: std::sync::Mutex::new(Vec::new()), out: perceive_output() , usage: None }),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
-            runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
+            runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         };
@@ -3888,7 +3888,7 @@ mod tests {
         use crate::identity::gitlawb::GitlawbIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
-        use crate::runlog::FileRunLog;
+        use crate::runlog::sqlite::SqliteRunLog;
         use std::collections::HashMap;
 
         let config = Arc::new(
@@ -3911,7 +3911,7 @@ mod tests {
             runtime: Arc::new(RecordingRuntime { seen: std::sync::Mutex::new(Vec::new()), out: perceive_output(), usage: None }),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
-            runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
+            runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         };
@@ -3989,7 +3989,7 @@ mod tests {
         use crate::identity::gitlawb::GitlawbIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
-        use crate::runlog::FileRunLog;
+        use crate::runlog::sqlite::SqliteRunLog;
         use crate::model::runlog::ToolCallRecord;
         use std::collections::HashMap;
 
@@ -4012,7 +4012,7 @@ mod tests {
             runtime: Arc::new(RecordingRuntime { seen: std::sync::Mutex::new(Vec::new()), out: perceive_output() , usage: None }),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
-            runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
+            runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         };
@@ -4047,7 +4047,7 @@ mod tests {
         use crate::identity::gitlawb::GitlawbIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
-        use crate::runlog::FileRunLog;
+        use crate::runlog::sqlite::SqliteRunLog;
         use base64::Engine;
         use ed25519_dalek::{Signer, SigningKey};
         use std::collections::HashMap;
@@ -4080,7 +4080,7 @@ mod tests {
             }),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
-            runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
+            runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         };
@@ -4125,7 +4125,7 @@ mod tests {
         use crate::identity::gitlawb::GitlawbIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
-        use crate::runlog::FileRunLog;
+        use crate::runlog::sqlite::SqliteRunLog;
         use std::collections::HashMap;
 
         let tmp = std::env::temp_dir().join(format!("dack-model-{}", std::process::id()));
@@ -4153,7 +4153,7 @@ mod tests {
             runtime: runtime.clone(),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
-            runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
+            runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         };
@@ -4267,7 +4267,7 @@ mod tests {
         use crate::identity::gitlawb::GitlawbIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
-        use crate::runlog::FileRunLog;
+        use crate::runlog::sqlite::SqliteRunLog;
         use crate::state_prompt::SessionConfig;
         use std::collections::HashMap;
 
@@ -4299,7 +4299,7 @@ mod tests {
             runtime: runtime.clone(),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
-            runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
+            runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         };
@@ -4370,8 +4370,11 @@ mod tests {
         assert!(has(0, "environment"), "fresh wake carries the environment map");
         assert!(!has(1, "self-orientation"), "RESUME drops self-orientation (the session already has it)");
         assert!(!has(1, "environment"), "RESUME drops the fresh environment map (fresh-only)");
-        assert!(has(1, "environment-recent"), "RESUME injects the GLOBAL diff since last wake");
-        assert!(has(1, "thread-recent"), "RESUME injects the conversation (thread) DIFF block");
+        // The diff blocks are RESUME-ONLY (never on a fresh wake). Their PRESENCE on a resume depends on
+        // there being a diff to show — with real runlog data (unit-tested at the SQLite layer), not this
+        // run_step-only harness fixture that writes no entries.
+        assert!(!has(0, "environment-recent") && !has(2, "environment-recent"), "environment-recent is resume-only");
+        assert!(!has(0, "thread-recent") && !has(2, "thread-recent"), "thread-recent is resume-only");
         assert!(!has(1, "thread"), "a resume uses thread-recent, not the fresh thread block");
         assert!(has(2, "self-orientation"), "a different thread's fresh wake carries self-orientation again");
         assert!(has(2, "environment"), "a fresh wake carries the environment map");
@@ -4390,7 +4393,7 @@ mod tests {
         use crate::identity::gitlawb::GitlawbIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
-        use crate::runlog::FileRunLog;
+        use crate::runlog::sqlite::SqliteRunLog;
         use crate::state_prompt::SessionConfig;
         use std::collections::HashMap;
 
@@ -4413,7 +4416,7 @@ mod tests {
             runtime: runtime.clone(),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
-            runlog: Arc::new(FileRunLog::new(tmp.join("runlogs"))),
+            runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
         };

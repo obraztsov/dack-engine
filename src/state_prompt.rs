@@ -111,6 +111,31 @@ pub struct RunlogContext {
     /// wants `false` (see all the facts, nothing collapsed) so it can consolidate them into `memory/`.
     #[serde(default = "default_true")]
     pub dedup_notes: bool,
+    /// `environment` MEMORY-notes soft window: only surface memory notes from the last N days (`0` = all
+    /// retained). The hard-GC ceiling (`tag_note_hard_days`) is separate + larger — this is what's SHOWN.
+    #[serde(default)]
+    pub recent_notes_days: usize,
+    /// Opt-in DIGEST-queue block: surface the PENDING `digest` notes for a digest/Reflect job to
+    /// consolidate, then retire them on the cycle's success. Off by default (only digest jobs set it).
+    #[serde(default)]
+    pub digest: DigestContext,
+}
+
+/// The digest-queue context: which pending `digest` notes a job consolidates. `tags` routes a CHANNEL
+/// digest (its pending notes tagged e.g. `telegram`); `stale_secs` is Reflect's catch-all (any pending
+/// digest note older than this). Either/both; empty `tags` + `0` stale = off.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DigestContext {
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub stale_secs: u64,
+}
+
+impl DigestContext {
+    pub fn is_on(&self) -> bool {
+        !self.tags.is_empty() || self.stale_secs > 0
+    }
 }
 
 impl Default for RunlogContext {
@@ -121,6 +146,8 @@ impl Default for RunlogContext {
             thread_recent_lookback_secs: default_thread_recent_lookback(),
             recent_notes: default_recent_notes(),
             dedup_notes: true,
+            recent_notes_days: 0,
+            digest: DigestContext::default(),
         }
     }
 }

@@ -786,6 +786,18 @@ impl Harness {
         let runlog_ref = self
             .write_runlog(prompt.state, stimulus, &out, tool_calls, step_seq, tags)
             .await?;
+        // A digest/Reflect cycle that reached here (an entry was authored) consolidated its digest queue
+        // → retire those notes (the same set `digest_block` surfaced: by channel tags and/or stale age).
+        if ctx.runlog.digest.is_on() {
+            let dtags: Vec<&str> = ctx.runlog.digest.tags.iter().map(String::as_str).collect();
+            let older_than = (ctx.runlog.digest.stale_secs > 0)
+                .then(|| chrono::Utc::now().timestamp() - ctx.runlog.digest.stale_secs as i64);
+            match self.runlog.deliver_digest(&dtags, older_than).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!("digest: retired {n} delivered note(s)"),
+                Err(e) => tracing::warn!("digest deliver failed: {e}"),
+            }
+        }
         Ok((out, runlog_ref, accessed))
     }
 
@@ -1380,7 +1392,43 @@ impl Harness {
                 }
             }
         }
+        // The DIGEST QUEUE (fresh OR resume): pending digest notes this job consolidates — independent of
+        // the memory notes above, so a digest job can carry both. Retired on the cycle's success.
+        if cfg.digest.is_on() {
+            if let Some(body) = self.digest_block(&cfg.digest).await {
+                out.push(ContextBlock { label: "digest-queue".into(), body, trusted: true });
+            }
+        }
         out
+    }
+
+    /// The `digest-queue` block: the PENDING `digest` notes this job should consolidate — those tagged
+    /// with its channel `tags`, or (Reflect's catch-all) older than `stale_secs`. The job distils them
+    /// into long-term `memory/`; [`deliver_digest`](crate::runlog::RunLogWriter::deliver_digest) retires
+    /// them when the cycle succeeds. `None` when the queue is empty (no block).
+    async fn digest_block(&self, digest: &crate::state_prompt::DigestContext) -> Option<String> {
+        let tags: Vec<&str> = digest.tags.iter().map(String::as_str).collect();
+        let older_than =
+            (digest.stale_secs > 0).then(|| chrono::Utc::now().timestamp() - digest.stale_secs as i64);
+        let notes = self.runlog.pending_digest(&tags, older_than).await.unwrap_or_default();
+        if notes.is_empty() {
+            return None;
+        }
+        let mut s = String::from(
+            "DIGEST QUEUE — pending items to consolidate into long-term `memory/`, then they retire. For \
+             each, recall the raw conversation by its tag + the note's time window, distil what lasts, and \
+             write it to memory. Tags shown are the note's (thread + channel):",
+        );
+        for n in &notes {
+            s.push_str(&format!(
+                "\n- [{}] ({} · {}): \"{}\"",
+                n.tag,
+                trust_abbrev(&n.trust),
+                fmt_utc(n.timestamp),
+                n.note
+            ));
+        }
+        Some(s)
     }
 
     /// The fresh-wake `environment` map — a compact-prose digest of the duck's short-term memory:
@@ -1426,9 +1474,13 @@ impl Harness {
         // Recent sticky notes (latest-per-tag), newest first, WITH their text + trust — the duck's
         // cross-thread short-term memory. The current thread's own note is highlighted separately
         // below, so drop it from this list to avoid duplication.
+        // Memory notes only (digest notes surface in their own block); optionally windowed to the last
+        // `recent_notes_days` (soft window; 0 = all retained, bounded by the hard-GC ceiling).
+        let memory_since = (cfg.recent_notes_days > 0)
+            .then(|| chrono::Utc::now().timestamp() - cfg.recent_notes_days as i64 * 86_400);
         let recent = self
             .runlog
-            .tag_notes(None, None, cfg.dedup_notes, cfg.recent_notes)
+            .tag_notes(Some("memory"), memory_since, None, cfg.dedup_notes, cfg.recent_notes)
             .await
             .unwrap_or_default();
         let recent: Vec<_> = recent.into_iter().filter(|r| Some(r.tag.as_str()) != tag).collect();
@@ -1448,7 +1500,7 @@ impl Harness {
             lines.push(s);
         }
         if let Some(t) = tag {
-            if let Some(n) = self.runlog.tag_notes(None, Some(t), true, 1).await.unwrap_or_default().last() {
+            if let Some(n) = self.runlog.tag_notes(Some("memory"), None, Some(t), true, 1).await.unwrap_or_default().last() {
                 let more = if n.dupes > 0 { format!(" [+{} more]", n.dupes) } else { String::new() };
                 lines.push(format!(
                     "This thread's note: \"{}\" ({} · {}){more}.",
@@ -1479,7 +1531,7 @@ impl Harness {
     /// the world while it slept (there is otherwise no global view on a resume).
     async fn environment_recent_block(&self, since: i64) -> Option<String> {
         let runs = self.runlog.tail_filtered(Some(since), 40, None).await.unwrap_or_default();
-        let notes = self.runlog.tag_notes(Some(since), None, false, 40).await.unwrap_or_default();
+        let notes = self.runlog.tag_notes(Some("memory"), Some(since), None, false, 40).await.unwrap_or_default();
         let mut parts: Vec<String> = Vec::new();
         if !runs.trim().is_empty() {
             parts.push(format!("Other runs since you last woke:\n{runs}"));

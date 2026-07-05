@@ -542,20 +542,25 @@ impl RunLogWriter for SqliteRunLog {
 
     async fn tag_notes(
         &self,
+        kind: Option<&str>,
         since: Option<i64>,
         tag: Option<&str>,
         latest_per_tag: bool,
         max: usize,
     ) -> Result<Vec<TagNoteRecord>> {
         let conn = self.conn.lock().unwrap();
-        // One row per (note, its tag); B0 notes carry a single tag, so this is 1:1.
         let mut sql = String::from(
             "SELECT nt.tag, n.note, n.trust, n.ts FROM tag_notes n
              JOIN note_tags nt ON nt.note_id = n.id WHERE 1=1",
         );
+        let kind_v = kind.map(str::to_string);
         let since_v = since;
         let tag_v = tag.map(str::to_string);
         let mut binds: Vec<&dyn rusqlite::ToSql> = Vec::new();
+        if let Some(k) = &kind_v {
+            binds.push(k);
+            sql.push_str(&format!(" AND n.kind = ?{}", binds.len()));
+        }
         if let Some(s) = &since_v {
             binds.push(s);
             sql.push_str(&format!(" AND n.ts > ?{}", binds.len()));
@@ -595,6 +600,78 @@ impl RunLogWriter for SqliteRunLog {
         }
         out.truncate(max);
         Ok(out)
+    }
+
+    async fn pending_digest(&self, tags: &[&str], older_than: Option<i64>) -> Result<Vec<TagNoteRecord>> {
+        let older_v = older_than;
+        let mut clauses: Vec<String> = Vec::new();
+        let mut binds: Vec<&dyn rusqlite::ToSql> = Vec::new();
+        if !tags.is_empty() {
+            clauses.push(format!(
+                "n.id IN (SELECT note_id FROM note_tags WHERE tag IN ({}))",
+                vec!["?"; tags.len()].join(",")
+            ));
+            for t in tags {
+                binds.push(t);
+            }
+        }
+        if let Some(o) = &older_v {
+            clauses.push("n.ts < ?".into());
+            binds.push(o);
+        }
+        if clauses.is_empty() {
+            return Ok(Vec::new());
+        }
+        // One row per pending digest note; `tag` = all its tags joined (so the digest can pick the
+        // thread tag to fetch the raw convo, and see the channel it routed on).
+        let sql = format!(
+            "SELECT (SELECT GROUP_CONCAT(tag) FROM note_tags WHERE note_id = n.id), n.note, n.trust, n.ts
+             FROM tag_notes n WHERE n.kind = 'digest' AND n.delivered_at IS NULL AND ({}) ORDER BY n.ts DESC",
+            clauses.join(" OR ")
+        );
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&sql).map_err(db)?;
+        let rows = stmt
+            .query_map(binds.as_slice(), |r| {
+                Ok(TagNoteRecord {
+                    tag: r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                    note: r.get(1)?,
+                    trust: r.get(2)?,
+                    timestamp: r.get(3)?,
+                    dupes: 0,
+                })
+            })
+            .map_err(db)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(db)
+    }
+
+    async fn deliver_digest(&self, tags: &[&str], older_than: Option<i64>) -> Result<usize> {
+        let now = chrono::Utc::now().timestamp();
+        let older_v = older_than;
+        let mut clauses: Vec<String> = Vec::new();
+        let mut binds: Vec<&dyn rusqlite::ToSql> = vec![&now]; // SET delivered_at = ? (first bind)
+        if !tags.is_empty() {
+            clauses.push(format!(
+                "id IN (SELECT note_id FROM note_tags WHERE tag IN ({}))",
+                vec!["?"; tags.len()].join(",")
+            ));
+            for t in tags {
+                binds.push(t);
+            }
+        }
+        if let Some(o) = &older_v {
+            clauses.push("ts < ?".into());
+            binds.push(o);
+        }
+        if clauses.is_empty() {
+            return Ok(0);
+        }
+        let sql = format!(
+            "UPDATE tag_notes SET delivered_at = ? WHERE kind = 'digest' AND delivered_at IS NULL AND ({})",
+            clauses.join(" OR ")
+        );
+        let conn = self.conn.lock().unwrap();
+        conn.execute(&sql, binds.as_slice()).map_err(db)
     }
 
     async fn append_note(
@@ -711,12 +788,12 @@ mod tests {
         rl.append_note("memory", &["chatX"], "note one", "org", 1000).await.unwrap();
         rl.append_note("memory", &["chatX"], "note two", "org", 1001).await.unwrap();
         rl.append_note("memory", &["chatY"], "other", "public", 1002).await.unwrap();
-        let latest = rl.tag_notes(None, Some("chatX"), true, 50).await.unwrap();
+        let latest = rl.tag_notes(None, None, Some("chatX"), true, 50).await.unwrap();
         assert_eq!(latest.len(), 1);
         assert_eq!(latest[0].note, "note two", "newest per tag");
         assert_eq!(latest[0].dupes, 1, "[+1 more]");
         // all-notes view (no collapse)
-        assert_eq!(rl.tag_notes(None, None, false, 50).await.unwrap().len(), 3);
+        assert_eq!(rl.tag_notes(None, None, None, false, 50).await.unwrap().len(), 3);
     }
 
     #[tokio::test]
@@ -742,11 +819,34 @@ mod tests {
         rl.append_note("digest", &["chatX", "telegram"], "summarize chatX", "self", 1000).await.unwrap();
         rl.append_note("memory", &["chatX"], "al likes ducks", "org", 1001).await.unwrap();
         // both of the digest note's tags resolve to it
-        assert_eq!(rl.tag_notes(None, Some("telegram"), false, 10).await.unwrap().len(), 1);
-        assert_eq!(rl.tag_notes(None, Some("chatX"), false, 10).await.unwrap().len(), 2, "chatX has the digest + memory note");
+        assert_eq!(rl.tag_notes(None, None, Some("telegram"), false, 10).await.unwrap().len(), 1);
+        assert_eq!(rl.tag_notes(None, None, Some("chatX"), false, 10).await.unwrap().len(), 2, "chatX has the digest + memory note");
         // the digest note retires via its channel tag; the memory note is untouched
         assert_eq!(rl.mark_digest_delivered(&["telegram"], 2000).unwrap(), 1);
         assert_eq!(rl.mark_digest_delivered(&["telegram"], 3000).unwrap(), 0, "idempotent");
+    }
+
+    #[tokio::test]
+    async fn pending_digest_routes_by_channel_tags_and_stale_age() {
+        let rl = SqliteRunLog::open_in_memory().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        rl.append_note("digest", &["chatX", "telegram"], "tg item", "self", now).await.unwrap();
+        rl.append_note("digest", &["threadY", "twitter"], "old tw item", "self", now - 20_000).await.unwrap();
+        rl.append_note("memory", &["chatX"], "not a digest item", "org", now).await.unwrap();
+
+        // channel digest: telegram → only the telegram digest note
+        let tg = rl.pending_digest(&["telegram"], None).await.unwrap();
+        assert_eq!(tg.len(), 1);
+        assert_eq!(tg[0].note, "tg item");
+        // Reflect stale catch-all: any pending digest note older than ~2.7h (any tag) → the old twitter one
+        let stale = rl.pending_digest(&[], Some(now - 10_000)).await.unwrap();
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].note, "old tw item");
+
+        // deliver telegram → retires the tg note; pending telegram now empty; the memory note untouched
+        assert_eq!(rl.deliver_digest(&["telegram"], None).await.unwrap(), 1);
+        assert!(rl.pending_digest(&["telegram"], None).await.unwrap().is_empty());
+        assert_eq!(rl.tag_notes(Some("memory"), None, None, false, 10).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

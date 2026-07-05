@@ -259,7 +259,7 @@ mod tests {
         let rl = SqliteRunLog::open(&db).unwrap();
         assert_eq!(rl.search("quack", &["sent"], 10).unwrap(), vec!["run-telegram-1000-perceive".to_string()]);
         assert!(rl.search("real duck", &["incoming"], 10).unwrap().len() == 1, "raw incoming is searchable");
-        let notes = rl.tag_notes(None, Some("945712096"), false, 10).await.unwrap();
+        let notes = rl.tag_notes(None, None, Some("945712096"), false, 10).await.unwrap();
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].note, "likes ducks");
 

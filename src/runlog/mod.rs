@@ -73,12 +73,25 @@ pub trait RunLogWriter: Send + Sync {
     /// most-recent `max` results. Default: empty (test writers).
     async fn tag_notes(
         &self,
+        _kind: Option<&str>,
         _since: Option<i64>,
         _tag: Option<&str>,
         _latest_per_tag: bool,
         _max: usize,
     ) -> Result<Vec<TagNoteRecord>> {
         Ok(Vec::new())
+    }
+
+    /// Pending (`delivered_at IS NULL`) `digest` notes for a digest job: those tagged with any of `tags`,
+    /// OR (Reflect's catch-all) older than the `older_than` unix-ts. Newest-first. Default: empty.
+    async fn pending_digest(&self, _tags: &[&str], _older_than: Option<i64>) -> Result<Vec<TagNoteRecord>> {
+        Ok(Vec::new())
+    }
+
+    /// Mark the PENDING `digest` notes that `pending_digest(tags, older_than)` returns as delivered
+    /// (retired) — called after a digest/Reflect cycle succeeds. Returns the count retired. Default: 0.
+    async fn deliver_digest(&self, _tags: &[&str], _older_than: Option<i64>) -> Result<usize> {
+        Ok(0)
     }
 
     /// Append a TYPED "sticky note" (`kind` = `"memory"` | `"digest"`) with one or more `tags` (M:N),

@@ -4362,9 +4362,9 @@ mod tests {
 
         // Resume-aware blocks (the fresh-vs-resume split): a FRESH wake carries `self-orientation` +
         // the `environment` map + the `thread` history; a RESUME drops those and instead carries the
-        // `environment-recent` GLOBAL diff + the `thread-recent` conversation diff. (Tag/since filtering
-        // is unit-tested in the runlog module; FileRunLog here doesn't filter, so this asserts BLOCK
-        // ASSEMBLY — which label appears when.)
+        // `environment-recent` GLOBAL diff + the `thread-recent` conversation diff. This fixture writes
+        // no runlog entries (run_step only), so it asserts BLOCK GATING — which label may appear when —
+        // not the diff CONTENT (that's tag/since filtering, unit-tested at the SQLite layer).
         let has = |i: usize, label: &str| seen[i].blocks.iter().any(|b| b.label == label);
         assert!(has(0, "self-orientation"), "fresh wake carries self-orientation (grounding)");
         assert!(has(0, "environment"), "fresh wake carries the environment map");

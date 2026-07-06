@@ -1,6 +1,7 @@
 import { test, expect } from 'bun:test'
 import { Database } from 'bun:sqlite'
 import {
+  activityWindow,
   around,
   byTag,
   openDb,
@@ -64,6 +65,19 @@ test('byTag + time window', () => {
   expect(byTag(db, 'chatX').map((r) => r.run_id)).toEqual(['r1', 'r2'])
   expect(byTag(db, 'chatX', 1500).map((r) => r.run_id)).toEqual(['r2']) // from_ts
   expect(byTag(db, 'trading').map((r) => r.run_id)).toEqual(['r2'])
+})
+
+test('activityWindow bounds the self feed by time (0 = open)', () => {
+  const db = openDb(fixture())
+  expect(activityWindow(db, 0, 0).map((r) => r.run_id)).toEqual(['r1', 'r2']) // fully open
+  expect(activityWindow(db, 1500, 0).map((r) => r.run_id)).toEqual(['r2']) // from_ts
+  expect(activityWindow(db, 0, 1500).map((r) => r.run_id)).toEqual(['r1']) // to_ts
+})
+
+test('recall_self_by_tag time-window (byTag from/to) — same as public, self view', () => {
+  const db = openDb(fixture())
+  expect(byTag(db, 'chatX', 1500, 0).map((r) => r.run_id)).toEqual(['r2'])
+  expect(byTag(db, 'chatX', 0, 1500).map((r) => r.run_id)).toEqual(['r1'])
 })
 
 test('FTS trust boundary: self scope never matches raw incoming; raw scope only matches incoming', () => {

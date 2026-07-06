@@ -158,6 +158,17 @@ export function recentActivity(db: Database, days: number): Row[] {
   return rows.map(mapRow)
 }
 
+/** The self activity feed within an explicit `[from, to]` window (either bound `0` = open). */
+export function activityWindow(db: Database, from: number, to: number): Row[] {
+  const rows = db
+    .query(
+      `${SELECT} WHERE (?1 = 0 OR e.ts >= ?1) AND (?2 = 0 OR e.ts <= ?2)
+       AND (e.thought != '' OR e.sent != '[]') ORDER BY e.ts`,
+    )
+    .all(from, to)
+  return rows.map(mapRow)
+}
+
 /** FTS5 search over `columns` (the trust boundary) → hits with a highlighted snippet, newest-first. */
 export function search(
   db: Database,

@@ -11,6 +11,8 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
 import {
+  activityWindow,
+  around,
   atLeastTrust,
   byTag,
   clamp,
@@ -38,19 +40,23 @@ server.registerTool(
       'thoughts and what you said, each tagged with run_id + chat + origin trust. NEVER the raw incoming ' +
       "text, so reading it keeps you clean (self-trust). Long fields are TRUNCATED with a `[+N chars — " +
       'read_entry …]` marker. Pages NEWEST first: omit `cursor` for the latest, then pass back ' +
-      "`page.cursor` for older. `min_trust` (self|org|public) floors out lower-trust chats.",
+      "`page.cursor` for older. `min_trust` (self|org|public) floors out lower-trust chats. Or pass " +
+      '`from_ts`/`to_ts` (unix secs) for an explicit window instead of `days`.',
     inputSchema: {
       days: z.number().int().optional(),
+      from_ts: z.number().int().optional(),
+      to_ts: z.number().int().optional(),
       min_trust: z.string().optional(),
       limit: z.number().int().optional(),
       cursor: z.string().optional(),
     },
   },
-  async ({ days, min_trust, limit, cursor }) => {
+  async ({ days, from_ts, to_ts, min_trust, limit, cursor }) => {
+    const windowed = from_ts != null || to_ts != null
     const d = clamp(days, 2, 30)
-    const rows = atLeastTrust(recentActivity(db, d), min_trust)
+    const rows = atLeastTrust(windowed ? activityWindow(db, from_ts ?? 0, to_ts ?? 0) : recentActivity(db, d), min_trust)
     const page = cursorPage(rows, clamp(limit, 25, 50), cursor)
-    return asText({ ok: true, days: d, page: { total: page.total, returned: page.returned, has_more: page.has_more, cursor: page.cursor }, log: renderThoughtLog(page.items) })
+    return asText({ ok: true, days: windowed ? null : d, page: { total: page.total, returned: page.returned, has_more: page.has_more, cursor: page.cursor }, log: renderThoughtLog(page.items) })
   },
 )
 
@@ -59,18 +65,44 @@ server.registerTool(
   {
     description:
       'Your OWN thoughts + replies in ONE chat/topic by its tag (find tags via `related_tags` or the ' +
-      'environment block). Thoughts-only (no raw incoming) — stays self-trust. Pages newest first.',
+      'environment block). Optional `from_ts`/`to_ts` (unix secs) narrow to a time window — pair with a ' +
+      "tag-note's timestamp to pull just that stretch. Thoughts-only (no raw incoming) — stays self-trust. " +
+      'Pages newest first.',
     inputSchema: {
       tag: z.string().min(1),
+      from_ts: z.number().int().optional(),
+      to_ts: z.number().int().optional(),
       min_trust: z.string().optional(),
       limit: z.number().int().optional(),
       cursor: z.string().optional(),
     },
   },
-  async ({ tag, min_trust, limit, cursor }) => {
-    const rows = atLeastTrust(byTag(db, tag).filter((r) => r.thought || r.sent.length), min_trust)
+  async ({ tag, from_ts, to_ts, min_trust, limit, cursor }) => {
+    const rows = atLeastTrust(byTag(db, tag, from_ts, to_ts).filter((r) => r.thought || r.sent.length), min_trust)
     const page = cursorPage(rows, clamp(limit, 25, 50), cursor)
     return asText({ ok: true, tag, page: { total: page.total, returned: page.returned, has_more: page.has_more, cursor: page.cursor }, log: renderThoughtLog(page.items) })
+  },
+)
+
+server.registerTool(
+  'recall_self_around',
+  {
+    description:
+      'Your OWN thoughts + replies around a moment: entries within ±`window_secs` of `ts` (unix secs), ' +
+      'optionally filtered to `tag`. Thoughts-only (no raw incoming), stays self-trust. For "what was I ' +
+      'thinking when X happened".',
+    inputSchema: {
+      ts: z.number().int(),
+      window_secs: z.number().int().optional(),
+      tag: z.string().optional(),
+      min_trust: z.string().optional(),
+      limit: z.number().int().optional(),
+    },
+  },
+  async ({ ts, window_secs, tag, min_trust, limit }) => {
+    const w = clamp(window_secs, 1800, 86400)
+    const rows = atLeastTrust(around(db, ts, w, tag).filter((r) => r.thought || r.sent.length), min_trust).slice(0, clamp(limit, 40, 100))
+    return asText({ ok: true, ts, window_secs: w, tag: tag ?? null, log: renderThoughtLog(rows) })
   },
 )
 

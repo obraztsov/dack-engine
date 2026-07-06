@@ -128,8 +128,18 @@ impl SqliteRunLog {
     /// CALLER's column choice: self-recall passes `["thought","sent"]` (never `incoming`), raw-search
     /// passes `["incoming"]`. Returns matching `run_id`s, best-ranked first.
     pub fn search(&self, query: &str, columns: &[&str], limit: usize) -> Result<Vec<String>> {
-        // Column-scoped FTS: `{thought sent} : (query)`. The query is a bound parameter (no injection).
-        let scoped = format!("{{{}}} : ({})", columns.join(" "), query);
+        // Sanitize the raw query into a SAFE FTS5 MATCH: word tokens only, each a quoted (escaped)
+        // phrase term, AND-ed. Strips FTS5 operators/quotes/parens so a query can never syntax-error.
+        // (Mirrors `ftsMatch` in the TS recall layer. Porter stemming still applies to quoted terms.)
+        let terms: Vec<String> = query
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .filter(|t| !t.is_empty())
+            .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+            .collect();
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let scoped = format!("{{{}}} : ({})", columns.join(" "), terms.join(" "));
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
@@ -766,6 +776,20 @@ mod tests {
         assert!(rl.search("banana", &["thought", "sent"], 10).unwrap().is_empty(), "self never matches raw incoming");
         // RAW scope (incoming only) is where 'what the user said' lives.
         assert_eq!(rl.search("banana", &["incoming"], 10).unwrap(), vec!["run-q".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn fts_search_sanitizes_special_chars() {
+        let rl = SqliteRunLog::open_in_memory().unwrap();
+        rl.append(&entry("run-q", 1000, "self", &["t"], "the duck quacks", "banana")).await.unwrap();
+        // Queries that would FTS-syntax-error a raw MATCH must be safe:
+        for q in ["it's a duck", "duck (quacks)", "foo \"bar", "AND", "a AND b", ""] {
+            assert!(rl.search(q, &["thought"], 10).is_ok(), "query {q:?} must not error");
+        }
+        // A real match still works (punctuation stripped, porter stems quack↔quacks):
+        assert_eq!(rl.search("the duck!", &["thought"], 10).unwrap(), vec!["run-q".to_string()]);
+        // Punctuation-only → no hits, no error:
+        assert!(rl.search("  (?) ", &["thought"], 10).unwrap().is_empty());
     }
 
     #[tokio::test]

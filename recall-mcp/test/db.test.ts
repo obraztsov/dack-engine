@@ -91,6 +91,23 @@ test('FTS trust boundary: self scope never matches raw incoming; raw scope only 
   expect(search(db, 'banana', ['thought', 'sent', 'incoming'], 10).length).toBe(1)
 })
 
+test('search sanitizes raw queries (no FTS syntax errors) + snippets the matching column', () => {
+  const db = openDb(fixture())
+  // Inputs that syntax-error a RAW FTS MATCH must now be safe:
+  for (const q of ["it's a duck", 'duck (quacks)', 'foo "bar', 'AND', 'a AND b', 'quack*', '']) {
+    expect(() => search(db, q, ['thought', 'sent'], 10)).not.toThrow()
+  }
+  // A real match still works, with porter stemming (quack ↔ quacks) + punctuation stripped:
+  expect(search(db, 'quack', ['thought', 'sent'], 10).map((h) => h.run_id)).toEqual(['r1'])
+  expect(search(db, 'the duck!', ['thought', 'sent'], 10).map((h) => h.run_id)).toEqual(['r1'])
+  // Punctuation-only / empty → no hits, no error:
+  expect(search(db, '  (?) ', ['thought', 'sent'], 10)).toEqual([])
+  // Snippet comes from the MATCHING column: a raw (incoming) match snippets 'banana', not the thought.
+  const raw = search(db, 'banana', ['incoming'], 10)
+  expect(raw.length).toBe(1)
+  expect(raw[0].snippet).toContain('banana')
+})
+
 test('typed tag-notes: pending vs delivered, kind + tag filters', () => {
   const db = openDb(fixture())
   // default hides the delivered digest note

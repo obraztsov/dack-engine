@@ -169,24 +169,36 @@ export function activityWindow(db: Database, from: number, to: number): Row[] {
   return rows.map(mapRow)
 }
 
-/** FTS5 search over `columns` (the trust boundary) → hits with a highlighted snippet, newest-first. */
+/** Sanitize a raw natural-language query into a SAFE FTS5 MATCH: word tokens only, each a quoted
+ * (escaped) phrase term, AND-ed, scoped to `columns`. Strips FTS5 operators / quotes / parens so a
+ * query like `it's a (duck)`, an unbalanced quote, a bare `AND`, or empty can never syntax-error.
+ * `null` when there's nothing searchable (caller returns no hits). Porter stemming still applies to the
+ * quoted terms, so `quack` matches `quacks`. */
+export function ftsMatch(query: string, columns: string[]): string | null {
+  const terms = (query.match(/[\p{L}\p{N}_]+/gu) ?? []).map((t) => `"${t.replace(/"/g, '""')}"`)
+  return terms.length ? `{${columns.join(' ')}} : (${terms.join(' ')})` : null
+}
+
+/** FTS5 search over `columns` (the trust boundary) → hits with a highlighted snippet, best-ranked. */
 export function search(
   db: Database,
   query: string,
   columns: string[],
   limit: number,
 ): { run_id: string; tag: string; at: string; snippet: string }[] {
-  const scoped = `{${columns.join(' ')}} : (${query})`
-  const col = columns.includes('incoming') && columns.length === 1 ? 2 : 0 // snippet from incoming vs thought
+  const match = ftsMatch(query, columns)
+  if (!match) return []
   const rows = db
     .query(
+      // snippet(-1) = auto-select the best-matching column (so a match in `sent`/`incoming` snippets
+      // from THAT column, not always `thought`).
       `SELECT e.run_id, e.ts,
         (SELECT tag FROM entry_tags WHERE run_id = e.run_id LIMIT 1) AS tag,
-        snippet(entries_fts, ${col}, '[', ']', '…', 12) AS snip
-       FROM entries_fts f JOIN entries e ON e.rowid = f.rowid
+        snippet(entries_fts, -1, '[', ']', '…', 12) AS snip
+       FROM entries_fts JOIN entries e ON e.rowid = entries_fts.rowid
        WHERE entries_fts MATCH ?1 ORDER BY rank LIMIT ?2`,
     )
-    .all(scoped, limit) as any[]
+    .all(match, limit) as any[]
   return rows.map((r) => ({ run_id: r.run_id, tag: r.tag ?? '', at: fmtTime(r.ts), snippet: (r.snip ?? '').replace(/\s+/g, ' ').trim() }))
 }
 

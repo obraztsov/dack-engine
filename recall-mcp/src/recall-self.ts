@@ -64,12 +64,12 @@ server.registerTool(
   'recall_self_by_tag',
   {
     description:
-      'Your OWN thoughts + replies in ONE chat/topic by its tag (find tags via `related_tags` or the ' +
-      'environment block). Optional `from_ts`/`to_ts` (unix secs) narrow to a time window — pair with a ' +
-      "tag-note's timestamp to pull just that stretch. Thoughts-only (no raw incoming) — stays self-trust. " +
-      'Pages newest first.',
+      'Your OWN thoughts + replies in ONE chat/topic by its tag (omit `tag` for THIS chat; find other ' +
+      'tags via `related_tags` or the environment block). Optional `from_ts`/`to_ts` (unix secs) narrow ' +
+      "to a time window — pair with a tag-note's timestamp to pull just that stretch. Thoughts-only (no " +
+      'raw incoming) — stays self-trust. Pages newest first.',
     inputSchema: {
-      tag: z.string().min(1),
+      tag: z.string().optional(),
       from_ts: z.number().int().optional(),
       to_ts: z.number().int().optional(),
       min_trust: z.string().optional(),
@@ -78,9 +78,11 @@ server.registerTool(
     },
   },
   async ({ tag, from_ts, to_ts, min_trust, limit, cursor }) => {
-    const rows = atLeastTrust(byTag(db, tag, from_ts, to_ts).filter((r) => r.thought || r.sent.length), min_trust)
+    const t = tag ?? TAG
+    if (!t) return asText({ ok: false, error: 'no tag given and no RECALL_TAG in scope — pass a tag' })
+    const rows = atLeastTrust(byTag(db, t, from_ts, to_ts).filter((r) => r.thought || r.sent.length), min_trust)
     const page = cursorPage(rows, clamp(limit, 25, 50), cursor)
-    return asText({ ok: true, tag, page: { total: page.total, returned: page.returned, has_more: page.has_more, cursor: page.cursor }, log: renderThoughtLog(page.items) })
+    return asText({ ok: true, tag: t, page: { total: page.total, returned: page.returned, has_more: page.has_more, cursor: page.cursor }, log: renderThoughtLog(page.items) })
   },
 )
 

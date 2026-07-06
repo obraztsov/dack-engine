@@ -719,7 +719,6 @@ mod tests {
             source: "telegram-pub".into(),
             state: ConsciousnessState::Perceive,
             context_summary: "ctx".into(),
-            baton: None,
             raw_stimulus: incoming.into(),
             tool_calls: vec![ToolCallRecord {
                 tool: "mcp__telegram__reply".into(),

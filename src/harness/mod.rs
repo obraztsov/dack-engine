@@ -243,7 +243,6 @@ impl Harness {
             source: stimulus.source.clone(),
             state: ConsciousnessState::Perceive,
             context_summary: format!("dispatch failed before completion: {err}"),
-            baton: None,
             raw_stimulus: stimulus.payload.to_string(),
             tool_calls: Vec::new(),
             output: None,
@@ -1720,7 +1719,6 @@ impl Harness {
                 "source={} type={} directive_tier={:?} payload_tier={:?}",
                 stimulus.source, stimulus.type_, stimulus.directive_tier, stimulus.payload_tier
             ),
-            baton: None,
             raw_stimulus: stimulus.payload.to_string(),
             tool_calls,
             output: Some(out.clone()),

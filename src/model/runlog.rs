@@ -10,7 +10,6 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::baton::Baton;
 use super::proposal::AgentOutput;
 use super::stimulus::StimulusId;
 use crate::state::ConsciousnessState;
@@ -48,9 +47,6 @@ pub struct RunLogEntry {
     pub state: ConsciousnessState,
     /// A summary of the assembled invocation context.
     pub context_summary: String,
-    /// The input→proposal (Baton) mapping, so an injection path is visible post-hoc.
-    #[serde(default)]
-    pub baton: Option<Baton>,
     /// Raw stimulus, stored in a **clearly-delimited-untrusted** block — this is what
     /// `runlog_ref` points at.
     pub raw_stimulus: String,

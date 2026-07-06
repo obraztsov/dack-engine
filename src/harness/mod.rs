@@ -785,9 +785,14 @@ impl Harness {
         let runlog_ref = self
             .write_runlog(prompt.state, stimulus, &out, tool_calls, step_seq, tags)
             .await?;
-        // A digest/Reflect cycle that reached here (an entry was authored) consolidated its digest queue
-        // → retire those notes (the same set `digest_block` surfaced: by channel tags and/or stale age).
-        if ctx.runlog.digest.is_on() {
+        // Retire the digest queue — but ONLY on a cycle that could actually CONSOLIDATE it into `memory/`.
+        // A digest job is two cycles: read-only Perceive READS + surfaces the queue and hands a gist to
+        // the Express distill that WRITES memory. Delivery must fire on the memory-writer (the gist is
+        // now durable), NOT on Perceive (else a distill failure would leave the notes retired-but-lost).
+        // So: any non-Perceive state carrying `digest` (distill's Express, or Reflect which reads+writes
+        // in one cycle) delivers. (NOTE: `deliver_digest` retires ALL matching pending notes — correct
+        // single-threaded; under future multithreading, deliver the exact surfaced ids instead.)
+        if ctx.runlog.digest.is_on() && prompt.state != ConsciousnessState::Perceive {
             let dtags: Vec<&str> = ctx.runlog.digest.tags.iter().map(String::as_str).collect();
             let older_than = (ctx.runlog.digest.stale_secs > 0)
                 .then(|| chrono::Utc::now().timestamp() - ctx.runlog.digest.stale_secs as i64);
@@ -1391,9 +1396,14 @@ impl Harness {
                 }
             }
         }
-        // The DIGEST QUEUE (fresh OR resume): pending digest notes this job consolidates — independent of
-        // the memory notes above, so a digest job can carry both. Retired on the cycle's success.
-        if cfg.digest.is_on() {
+        // The DIGEST QUEUE: pending digest notes this job consolidates — independent of the memory notes
+        // above, so a digest job can carry both. Surfaced only on states that READ the queue to
+        // consolidate it — a read-only Perceive (which then hands a gist to distill) or Reflect (which
+        // reads+writes in one cycle). The Express distill WRITES memory from the gist and only DELIVERS
+        // (retires) — it needn't re-surface.
+        if cfg.digest.is_on()
+            && matches!(state, ConsciousnessState::Perceive | ConsciousnessState::Reflect)
+        {
             if let Some(body) = self.digest_block(&cfg.digest).await {
                 out.push(ContextBlock { label: "digest-queue".into(), body, trusted: true });
             }

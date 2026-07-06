@@ -66,6 +66,24 @@ where
     })
 }
 
+/// Lenient `priority` deserializer for MODEL output — the model is taught `low|normal|high|urgent`, but a
+/// hallucinated label (`"critical"`, `"medium"`, …) must degrade to `None` (inherit the cycle's priority),
+/// NOT fail the whole cycle parse. Absent/null/unknown → `None`. (Operator-written config + stimulus
+/// `Priority` stay STRICT — a typo there SHOULD surface.)
+fn de_lenient_priority<'de, D>(d: D) -> Result<Option<Priority>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(d)?;
+    Ok(raw.and_then(|s| match s.to_ascii_lowercase().as_str() {
+        "low" => Some(Priority::Low),
+        "normal" => Some(Priority::Normal),
+        "high" => Some(Priority::High),
+        "urgent" => Some(Priority::Urgent),
+        _ => None,
+    }))
+}
+
 /// A requested state transition. The agent names the **next state-prompt id** it chooses
 /// — exactly one of the current prompt's declared `transitions` (or `None` to terminate). Whether
 /// it is honored is decided by the harness: the id must be in the allowed set, resolve to a real
@@ -95,8 +113,9 @@ pub struct BatonIntent {
     #[serde(default)]
     pub gist: String,
     /// Proposed scheduling priority for this branch. Harness-CLAMPED (never trusted to raise above
-    /// the origin) — `None` ⇒ inherit the cycle's. Honored from carried here from .
-    #[serde(default)]
+    /// the origin) — `None` ⇒ inherit the cycle's. LENIENT parse (`de_lenient_priority`): a hallucinated
+    /// value degrades to `None` rather than failing the whole cycle output (same lesson as `NoteKind`).
+    #[serde(default, deserialize_with = "de_lenient_priority")]
     pub priority: Option<Priority>,
     /// The message this branch REPLIES TO — the id the model copies from a message it saw in the
     /// batch (`payload.items`), e.g. a telegram `message_id`. The harness VALIDATES it against the
@@ -143,12 +162,30 @@ pub struct TagNote {
 }
 
 /// The two sticky-note types. No others — each has a distinct role in context assembly + GC.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NoteKind {
     #[default]
     Memory,
     Digest,
+}
+
+impl<'de> Deserialize<'de> for NoteKind {
+    /// LENIENT by design: the model can hallucinate a kind — this bit us with `"kind":"pub"` (it
+    /// conflated the twitter `pub` CHANNEL with a note kind). A strict enum would fail the WHOLE
+    /// `AgentOutput` parse and silently DROP the entire cycle's output (thought, notes, everything). So
+    /// anything that isn't `digest` — an absent/null/misspelled/unknown value — falls back to `memory`,
+    /// the default. Never let one stray field cost a cycle.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = Option::<String>::deserialize(deserializer)?;
+        Ok(match raw.as_deref() {
+            Some(s) if s.eq_ignore_ascii_case("digest") => NoteKind::Digest,
+            _ => NoteKind::Memory,
+        })
+    }
 }
 
 impl NoteKind {
@@ -211,6 +248,37 @@ impl AgentOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The 0.2.0 typed-notes regression: a live twitter-feed cycle emitted `"kind":"pub"` (conflating the
+    /// twitter `pub` CHANNEL with a note kind); the strict enum failed the WHOLE `AgentOutput` parse and
+    /// DROPPED the entire cycle's output. Note kind + baton priority must degrade, never hard-error.
+    #[test]
+    fn model_output_tolerates_bad_kind_and_priority() {
+        use crate::model::stimulus::Priority;
+        let k = |v: serde_json::Value| serde_json::from_value::<NoteKind>(v).unwrap();
+        assert_eq!(k(serde_json::json!("digest")), NoteKind::Digest);
+        assert_eq!(k(serde_json::json!("DIGEST")), NoteKind::Digest); // case-insensitive
+        assert_eq!(k(serde_json::json!("memory")), NoteKind::Memory);
+        assert_eq!(k(serde_json::json!("pub")), NoteKind::Memory); // the hallucination → default
+        assert_eq!(k(serde_json::json!(null)), NoteKind::Memory); // null → default
+
+        // The EXACT failing payload: a full AgentOutput with a bad note kind must parse, not drop the cycle.
+        let out: AgentOutput = serde_json::from_value(serde_json::json!({
+            "thought": "10th perceive cycle",
+            "tag_notes": [{"tag": "standing-shitpost-0706l", "note": "n", "kind": "pub"}],
+            "batons": [], "spawn": null, "transition": {"to_prompt": null}
+        }))
+        .expect("a hallucinated note kind must not fail the whole cycle parse");
+        assert_eq!(out.tag_notes.unwrap()[0].kind, NoteKind::Memory);
+
+        // Baton priority: known maps; a hallucinated label degrades to None (inherit), doesn't crash.
+        let good: BatonIntent =
+            serde_json::from_value(serde_json::json!({"to_prompt":"x","priority":"high"})).unwrap();
+        assert_eq!(good.priority, Some(Priority::High));
+        let bad: BatonIntent =
+            serde_json::from_value(serde_json::json!({"to_prompt":"x","priority":"critical"})).unwrap();
+        assert_eq!(bad.priority, None);
+    }
 
     /// A weaker model emits `intent`/`refs` in shapes the strict schema would reject. None of these
     /// may abort the cycle: an unknown intent degrades to `Other`, and `refs` accepts any JSON shape.

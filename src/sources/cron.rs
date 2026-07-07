@@ -137,6 +137,22 @@ mod tests {
         assert_eq!(next, Utc.with_ymd_and_hms(2026, 6, 5, 10, 0, 0).unwrap());
     }
 
+    /// The reflect-scheduler day-boundary DOUBLE-FIRE (two Reflects at 03:59:59 + 04:00:00). If the loop
+    /// recomputes `next_fire` from a clock that woke a hair BEFORE the slot, it re-obtains the SAME slot →
+    /// a second fire. The scheduler fix advances its search cursor to `slot + 1s`, which yields the NEXT
+    /// slot — so each slot fires exactly once no matter how the sleep wakes.
+    #[test]
+    fn next_fire_from_just_before_a_slot_reobtains_it_so_advance_past_it() {
+        let sched = parse_cron("0 4 * * *").unwrap(); // nightly 04:00 (the reflect_schedule)
+        let slot = Utc.with_ymd_and_hms(2026, 7, 7, 4, 0, 0).unwrap();
+        // BUG shape: a wake 1ms early re-obtains the same slot (would fire it a second time).
+        let early = slot - chrono::Duration::milliseconds(1);
+        assert_eq!(next_fire(&sched, early), Some(slot));
+        // FIX shape: searching from `slot + 1s` yields TOMORROW's slot — the slot fires exactly once.
+        let next = next_fire(&sched, slot + chrono::Duration::seconds(1)).unwrap();
+        assert_eq!(next, slot + chrono::Duration::days(1));
+    }
+
     #[test]
     fn rejects_garbage_cron() {
         assert!(parse_cron("not a cron").is_err());

@@ -950,13 +950,20 @@ impl Harness {
             }
         };
         tracing::info!("reflect scheduler up (`{expr}`).");
+        // `from` is the cursor we search the NEXT slot from — advanced strictly PAST each fired slot.
+        // Do NOT recompute the next slot from a freshly-read clock: `sleep` can wake a hair BEFORE the
+        // wall-clock boundary (monotonic-vs-wall drift over a ~24h sleep), and `next_fire(now)` from that
+        // early clock returns the SAME slot again → a second Reflect ~1s later (the day-boundary
+        // duplicate we saw at 03:59:59 + 04:00:00). Searching from `slot + 1s` fires each slot exactly
+        // once regardless of wake jitter. (The rate-limit can't backstop this: `reflect:last` is only
+        // written when the Reflect RUNS, seconds later, so both near-simultaneous enqueues pass it.)
+        let mut from = chrono::Utc::now();
         loop {
-            let now = chrono::Utc::now();
-            let Some(next) = crate::sources::cron::next_fire(&schedule, now) else {
+            let Some(next) = crate::sources::cron::next_fire(&schedule, from) else {
                 tracing::warn!("reflect_schedule never fires again — scheduler exiting");
                 return;
             };
-            let wait = (next - now).to_std().unwrap_or(Duration::from_secs(1));
+            let wait = (next - chrono::Utc::now()).to_std().unwrap_or(Duration::from_secs(0));
             tokio::select! {
                 _ = tokio::time::sleep(wait) => {}
                 _ = shutdown.changed() => return,
@@ -964,7 +971,8 @@ impl Harness {
             if *shutdown.borrow() {
                 return;
             }
-            let ts = chrono::Utc::now().timestamp();
+            from = next + chrono::Duration::seconds(1);
+            let ts = next.timestamp(); // the SCHEDULED second (stable id), not the jittery wake clock
             // The cadence guard — a scheduled Reflect within the interval of the last one is skipped
             // (e.g. a manual `reflect-now` an hour earlier). `reflect-now` itself does not check this.
             if !self.reflect_rate_limit_ok(ts).await {
@@ -972,7 +980,7 @@ impl Harness {
                 continue;
             }
             match self.queue.enqueue(reflect_stimulus(ts)).await {
-                Ok(()) => tracing::info!("scheduled Reflect enqueued."),
+                Ok(()) => tracing::info!("scheduled Reflect enqueued (for {}).", next.to_rfc3339()),
                 Err(e) => tracing::warn!("scheduled Reflect enqueue failed: {e}"),
             }
         }

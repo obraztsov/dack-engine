@@ -599,6 +599,12 @@ pub struct DackConfig {
     /// org+ digest jobs / reflect). Tag-notes (short-term) share this floor. Default `org`.
     #[serde(default = "default_memory_write_min_trust")]
     pub memory_write_min_trust: String,
+    /// PROTECTED memory paths (repo-relative, e.g. `memory/INDEX.md`) — writable ONLY in Reflect, like the
+    /// soul's `prompts/`/`stimuli/`/`SOUL.md`. These files are engine-INJECTED into every context, so a
+    /// non-Reflect cycle (even org+) rewriting them is a context-injection surface; the wall denies it. A
+    /// plain file matches exactly; a trailing-`/` entry protects a whole subtree. Empty (default) = none.
+    #[serde(default)]
+    pub protected_memory_paths: Vec<String>,
     /// Cap on the tag-notes catalogue (`runlogs/tag-notes.ndjson`): keep only the last N notes (the read
     /// tool dedups to latest-per-tag anyway). Default 200.
     #[serde(default = "default_tag_notes_max")]

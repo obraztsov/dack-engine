@@ -739,6 +739,11 @@ fn bridge_env(config: &DackConfig) -> HashMap<String, String> {
             env.insert(name.clone(), v);
         }
     }
+    // We own context management via sticky-session size-eviction (`session_max_context_tokens`); keep the
+    // SDK's OWN auto-compaction OFF so it can't silently summarize a session behind our back — which would
+    // break our token accounting + the firebreak's context guarantee — or nag the model toward the
+    // wall-denied `snip` tool (wasted cycles). openclaude honors `DISABLE_AUTO_COMPACT`.
+    env.insert("DISABLE_AUTO_COMPACT".to_string(), "1".to_string());
     env
 }
 

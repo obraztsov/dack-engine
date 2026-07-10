@@ -204,6 +204,7 @@ impl OpenClaudeClient {
         const KEYS: &[&str] = &[
             "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE", "CLAUDE_CODE_USE_OPENAI",
             "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN",
+            "DISABLE_AUTO_COMPACT", // behaviour flag (not a secret) — keep the SDK's compaction off here too
         ];
         self.env
             .iter()

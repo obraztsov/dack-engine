@@ -21,7 +21,7 @@ use async_trait::async_trait;
 use super::classify::classify_tool;
 use super::{ActionDecision, ActionRequest, ActionResponder};
 use crate::config::CapabilityPrefix;
-use crate::state::{StateSpec, ToolClass};
+use crate::state::{ConsciousnessState, StateSpec, ToolClass};
 
 /// One responder per invocation, bound to the running state's spec. Holding the spec
 /// (not the state name) means the gate reads the exact same table the rest of the
@@ -48,6 +48,13 @@ pub struct StatePolicyResponder {
     /// `memory_write_min_trust` (org+). When `false`, a `memory/` write is denied (an untrusted in-run
     /// cycle leaves tags; the digest consolidates). `true` by default (tests / no restriction).
     pub long_term_writable: bool,
+    /// Memory paths (repo-relative, e.g. `memory/INDEX.md`) that are PROTECTED: writable ONLY in Reflect,
+    /// exactly like the soul's `prompts/`/`stimuli/`/`SOUL.md`. These files are engine-INJECTED into every
+    /// context (the self-orientation block reads `memory/INDEX.md`), so letting a non-Reflect cycle — even
+    /// an org+ digest/Express — rewrite them is a context-injection surface. Empty = none (default,
+    /// back-compat). Set by the harness from `config.protected_memory_paths`; a plain file matches exactly,
+    /// a `dir/` also matches anything beneath it.
+    pub protected_paths: Vec<String>,
     /// `(tool, input)` fingerprints of OUTWARD actions (Post / SettleTx) that ran this invocation —
     /// tracked so [`acted_outward`](Self::acted_outward) can gate the timeout-retry path (never re-run
     /// a wake that already posted/traded → no double-post on a re-run). Duplicates are NOT blocked: a
@@ -69,6 +76,7 @@ impl StatePolicyResponder {
             repo_root: None,
             dry_run_block: Vec::new(),
             long_term_writable: true,
+            protected_paths: Vec::new(),
             outward_seen: Default::default(),
         }
     }
@@ -87,6 +95,7 @@ impl StatePolicyResponder {
             repo_root: None,
             dry_run_block: Vec::new(),
             long_term_writable: true,
+            protected_paths: Vec::new(),
             outward_seen: Default::default(),
         }
     }
@@ -124,6 +133,19 @@ impl StatePolicyResponder {
     /// Is this write target LONG-TERM memory (`memory/`)? Gated to org+ by `long_term_writable`.
     fn is_long_term_write(&self, target: &str) -> bool {
         self.relativize(target).is_some_and(|rel| rel.starts_with("memory/"))
+    }
+
+    /// Is this write target a PROTECTED memory path (Reflect-only)? A configured entry matches the
+    /// relativized target exactly (a file) or as a directory prefix (`dir/…`). Relativization already
+    /// collapses `..`, so `memory/../memory/INDEX.md` can't sneak past.
+    fn is_protected_write(&self, target: &str) -> bool {
+        let Some(rel) = self.relativize(target) else {
+            return false;
+        };
+        self.protected_paths.iter().any(|p| {
+            let p = p.trim_end_matches('/');
+            rel == p || rel.starts_with(&format!("{p}/"))
+        })
     }
 
     /// Resolve a write `target` to a **repo-relative, `..`-collapsed** path, or `None` if it
@@ -219,6 +241,19 @@ impl ActionResponder for StatePolicyResponder {
                              (and a tag-note) and the digest will consolidate it into memory."
                                 .into(),
                         );
+                    }
+                    // (2b) Protected memory paths: engine-INJECTED memory files (e.g. `memory/INDEX.md`,
+                    // which rides EVERY context) are self-modification surface, like prompts/stimuli/SOUL.md
+                    // — writable ONLY in Reflect (the rate-limited, uncontaminated self-mod state). Even an
+                    // org+ digest/Express is denied, so a trusted-but-not-Reflect cycle can't poison the
+                    // always-present context.
+                    if self.spec.state != ConsciousnessState::Reflect && self.is_protected_write(path) {
+                        return ActionDecision::Deny(format!(
+                            "`{}` is a PROTECTED memory file — it's injected into every context, so only \
+                             Reflect may modify it (same rule as prompts/stimuli/SOUL.md). Not here: leave a \
+                             tag-note and Reflect will fold it in.",
+                            self.relativize(path).unwrap_or_else(|| path.to_string())
+                        ));
                     }
                 }
                 Some(path) => {
@@ -336,6 +371,35 @@ mod tests {
             ok.decide(&req("Write", json!({"file_path": "memory/social.md", "contents": "x"}))).await,
             ActionDecision::Allow
         ), "an org+ cycle (digest/reflect) writes long-term memory");
+    }
+
+    #[tokio::test]
+    async fn protected_memory_paths_are_reflect_only() {
+        // A protected memory file (e.g. INDEX.md, injected into EVERY context) is writable ONLY in Reflect —
+        // even an org+ Express is denied. A non-protected memory file is unaffected. Covers Edit too.
+        let mut expr = responder(ConsciousnessState::Express);
+        expr.long_term_writable = true;
+        expr.protected_paths = vec!["memory/INDEX.md".into()];
+        assert!(matches!(
+            expr.decide(&req("Write", json!({"file_path": "memory/social.md", "contents": "x"}))).await,
+            ActionDecision::Allow
+        ), "a NON-protected memory file is still writable by org+ Express");
+        assert!(matches!(
+            expr.decide(&req("Write", json!({"file_path": "memory/INDEX.md", "contents": "x"}))).await,
+            ActionDecision::Deny(d) if d.contains("PROTECTED")
+        ), "a protected memory file is denied outside Reflect");
+        assert!(matches!(
+            expr.decide(&req("Edit", json!({"file_path": "memory/INDEX.md", "old_string": "a", "new_string": "b"}))).await,
+            ActionDecision::Deny(d) if d.contains("PROTECTED")
+        ), "…and Edit can't bypass it (edit-family classifies as FileWrite)");
+
+        let mut refl = responder(ConsciousnessState::Reflect);
+        refl.long_term_writable = true;
+        refl.protected_paths = vec!["memory/INDEX.md".into()];
+        assert!(matches!(
+            refl.decide(&req("Write", json!({"file_path": "memory/INDEX.md", "contents": "x"}))).await,
+            ActionDecision::Allow
+        ), "Reflect MAY modify a protected memory file (same rule as prompts/stimuli/SOUL.md)");
     }
 
     #[tokio::test]

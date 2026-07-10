@@ -43,6 +43,11 @@ trust_tiers:
   - { name: self,   reaches: reflect }            # the agent's own clean data — may even self-edit
   - { name: operator_signed, reaches: reflect }   # a DID-signed operator instruction
 
+# PROTECTED memory files — writable ONLY in Reflect (same rule as prompts/stimuli/SOUL.md). Any memory file
+# the engine injects into EVERY context (notably `memory/INDEX.md`, the self-orientation catalogue) belongs
+# here, so a non-Reflect cycle can't rewrite what rides every prompt. Empty by default.
+# protected_memory_paths: [memory/INDEX.md]
+
 # Per-webhook trust anchor: a webhook path → the tier a stimulus on it is seeded at. The listener is
 # localhost-only, so only a local channel adapter can post; the tier is the operator's call.
 # webhooks:

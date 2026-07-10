@@ -737,7 +737,7 @@ impl Harness {
             match self.config.session_max_context_tokens {
                 Some(cap) if ctx > cap => {
                     self.sessions.lock().unwrap().remove(key);
-                    tracing::debug!(
+                    tracing::info!(
                         "sticky[{key}]: EVICTED — context {}k > cap {}k (next wake fresh)",
                         ctx / 1000,
                         cap / 1000
@@ -1113,6 +1113,9 @@ impl Harness {
         // Long-term memory (`memory/`) is gated to `memory_write_min_trust` (org+): a lower-trust cycle
         // may not write it (the wall enforces; the digest consolidates instead).
         responder.long_term_writable = self.config.lattice().permits(cycle_trust, &self.long_term_floor());
+        // Protected memory files (e.g. `memory/INDEX.md`, injected into every context) are Reflect-only —
+        // the wall denies a non-Reflect cycle writing them (same rule as prompts/stimuli/SOUL.md).
+        responder.protected_paths = self.config.protected_memory_paths.clone();
         // Dry-run (testing): the wall denies these tool prefixes so the agent composes-but-doesn't-execute.
         responder.dry_run_block = self.config.dry_run.active_block();
         RecordingResponder::wrap(responder)

@@ -50,12 +50,19 @@ const ALWAYS_DISALLOWED: &[&str] = &["Bash", "PowerShell", "REPL", "KillShell"];
 /// sub-helper injection) and (2) the worker model, having no native `Bash`, emitted text-format
 /// `<function=Bash>` tool calls that executed nothing — so the worker built nothing.
 fn disallowed_for(spec: &crate::state::StateSpec) -> Vec<String> {
-    let worker_keeps_bash = spec.tool_scope.allows(crate::state::ToolClass::Shell);
+    // A WORKER is the only spec that admits `Shell` — the duck's consciousness states never do.
+    let is_worker = spec.tool_scope.allows(crate::state::ToolClass::Shell);
     let mut out: Vec<String> = ALWAYS_DISALLOWED
         .iter()
-        .filter(|t| !(worker_keeps_bash && **t == "Bash"))
+        .filter(|t| !(is_worker && **t == "Bash"))
         .map(|s| s.to_string())
         .collect();
+    // `TodoWrite` (the SDK's task-list tool) is dead weight for the duck's consciousness states — it only
+    // produced "use TodoWrite" nudge noise the wall then denied. Hide it from the duck; a spawned WORKER
+    // (a real multi-step build agent) KEEPS it for task tracking.
+    if !is_worker {
+        out.push("TodoWrite".into());
+    }
     // Defense-in-depth: NETWORK egress (WebFetch/WebSearch = `Net`) is a distinct class scoped to
     // Perceive (+ the worker). Where a state's scope does NOT admit `Net`, hide these at the SDK layer
     // too — so an Express/Settle/Reflect cycle isn't even offered the network (the wall denies it
@@ -469,6 +476,9 @@ mod tests {
         // The other exec tools remain disallowed even for a worker (it builds with Bash, not these).
         assert!(worker.contains(&"PowerShell".to_string()));
         assert!(worker.contains(&"KillShell".to_string()));
+        // TodoWrite: hidden from the duck (noise), kept for a worker (multi-step task tracking).
+        assert!(duck.contains(&"TodoWrite".to_string()), "the duck must NOT get TodoWrite");
+        assert!(!worker.contains(&"TodoWrite".to_string()), "a worker keeps TodoWrite");
     }
 
     /// The model-routing split (8.7 + the gateway fix): on a gateway the resolved model must go to

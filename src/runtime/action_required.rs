@@ -403,6 +403,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snip_is_allowed_in_every_state() {
+        // `snip` trims the model's OWN context window (Read-class): allowed in every state so a long sticky
+        // session can self-trim stale turns instead of a full eviction. It can't reach the system prompt or
+        // the runlog, so there's nothing to gate by trust/state.
+        for state in [ConsciousnessState::Perceive, ConsciousnessState::Express, ConsciousnessState::Reflect] {
+            let r = responder(state);
+            assert!(matches!(
+                r.decide(&req("snip", json!({"message_ids": ["ab12cd"]}))).await,
+                ActionDecision::Allow
+            ), "{state:?} may snip its own context window");
+        }
+    }
+
+    #[tokio::test]
     async fn perceive_cannot_post_or_write() {
         let r = responder(ConsciousnessState::Perceive);
         assert!(matches!(

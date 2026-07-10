@@ -71,6 +71,15 @@ pub fn classify_tool(
         "LSP" | "ReadMcpResource" | "ListMcpResources" | "ToolSearch"
         | "TaskGet" | "TaskList" | "TaskOutput" => (ToolClass::Read, None),
 
+        // `snip` — the SDK's context trimmer. It removes ONLY the model's own past user turns + tool
+        // outputs from the live WINDOW: never the system prompt (a separate field it can't reach), never
+        // the runlog (harness-authored + persisted → the record survives, recallable). No file / network /
+        // outward effect and no taint, so it shares Read's scoping — allowed in every state, letting a long
+        // sticky session self-trim stale turns instead of hitting a full size-eviction (better continuity,
+        // lower cost). Safe because the firebreak is enforced by fresh sessions per trust lane, not by
+        // in-context labels a trim could disturb.
+        "snip" => (ToolClass::Read, None),
+
         // File writes — the path decides memory vs soul (gated by writable_dirs).
         "Write" | "FileWrite" | "Edit" | "FileEdit" | "MultiEdit" | "NotebookEdit" => {
             (ToolClass::FileWrite, extract_path(input))
@@ -133,6 +142,8 @@ mod tests {
         let (c, p) = classify_tool("Write", &json!({"file_path": "memory/log.md"}), &settle(), &post(), &read());
         assert_eq!(c, ToolClass::FileWrite);
         assert_eq!(p.as_deref(), Some("memory/log.md"));
+        // `snip` (the SDK's context trimmer — window-only, no external effect, no taint) → Read scoping.
+        assert_eq!(classify_tool("snip", &json!({"message_ids": ["ab12cd"]}), &settle(), &post(), &read()).0, ToolClass::Read);
     }
 
     #[test]

@@ -202,20 +202,35 @@ impl Queue for SqliteQueue {
         Ok(())
     }
 
-    async fn next(&self) -> Result<Option<Stimulus>> {
+    async fn next_eligible(&self, busy: &[String]) -> Result<Option<Stimulus>> {
         let now = chrono::Utc::now().timestamp();
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(db)?;
         // Debounce gate: skip a row still within its coalesce window (`pop_after > now`) so a chat's
         // messages keep folding into it; an immediate row (`pop_after IS NULL`) is always eligible.
+        // Axis-1: exclude rows whose `dedup_key` is already in flight (`busy`); a null-key row (a cron
+        // with no thread) is always eligible. Empty `busy` ⇒ no exclusion ⇒ the old single-flight claim.
+        let exclude = if busy.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " AND (dedup_key IS NULL OR dedup_key NOT IN ({}))",
+                vec!["?"; busy.len()].join(",")
+            )
+        };
+        // Bound positionally: `now`, then each busy key. All `?` (anonymous) so the count matches.
+        let mut binds: Vec<&dyn rusqlite::ToSql> = vec![&now];
+        for k in busy {
+            binds.push(k);
+        }
         let raw = tx
             .query_row(
                 &format!(
                     "SELECT {COLS} FROM stimulus WHERE status='pending'
-                       AND (pop_after IS NULL OR pop_after <= ?1)
+                       AND (pop_after IS NULL OR pop_after <= ?){exclude}
                      ORDER BY priority_rank ASC, received_at ASC LIMIT 1"
                 ),
-                params![now],
+                binds.as_slice(),
                 read_raw,
             )
             .optional()
@@ -402,6 +417,26 @@ mod tests {
         assert_eq!(q.next().await.unwrap().unwrap().id.0, "normal-new");
         assert_eq!(q.next().await.unwrap().unwrap().id.0, "low");
         assert!(q.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn next_eligible_skips_busy_threads_and_keeps_null_key() {
+        let q = SqliteQueue::open_in_memory().unwrap();
+        // Two chat threads + one null-key cron; all Normal so `received_at` orders them.
+        q.enqueue(mk("chatA-1", Priority::Normal, 10, "telegram", Some("chatA"))).await.unwrap();
+        q.enqueue(mk("chatB-1", Priority::Normal, 20, "telegram", Some("chatB"))).await.unwrap();
+        q.enqueue(mk("cron-1", Priority::Normal, 30, "reflect", None)).await.unwrap();
+
+        // chatA in flight → skip its row; claim the next-oldest eligible (chatB).
+        assert_eq!(q.next_eligible(&["chatA".into()]).await.unwrap().unwrap().id.0, "chatB-1");
+        // Both chats busy → only the null-key cron is eligible.
+        assert_eq!(
+            q.next_eligible(&["chatA".into(), "chatB".into()]).await.unwrap().unwrap().id.0,
+            "cron-1"
+        );
+        // Empty busy ⇒ single-flight `next`: the last remaining pending (chatA-1) is claimed.
+        assert_eq!(q.next_eligible(&[]).await.unwrap().unwrap().id.0, "chatA-1");
+        assert!(q.next_eligible(&["chatA".into()]).await.unwrap().is_none());
     }
 
     #[tokio::test]

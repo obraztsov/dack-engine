@@ -15,9 +15,16 @@ use crate::model::stimulus::{Stimulus, StimulusId, StimulusStatus, StimulusType}
 pub trait Queue: Send + Sync {
     async fn enqueue(&self, stimulus: Stimulus) -> Result<()>;
 
-    /// Pop the highest-priority `pending` row and mark it `dispatched`. Single-flight:
-    /// returns at most one, and the harness processes it to completion before the next.
-    async fn next(&self) -> Result<Option<Stimulus>>;
+    /// Claim the highest-priority `pending` row whose `dedup_key` is NOT already in `busy` — a thread with
+    /// a wake in flight (Axis-1 per-thread serialization under concurrency: at most one wake per thread) —
+    /// and mark it `dispatched`. Null-key rows (crons, no thread) are always eligible. A still-debounced
+    /// row (`pop_after > now`) is skipped. `busy` empty ⇒ the old single-flight claim.
+    async fn next_eligible(&self, busy: &[String]) -> Result<Option<Stimulus>>;
+
+    /// Single-flight claim (no thread busy) — the serial loop + tests. Delegates to `next_eligible(&[])`.
+    async fn next(&self) -> Result<Option<Stimulus>> {
+        self.next_eligible(&[]).await
+    }
 
     async fn update_status(&self, id: &StimulusId, status: StimulusStatus) -> Result<()>;
 

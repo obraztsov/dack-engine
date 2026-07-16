@@ -151,37 +151,10 @@ server.registerTool(
 
 const trimUser = (u: any) => ({ id: u.id, username: u.username, name: u.name })
 
-server.registerTool(
-  'get_followers',
-  {
-    description:
-      "Who follows an @username (defaults to YOU, @agentdack). Use to notice new followers / who's in your " +
-      'orbit — diff it against last time to see who newly followed. Read-only context.',
-    inputSchema: { username: z.string().optional(), max_results: z.number().int().optional() },
-  },
-  async ({ username, max_results }: { username?: string; max_results?: number }) => {
-    const { id, error } = await resolveUserId(username ?? process.env.DACK_HANDLE ?? 'agentdack')
-    if (!id) return asText(error ?? { ok: false, error: 'user not found' })
-    const r = await xGet(`/users/${id}/followers`, { max_results: clampMax(max_results, 50), 'user.fields': 'username,name' })
-    if (!r.ok) return asText(r)
-    return asText({ ok: true, followers: (r.data ?? []).map(trimUser) })
-  },
-)
-
-server.registerTool(
-  'get_following',
-  {
-    description: "Who an @username follows (defaults to YOU, @agentdack) — read-only context.",
-    inputSchema: { username: z.string().optional(), max_results: z.number().int().optional() },
-  },
-  async ({ username, max_results }: { username?: string; max_results?: number }) => {
-    const { id, error } = await resolveUserId(username ?? process.env.DACK_HANDLE ?? 'agentdack')
-    if (!id) return asText(error ?? { ok: false, error: 'user not found' })
-    const r = await xGet(`/users/${id}/following`, { max_results: clampMax(max_results, 50), 'user.fields': 'username,name' })
-    if (!r.ok) return asText(r)
-    return asText({ ok: true, following: (r.data ?? []).map(trimUser) })
-  },
-)
+// NB: `get_followers` + `get_following` MOVED to the self-trust `twitter-graph` server (they return only
+// {id,username,name} user records — no tweet text — so the digest can read the social graph WITHOUT
+// tainting the cycle to public). See `twitter-graph-mcp.ts`. `get_liking_users` stays here (per-post
+// engagement is a reactive, public-context activity).
 
 server.registerTool(
   'get_liking_users',

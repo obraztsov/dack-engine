@@ -3217,6 +3217,118 @@ mod tests {
         }
     }
 
+    /// A runtime that PROBES concurrency: counts how many invokes are in flight at once (the max),
+    /// holding each briefly to force an overlap window. Lets us prove parallel prompts actually run
+    /// concurrently while write-lock prompts serialize.
+    struct ConcurrencyProbe {
+        active: std::sync::atomic::AtomicUsize,
+        max: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl RuntimeClient for ConcurrencyProbe {
+        async fn invoke(
+            &self,
+            req: InvocationRequest,
+            _responder: Arc<dyn ActionResponder>,
+        ) -> Result<(AgentOutput, Option<SessionId>, Option<InvokeUsage>)> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let n = self.active.fetch_add(1, SeqCst) + 1;
+            self.max.fetch_max(n, SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await; // overlap window
+            self.active.fetch_sub(1, SeqCst);
+            let sid = req.session.clone().or_else(|| Some(SessionId("s".into())));
+            Ok((AgentOutput::default(), sid, None)) // terminal (no fan-out) → one step per wake
+        }
+    }
+
+    fn conc_stim(idx: usize, dedup: &str) -> Stimulus {
+        Stimulus {
+            id: StimulusId(format!("s-{idx}")),
+            source: "telegram-pub".into(),
+            type_: StimulusType::from("telegram_message"),
+            directive_tier: TrustTier::self_(),
+            payload_tier: TrustTier::self_(),
+            payload: serde_json::json!({ "text": "hi" }),
+            provenance: None,
+            received_at: 0,
+            dedup_key: Some(dedup.into()),
+            pop_after: None,
+            priority: Priority::Normal,
+            status: StimulusStatus::Pending,
+            attempts: 0,
+            directive_body: "duty".into(),
+            entry: "perceive".into(),
+        }
+    }
+
+    /// Boot the run-loop at N=4 with one wake per `keys` entry (its `dedup_key`) on a perceive prompt
+    /// whose `parallel` flag is `parallel`; return the max concurrent invocations observed.
+    async fn observe_concurrency(parallel: bool, keys: &[&str]) -> usize {
+        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::queue::InMemoryQueue;
+        use crate::repo::git::PlainGitRepo;
+        use crate::runlog::sqlite::SqliteRunLog;
+        use std::collections::HashMap;
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let tmp = std::env::temp_dir().join(format!("dack-conc-{parallel}-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(tmp.join("prompts")).unwrap();
+        std::fs::write(
+            tmp.join("prompts/perceive.md"),
+            format!("---\nstate: perceive\nparallel: {parallel}\n---\nDigest.\n"),
+        )
+        .unwrap();
+
+        let probe = Arc::new(ConcurrencyProbe { active: Default::default(), max: Default::default() });
+        // `default_entry` points at a non-existent prompt so the boot back-online wake drops without
+        // invoking — otherwise its null-key cycle would overlap the test wakes and skew the probe.
+        let config = Arc::new(
+            DackConfig::from_yaml(
+                "operator_did: \"did:x\"\nmax_concurrent_cycles: 4\ndefault_entry: __no_back_online__",
+            )
+            .unwrap(),
+        );
+        let queue: Arc<dyn Queue> = Arc::new(InMemoryQueue::new());
+        let harness = Arc::new(Harness {
+            config: config.clone(),
+            queue: queue.clone(),
+            bus: Arc::new(Bus::new(config.clone(), queue.clone())),
+            runtime: probe.clone(),
+            repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
+            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
+            broker: Arc::new(SecretsBroker::new_test(vec![])),
+            sessions: Default::default(),
+            mem_lock: Default::default(),
+        });
+        for (i, k) in keys.iter().enumerate() {
+            queue.enqueue(conc_stim(i, k)).await.unwrap();
+        }
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let run = tokio::spawn({
+            let h = harness.clone();
+            async move { h.run(rx).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        tx.send(true).unwrap();
+        run.await.unwrap().unwrap();
+        std::fs::remove_dir_all(&tmp).ok();
+        probe.max.load(SeqCst)
+    }
+
+    /// The core multithreading property: parallel (read-lock) prompts run CONCURRENTLY; the default
+    /// (write-lock) prompts SERIALIZE. Same three distinct-thread wakes, N=4, only the flag differs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn parallel_prompts_run_concurrently_write_lock_serializes() {
+        // Axis-2: parallel (read-lock) prompts on DISTINCT threads overlap; write-lock prompts don't.
+        assert!(observe_concurrency(true, &["chatA", "chatB", "chatC"]).await >= 2, "parallel prompts overlap (read-lock)");
+        assert_eq!(observe_concurrency(false, &["chatA", "chatB", "chatC"]).await, 1, "write-lock prompts serialize");
+        // Axis-1: even PARALLEL wakes on the SAME thread never overlap (session integrity) — one in-flight
+        // wake per dedup_key, so the three same-key wakes run strictly one at a time.
+        assert_eq!(observe_concurrency(true, &["chatX", "chatX", "chatX"]).await, 1, "same-thread wakes serialize (Axis-1)");
+    }
+
     /// A Perceive that emits TWO fan-out batons (`express` AND `settle`). `gist` per branch.
     fn two_branch_perceive() -> AgentOutput {
         AgentOutput {

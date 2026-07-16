@@ -862,13 +862,14 @@ impl Harness {
         // the Express distill that WRITES memory. Delivery must fire on the memory-writer (the gist is
         // now durable), NOT on Perceive (else a distill failure would leave the notes retired-but-lost).
         // So: any non-Perceive state carrying `digest` (distill's Express, or Reflect which reads+writes
-        // in one cycle) delivers. (NOTE: `deliver_digest` retires ALL matching pending notes — correct
-        // single-threaded; under future multithreading, deliver the exact surfaced ids instead.)
+        // in one cycle) delivers. MT-safe: the delivery is watermarked to `stimulus.received_at` (the
+        // digest wake's START), so a note written DURING the digest by a concurrent cycle is NOT retired
+        // unconsolidated — it survives to the next digest (which surfaces + delivers it).
         if ctx.runlog.digest.is_on() && prompt.state != ConsciousnessState::Perceive {
             let dtags: Vec<&str> = ctx.runlog.digest.tags.iter().map(String::as_str).collect();
             let older_than = (ctx.runlog.digest.stale_secs > 0)
                 .then(|| chrono::Utc::now().timestamp() - ctx.runlog.digest.stale_secs as i64);
-            match self.runlog.deliver_digest(&dtags, older_than).await {
+            match self.runlog.deliver_digest(&dtags, older_than, Some(stimulus.received_at)).await {
                 Ok(0) => {}
                 Ok(n) => tracing::info!("digest: retired {n} delivered note(s)"),
                 Err(e) => tracing::warn!("digest deliver failed: {e}"),

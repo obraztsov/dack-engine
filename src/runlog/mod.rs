@@ -88,9 +88,16 @@ pub trait RunLogWriter: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Mark the PENDING `digest` notes that `pending_digest(tags, older_than)` returns as delivered
-    /// (retired) — called after a digest/Reflect cycle succeeds. Returns the count retired. Default: 0.
-    async fn deliver_digest(&self, _tags: &[&str], _older_than: Option<i64>) -> Result<usize> {
+    /// Mark PENDING `digest` notes (matching `tags`/`older_than`) as delivered (retired) — called after a
+    /// digest/Reflect cycle succeeds. `ceiling_ts` bounds it to notes that existed at the digest wake's
+    /// START (`ts <= ceiling_ts`), so under concurrency a note written DURING the digest survives to the
+    /// next one instead of being retired unconsolidated. `None` = no bound. Returns the count retired.
+    async fn deliver_digest(
+        &self,
+        _tags: &[&str],
+        _older_than: Option<i64>,
+        _ceiling_ts: Option<i64>,
+    ) -> Result<usize> {
         Ok(0)
     }
 

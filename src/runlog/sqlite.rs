@@ -655,9 +655,15 @@ impl RunLogWriter for SqliteRunLog {
         rows.collect::<std::result::Result<Vec<_>, _>>().map_err(db)
     }
 
-    async fn deliver_digest(&self, tags: &[&str], older_than: Option<i64>) -> Result<usize> {
+    async fn deliver_digest(
+        &self,
+        tags: &[&str],
+        older_than: Option<i64>,
+        ceiling_ts: Option<i64>,
+    ) -> Result<usize> {
         let now = chrono::Utc::now().timestamp();
         let older_v = older_than;
+        let ceil_v = ceiling_ts;
         let mut clauses: Vec<String> = Vec::new();
         let mut binds: Vec<&dyn rusqlite::ToSql> = vec![&now]; // SET delivered_at = ? (first bind)
         if !tags.is_empty() {
@@ -676,10 +682,19 @@ impl RunLogWriter for SqliteRunLog {
         if clauses.is_empty() {
             return Ok(0);
         }
+        // CONSISTENCY WATERMARK (multithreading): retire ONLY notes that existed at the digest wake's
+        // start (`ts <= ceiling_ts`). Under concurrency a note written DURING the digest (by a parallel
+        // cycle, after the queue was surfaced) must NOT be retired unconsolidated — it survives here and
+        // is surfaced + delivered by the NEXT digest. `None` = no bound (single-thread / legacy).
+        let ceiling_sql = if ceil_v.is_some() { " AND ts <= ?" } else { "" };
         let sql = format!(
-            "UPDATE tag_notes SET delivered_at = ? WHERE kind = 'digest' AND delivered_at IS NULL AND ({})",
-            clauses.join(" OR ")
+            "UPDATE tag_notes SET delivered_at = ? WHERE kind = 'digest' AND delivered_at IS NULL AND ({}){}",
+            clauses.join(" OR "),
+            ceiling_sql
         );
+        if let Some(c) = &ceil_v {
+            binds.push(c);
+        }
         let conn = self.conn.lock().unwrap();
         conn.execute(&sql, binds.as_slice()).map_err(db)
     }
@@ -867,9 +882,24 @@ mod tests {
         assert_eq!(stale[0].note, "old tw item");
 
         // deliver telegram → retires the tg note; pending telegram now empty; the memory note untouched
-        assert_eq!(rl.deliver_digest(&["telegram"], None).await.unwrap(), 1);
+        assert_eq!(rl.deliver_digest(&["telegram"], None, None).await.unwrap(), 1);
         assert!(rl.pending_digest(&["telegram"], None).await.unwrap().is_empty());
         assert_eq!(rl.tag_notes(Some("memory"), None, None, false, 10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn deliver_digest_watermark_spares_notes_written_after_the_wake_start() {
+        // The MT race: a digest note written DURING the digest (after the wake's start) must NOT be
+        // retired unconsolidated. `ceiling_ts` = the wake start bounds delivery to notes that existed then.
+        let rl = SqliteRunLog::open_in_memory().unwrap();
+        rl.append_note("digest", &["telegram"], "before wake", "self", 1000).await.unwrap(); // existed at start
+        rl.append_note("digest", &["telegram"], "during digest", "self", 2000).await.unwrap(); // arrived after
+        // Wake started at ts=1500 → deliver only the note that existed then (the ts=1000 one).
+        assert_eq!(rl.deliver_digest(&["telegram"], None, Some(1500)).await.unwrap(), 1);
+        // The note written during the digest survives, still pending for the NEXT digest.
+        let pending = rl.pending_digest(&["telegram"], None).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].note, "during digest");
     }
 
     #[tokio::test]

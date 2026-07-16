@@ -424,6 +424,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parallel_prompt_cleared_writable_dirs_denies_memory() {
+        // The P1 tie-in: a `parallel: true` prompt runs run_step with its `writable_dirs` CLEARED, so the
+        // wall denies ANY memory/soul write — that's what makes the read-lock sound. A normal org+ Express
+        // may still write memory.
+        let mut normal = responder(ConsciousnessState::Express);
+        normal.long_term_writable = true;
+        assert!(matches!(
+            normal.decide(&req("Write", json!({"file_path": "memory/social.md", "contents": "x"}))).await,
+            ActionDecision::Allow
+        ), "a NON-parallel org+ Express may write memory");
+
+        let mut parallel = responder(ConsciousnessState::Express);
+        parallel.long_term_writable = true;
+        parallel.spec.writable_dirs.clear(); // what run_step does for `parallel: true`
+        assert!(matches!(
+            parallel.decide(&req("Write", json!({"file_path": "memory/social.md", "contents": "x"}))).await,
+            ActionDecision::Deny(_)
+        ), "a parallel cycle (writable_dirs cleared) can't write memory — the read-lock stays sound");
+    }
+
+    #[tokio::test]
     async fn perceive_cannot_post_or_write() {
         let r = responder(ConsciousnessState::Perceive);
         assert!(matches!(

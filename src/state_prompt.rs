@@ -208,6 +208,12 @@ pub struct StatePromptFrontmatter {
     /// De-bloat knobs for the injected context blocks (memory/runlog). `None` ⇒ both on.
     #[serde(default)]
     pub context: Option<ContextConfig>,
+    /// **Parallel (multithreading Axis-2).** `true` ⇒ this prompt makes NO long-term memory/soul write
+    /// (the wall clears its `writable_dirs` to guarantee it), so its step takes a READ-lock and runs
+    /// concurrently with other readers. Default `false` ⇒ a WRITE-lock, exclusive for the whole
+    /// read-modify-write cycle. Only opt a prompt in once you're sure it never writes `memory/`.
+    #[serde(default)]
+    pub parallel: bool,
 }
 
 /// A parsed state-prompt: its id (path), frontmatter, and the trusted directive body.
@@ -226,6 +232,9 @@ pub struct StatePrompt {
     pub reply_key: Option<String>,
     /// De-bloat knobs for the injected context blocks (memory/runlog). `None` ⇒ both on (`ContextConfig::default`).
     pub context: Option<ContextConfig>,
+    /// **Multithreading Axis-2:** `true` ⇒ this step takes a READ-lock (runs concurrently; wall-guaranteed
+    /// to make no memory/soul write). Default `false` ⇒ an exclusive WRITE-lock for the whole cycle.
+    pub parallel: bool,
     /// **Frame 1 — the SYSTEM frame.** The state's STABLE invariant rules (e.g. "you are in Express;
     /// reply-only; one outward action"), appended to SOUL.md in the system message. Identical every
     /// turn — fresh AND resume — so it stays in the cached prefix. The content of the prompt file ABOVE
@@ -260,6 +269,7 @@ impl StatePrompt {
             session: fm.session,
             reply_key: fm.reply_key,
             context: fm.context,
+            parallel: fm.parallel,
             system_frame,
             body,
             resume_body,
@@ -378,6 +388,14 @@ mod tests {
         let sp = StatePrompt::parse("p", "---\nstate: perceive\ncontext: { runlog: { thread: 5 } }\n---\nx").unwrap();
         let c = sp.context();
         assert_eq!((c.runlog.environment, c.runlog.thread), (10, 5));
+    }
+
+    #[test]
+    fn parallel_flag_defaults_off_and_parses() {
+        // Absent → false (write-lock, serial default).
+        assert!(!StatePrompt::parse("p", "---\nstate: perceive\n---\nx").unwrap().parallel);
+        // `parallel: true` → read-lock opt-in.
+        assert!(StatePrompt::parse("p", "---\nstate: perceive\nparallel: true\n---\nx").unwrap().parallel);
     }
 
     #[test]

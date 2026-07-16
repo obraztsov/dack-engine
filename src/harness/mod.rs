@@ -82,6 +82,15 @@ pub fn reflect_stimulus(now: i64) -> Stimulus {
     }
 }
 
+/// Holds EITHER memory/soul lock guard for a step's duration (RAII release at step end): a `parallel`
+/// prompt takes the shared READ guard, everything else the exclusive WRITE guard. The variants are held,
+/// never read — they exist only to keep the guard alive across the step.
+#[allow(dead_code)]
+enum MemGuard {
+    Read(tokio::sync::OwnedRwLockReadGuard<()>),
+    Write(tokio::sync::OwnedRwLockWriteGuard<()>),
+}
+
 /// All the seams, owned as trait objects so the v1 (Gitlawb/OpenClaude) and corp
 /// (GitHub/Claude Code) wirings differ only at construction.
 pub struct Harness {
@@ -628,13 +637,24 @@ impl Harness {
         // nothing irreversible/self-modifying happened anywhere in the wake.
         wake_unretryable: &std::sync::atomic::AtomicBool,
     ) -> Result<(AgentOutput, String, Option<TrustTier>)> {
-        // MEMORY/SOUL LOCK (Axis-2): held for the WHOLE step. Context assembly READS memory/soul and a
-        // writer step later WRITES it, so the exclusive region must span read-through-write (making a
-        // writer's read-modify-write atomic — two writers can't clobber each other). P0: ALWAYS write
-        // (exclusive). P1 takes a READ-lock for a `parallel: true` prompt (wall-guaranteed to make no
-        // memory/soul write). Uncontended at `max_concurrent_cycles = 1` (single-flight) — inert until then.
-        let _mem_guard = self.mem_lock.write().await;
-        let spec = default_spec(prompt.state);
+        // MEMORY/SOUL LOCK (Axis-2), held for the WHOLE step. Context assembly READS memory/soul and a
+        // writer later WRITES it, so the exclusive region must span read-through-write (a writer's
+        // read-modify-write is atomic; two writers can't clobber each other). A `parallel: true` prompt
+        // is READ-ONLY w.r.t. long-term state — enforced just below by clearing its `writable_dirs` — so
+        // it takes a shared READ-lock and runs concurrently; every other prompt takes the exclusive
+        // WRITE-lock. Uncontended at `max_concurrent_cycles = 1` (single-flight).
+        let _mem_guard = if prompt.parallel {
+            MemGuard::Read(self.mem_lock.clone().read_owned().await)
+        } else {
+            MemGuard::Write(self.mem_lock.clone().write_owned().await)
+        };
+        let mut spec = default_spec(prompt.state);
+        // Wall tie-in: a `parallel` cycle must make NO memory/soul FILE write (the read-lock's soundness
+        // rests on this), so strip its writable dirs → the wall denies any write. Runlog/tag-notes
+        // (SQLite) + Post/reply (external) are outside this lock, so a parallel Express still replies.
+        if prompt.parallel {
+            spec.writable_dirs.clear();
+        }
         // The capabilities this state-prompt plugs (the two-sided handshake,).
         let (mcp_servers, inline_read) =
             self.assemble_mcp_servers(prompt, stimulus, cycle_trust, scope_override).await;
@@ -3739,6 +3759,7 @@ mod tests {
             session: None,
             reply_key: None,
             context: None,
+            parallel: false,
             system_frame: String::new(),
             body: String::new(),
             resume_body: None,
@@ -3868,7 +3889,7 @@ mod tests {
         // OPEN perceive: the inline public MCP is admitted, read-tier, with its wall prefix.
         let open = StatePrompt {
             id: "p".into(), state: ConsciousnessState::Perceive,
-            mcp: vec![inline(), McpRef::Import("cove-read".into())], transitions: vec![], model: None, session: None, reply_key: None, context: None, system_frame: String::new(), body: String::new(), resume_body: None,
+            mcp: vec![inline(), McpRef::Import("cove-read".into())], transitions: vec![], model: None, session: None, reply_key: None, context: None, parallel: false, system_frame: String::new(), body: String::new(), resume_body: None,
         };
         let (servers, inline_read) = harness.assemble_mcp_servers(&open, &stim, &TrustTier::self_(), None).await;
         assert!(servers.contains_key("rootai"), "inline admitted on an open tier");
@@ -3881,7 +3902,7 @@ mod tests {
         // LOCKED express (unconfigured → default locked): the same inline is rejected.
         let locked = StatePrompt {
             id: "e".into(), state: ConsciousnessState::Express,
-            mcp: vec![inline()], transitions: vec![], model: None, session: None, reply_key: None, context: None, system_frame: String::new(), body: String::new(), resume_body: None,
+            mcp: vec![inline()], transitions: vec![], model: None, session: None, reply_key: None, context: None, parallel: false, system_frame: String::new(), body: String::new(), resume_body: None,
         };
         let (servers, inline_read) = harness.assemble_mcp_servers(&locked, &stim, &TrustTier::self_(), None).await;
         assert!(servers.is_empty() && inline_read.is_empty(), "no self-plug on a locked tier");
@@ -3931,7 +3952,7 @@ mod tests {
         let stim = poisoned_stimulus();
         let express = StatePrompt {
             id: "e".into(), state: ConsciousnessState::Express,
-            mcp: vec![McpRef::Import("telegram".into())], transitions: vec![], model: None, session: None, reply_key: None, context: None, system_frame: String::new(), body: String::new(), resume_body: None,
+            mcp: vec![McpRef::Import("telegram".into())], transitions: vec![], model: None, session: None, reply_key: None, context: None, parallel: false, system_frame: String::new(), body: String::new(), resume_body: None,
         };
 
         // public cycle (rank 0) < org (rank 1) → telegram WITHHELD.
@@ -4013,7 +4034,7 @@ mod tests {
         let express = StatePrompt {
             id: "e".into(), state: ConsciousnessState::Express,
             mcp: vec![McpRef::Import("telegram".into())], transitions: vec![], model: None, session: None,
-            reply_key: None, context: None, system_frame: String::new(), body: String::new(), resume_body: None,
+            reply_key: None, context: None, parallel: false, system_frame: String::new(), body: String::new(), resume_body: None,
         };
 
         // No override → the top-level latest (message_id 20).
@@ -4074,7 +4095,7 @@ mod tests {
         let perceive = StatePrompt {
             id: "p".into(), state: ConsciousnessState::Perceive,
             mcp: vec![McpRef::Import("recall".into())], transitions: vec![], model: None, session: None,
-            reply_key: None, context: None, system_frame: String::new(), body: String::new(), resume_body: None,
+            reply_key: None, context: None, parallel: false, system_frame: String::new(), body: String::new(), resume_body: None,
         };
 
         // dedup_key set → RECALL_TAG carries the conversation tag (recall public → cycle stays public).
@@ -4327,6 +4348,7 @@ mod tests {
             session: None,
             reply_key: None,
             context: None,
+            parallel: false,
             system_frame: String::new(),
             body: "go".into(),
             resume_body: None,
@@ -4478,6 +4500,7 @@ mod tests {
                 auto_tags: Vec::new(),
                 runlog: crate::state_prompt::RunlogContext { thread: 20, ..Default::default() },
             }),
+            parallel: false,
             system_frame: String::new(),
             body: "FULL-BODY-go".into(),
             resume_body: Some("LEAN-RESUME-only-new".into()),
@@ -4592,6 +4615,7 @@ mod tests {
             session: Some(SessionConfig { sticky: true, key: vec!["thread_id".into()] }),
             reply_key: None,
             context: None,
+            parallel: false,
             system_frame: String::new(),
             body: "go".into(),
             resume_body: None,

@@ -185,6 +185,10 @@ fn default_session_ttl() -> i64 {
     3_600 // one hour idle before a sticky session is dropped.
 }
 
+fn default_max_concurrent_cycles() -> usize {
+    1 // single-flight by default — parallelism is opted into per-prompt (`parallel: true`) + config.
+}
+
 /// The resolved trust lattice — built from `DackConfig.trust_tiers` (or the safe default). A total
 /// order by rank; the taint `meet` (greatest-lower-bound) is just the lower-ranked tier. An unknown
 /// tier name fails SAFE (rank 0 / `reaches: express`) so a mislabel can never *raise* a ceiling.
@@ -591,6 +595,13 @@ pub struct DackConfig {
     /// `None` (default) = size-eviction off (only the idle TTL applies). Set it in the operator config.
     #[serde(default)]
     pub session_max_context_tokens: Option<u64>,
+    /// **Max concurrent consciousness cycles** — the bounded worker pool for the multithreaded dispatch
+    /// loop. `1` (DEFAULT) = single-flight, byte-identical to the pre-MT serial behavior. `>1` runs
+    /// independent wakes in parallel, still bounded by: per-thread serialization (one in-flight wake per
+    /// `dedup_key`) and the memory/soul RwLock (a `parallel: true` prompt takes a read-lock; every other
+    /// step an exclusive write-lock). Bound it by the model gateway's rate/cost, not CPU.
+    #[serde(default = "default_max_concurrent_cycles")]
+    pub max_concurrent_cycles: usize,
     /// Operational logging (the `tracing` subscriber): level + format. Default `info`/`auto`.
     #[serde(default)]
     pub log: LogConfig,

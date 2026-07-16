@@ -108,10 +108,11 @@ pub struct Harness {
 }
 
 impl Harness {
-    /// The single-flight dispatch loop. Concurrency = 1 — the duck is one mind
-    /// SCAFFOLD: the body wires the real calls; the runtime stub
-    /// (`todo!`) — wired in a later step.
-    pub async fn run(&self, mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
+    /// The dispatch loop: a bounded pool of concurrent wakes (`max_concurrent_cycles`), with per-thread
+    /// serialization (`busy_keys` + the queue's `next_eligible` claim = Axis-1) and the memory/soul RwLock
+    /// (taken in `run_step` = Axis-2). At `max_concurrent_cycles = 1` it is single-flight — one mind, one
+    /// wake at a time, byte-identical to the pre-MT loop.
+    pub async fn run(self: Arc<Self>, mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
         // Boot reconciliation: requeue any row a crash left stuck in `dispatched`.
         match self.queue.reclaim_orphans().await {
             Ok(0) => {}
@@ -132,19 +133,31 @@ impl Harness {
         // that Perceives then Expresses (the duck may comment on having been away).
         self.enqueue_back_online().await;
 
+        // Bounded pool of concurrent wakes. `busy_keys` = Axis-1 (at most one in-flight wake per
+        // thread/`dedup_key`); the semaphore bounds total concurrency; the memory/soul RwLock (in
+        // `run_step`) = Axis-2. At `max_concurrent_cycles = 1` this is single-flight — one permit + one
+        // write-lock at a time, byte-identical to the pre-MT loop.
+        let sem = Arc::new(tokio::sync::Semaphore::new(self.config.max_concurrent_cycles.max(1)));
+        let busy_keys: Arc<std::sync::Mutex<std::collections::HashSet<String>>> = Default::default();
+        let mut workers: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+
         loop {
-            // Graceful shutdown: a SIGTERM (set via the watch) is honored at a cycle boundary —
-            // an in-flight dispatch always finishes (no zombie `dispatched` row), then we exit.
+            // Graceful shutdown: stop claiming, then DRAIN in-flight cycles (each finishes → no zombie
+            // `dispatched` row) before exiting.
             if *shutdown.borrow() {
-                tracing::info!("shutdown signal — consciousness loop exiting cleanly");
+                tracing::info!(
+                    "shutdown signal — draining {} in-flight cycle(s), then exiting cleanly",
+                    workers.len()
+                );
+                while workers.join_next().await.is_some() {}
                 return Ok(());
             }
-            // Soft kill-switch (`dack pause`): a shared cursor flag. While set, the loop idles at the
-            // cycle boundary (any in-flight dispatch already finished); `dack resume` clears it.
+            // Soft kill-switch (`dack pause`): idle at the boundary; in-flight cycles keep running.
             if self.is_paused().await {
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_millis(500)) => {}
                     _ = shutdown.changed() => {}
+                    _ = workers.join_next(), if !workers.is_empty() => {}
                 }
                 continue;
             }
@@ -160,50 +173,77 @@ impl Harness {
                     Err(e) => tracing::warn!("load-shed failed: {e}"),
                 }
             }
-            match self.queue.next().await? {
-                Some(stimulus) => {
-                    let snap = stimulus.clone();
-                    // Did the wake take an OUTWARD action? Shared across its steps so a timeout-retry
-                    // can only fire when nothing irreversible happened anywhere in the wake.
-                    let wake_unretryable = std::sync::atomic::AtomicBool::new(false);
-                    // Panic-isolate the cycle: logging-not-rollback extended to PANICS. A
-                    // panic in ONE dispatch (a malformed payload, a unicode edge, …) must NOT crash the
-                    // whole duck — catch it, record a failed cycle, keep the loop alive. Essential for a
-                    // hosted fleet: one bad message can never take a user's duck down.
-                    let health = self.broker.health();
-                    match std::panic::AssertUnwindSafe(self.dispatch(stimulus, &wake_unretryable)).catch_unwind().await {
-                        // Terminal states: a processed row never sticks in `dispatched`.
-                        Ok(Ok(())) => {
-                            // Cycle health, keyed by `source` (= the duty id for ingested stimuli, so
-                            // it aggregates with the ingestion-level health for that duty).
-                            health.record_cycle(true);
-                            health.record_stimulus_ok(&snap.source, chrono::Utc::now().timestamp());
-                            let _ = self.queue.update_status(&snap.id, StimulusStatus::Done).await;
-                        }
-                        Ok(Err(e)) => {
-                            health.record_cycle(false);
-                            health.record_stimulus_err(&snap.source, &e.to_string());
-                            self.handle_dispatch_error(&snap, e, &wake_unretryable).await;
-                        }
-                        Err(panic) => {
-                            let msg = panic
-                                .downcast_ref::<&str>()
-                                .map(|s| s.to_string())
-                                .or_else(|| panic.downcast_ref::<String>().cloned())
-                                .unwrap_or_else(|| "unknown panic".into());
-                            tracing::error!("dispatch PANICKED ({}): {msg} — cycle failed, loop continues", snap.id);
-                            health.record_cycle(false);
-                            health.record_stimulus_err(&snap.source, &format!("panic: {msg}"));
-                            self.log_dispatch_failure(&snap, &DackError::Runtime(format!("panic: {msg}"))).await;
-                            let _ = self.queue.update_status(&snap.id, StimulusStatus::Failed).await;
-                        }
+            // Acquire a concurrency permit. A full pool → wait for a worker to free a slot (or shutdown).
+            let permit = match Arc::clone(&sem).try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    tokio::select! {
+                        _ = workers.join_next(), if !workers.is_empty() => {}
+                        _ = shutdown.changed() => {}
                     }
+                    continue;
                 }
-                // Daemon: the duck sleeps between stimuli, it doesn't exit. Wake on a new
-                // stimulus (poll) OR on the shutdown signal, whichever comes first.
+            };
+            // Claim the highest-priority row whose thread is NOT already in flight (Axis-1).
+            let busy: Vec<String> = busy_keys.lock().unwrap().iter().cloned().collect();
+            match self.queue.next_eligible(&busy).await? {
+                Some(stimulus) => {
+                    if let Some(k) = &stimulus.dedup_key {
+                        busy_keys.lock().unwrap().insert(k.clone());
+                    }
+                    let this = Arc::clone(&self);
+                    let bk = Arc::clone(&busy_keys);
+                    workers.spawn(async move {
+                        let key = stimulus.dedup_key.clone();
+                        let snap = stimulus.clone();
+                        // Did the wake take an OUTWARD action? Shared across its steps so a timeout-retry
+                        // can only fire when nothing irreversible happened anywhere in the wake.
+                        let wake_unretryable = std::sync::atomic::AtomicBool::new(false);
+                        // Panic-isolate the cycle: a panic in ONE wake (a malformed payload, a unicode
+                        // edge, …) must NOT crash the duck — catch it, record a failed cycle, keep going.
+                        let health = this.broker.health();
+                        match std::panic::AssertUnwindSafe(this.dispatch(stimulus, &wake_unretryable))
+                            .catch_unwind()
+                            .await
+                        {
+                            // Terminal states: a processed row never sticks in `dispatched`.
+                            Ok(Ok(())) => {
+                                health.record_cycle(true);
+                                health.record_stimulus_ok(&snap.source, chrono::Utc::now().timestamp());
+                                let _ = this.queue.update_status(&snap.id, StimulusStatus::Done).await;
+                            }
+                            Ok(Err(e)) => {
+                                health.record_cycle(false);
+                                health.record_stimulus_err(&snap.source, &e.to_string());
+                                this.handle_dispatch_error(&snap, e, &wake_unretryable).await;
+                            }
+                            Err(panic) => {
+                                let msg = panic
+                                    .downcast_ref::<&str>()
+                                    .map(|s| s.to_string())
+                                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                                    .unwrap_or_else(|| "unknown panic".into());
+                                tracing::error!("dispatch PANICKED ({}): {msg} — cycle failed, loop continues", snap.id);
+                                health.record_cycle(false);
+                                health.record_stimulus_err(&snap.source, &format!("panic: {msg}"));
+                                this.log_dispatch_failure(&snap, &DackError::Runtime(format!("panic: {msg}"))).await;
+                                let _ = this.queue.update_status(&snap.id, StimulusStatus::Failed).await;
+                            }
+                        }
+                        // Free this thread (Axis-1) so its next wake becomes eligible, then the slot.
+                        if let Some(k) = key {
+                            bk.lock().unwrap().remove(&k);
+                        }
+                        drop(permit);
+                    });
+                }
+                // Nothing eligible (queue empty, or every pending thread is already in flight). Release the
+                // permit and wait for a new stimulus, a worker to free a thread, or shutdown.
                 None => {
+                    drop(permit);
                     tokio::select! {
                         _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                        _ = workers.join_next(), if !workers.is_empty() => {}
                         _ = shutdown.changed() => {}
                     }
                 }

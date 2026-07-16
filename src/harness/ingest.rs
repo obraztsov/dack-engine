@@ -331,6 +331,106 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// A webhook duty (no sensor, POSTed body IS the payload — exactly like `telegram-pub`).
+    fn webhook_ingestor(root: &std::path::Path) -> (Ingestor, Arc<dyn crate::queue::Queue>) {
+        std::fs::remove_dir_all(root).ok();
+        std::fs::create_dir_all(root.join("stimuli/tg-pub")).unwrap();
+        std::fs::write(
+            root.join("stimuli/tg-pub/STIMULUS.md"),
+            "---\nid: tg-pub\ntrigger: { type: webhook, path: /telegram/pub }\n\
+             directive_tier: self\nemits: { type: telegram_message }\n\
+             coalesce: { mode: batch, window_sec: 600 }\nentry: perceive\n---\nPublic chat.\n",
+        )
+        .unwrap();
+        let config = Arc::new(DackConfig::from_yaml("operator_did: \"did:key:zOp\"").unwrap());
+        let queue: Arc<dyn crate::queue::Queue> = Arc::new(SqliteQueue::open_in_memory().unwrap());
+        let ingestor = Ingestor {
+            repo_root: root.to_path_buf(),
+            config: config.clone(),
+            bus: Arc::new(Bus::new(config, queue.clone())),
+            queue: queue.clone(),
+            sensor: Arc::new(SubprocessSensor::new()),
+            broker: Arc::new(SecretsBroker::new_test(vec![])),
+            registry: Arc::new(RwLock::new(Registry::load(root).unwrap())),
+        };
+        (ingestor, queue)
+    }
+
+    /// Exactly the body `telegram-ingress.ts` POSTs — the THREAD key rides in a top-level
+    /// `dedup_key` (= the chat id), which `process` reads at ingest.rs:96 (NOT `chat_id`).
+    fn tg_post(chat: i64, msg: i64, key: Option<&str>) -> FiredTrigger {
+        let mut body = serde_json::json!({
+            "chat_id": chat, "message_id": msg, "text": "hi duck",
+            "from_username": "stranger",
+        });
+        if let Some(k) = key {
+            body["dedup_key"] = serde_json::json!(k);
+        }
+        FiredTrigger { def_id: "tg-pub".into(), payload: serde_json::to_vec(&body).unwrap() }
+    }
+
+    /// acceptance (multithreading confidence): *distinct-chat webhook POSTs enqueue as DISTINCT,
+    /// separately-keyed rows* — the exact property MT relies on to hand different chats to parallel
+    /// workers (`next_eligible` keys off `dedup_key`). Three chats → three rows; a repeat in an
+    /// existing chat folds into that chat's one row (per-thread serialization), never a fourth.
+    /// This is the webhook analogue of the cron dedup test — closing the "do webhooks tag apart?"
+    /// gap that a malformed dry-run POST (chat_id present, top-level `dedup_key` absent) had muddied.
+    #[tokio::test]
+    async fn webhook_distinct_dedup_keys_enqueue_as_distinct_parallelizable_rows() {
+        let root = std::env::temp_dir().join(format!("dack-wh-{}", std::process::id()));
+        let (ingestor, queue) = webhook_ingestor(&root);
+
+        // Three DIFFERENT chats, each carrying its own thread key.
+        for (i, chat) in [4001i64, 4002, 4003].into_iter().enumerate() {
+            ingestor
+                .process(tg_post(chat, i as i64 + 1, Some(&chat.to_string())), 1000)
+                .await
+                .unwrap();
+        }
+        // A SECOND message in an existing chat (4001) folds into its pending accumulator (one wake
+        // per thread), not a distinct row.
+        ingestor.process(tg_post(4001, 9, Some("4001")), 1000).await.unwrap();
+
+        assert_eq!(
+            queue.depth().await.unwrap(),
+            3,
+            "three chats = three parallelizable rows; chat 4001's repeat coalesced into its own row"
+        );
+        let mut keys = Vec::new();
+        while let Some(row) = queue.next().await.unwrap() {
+            keys.push(row.dedup_key.expect("the webhook body carried a top-level dedup_key"));
+        }
+        keys.sort();
+        assert_eq!(keys, vec!["4001", "4002", "4003"], "one keyed row per distinct chat");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The failure mode the earlier dry-run *looked* like but wasn't: a body with NO top-level
+    /// `dedup_key` yields a `None`-keyed candidate, and coalescing needs `Some(key)` (bus/mod.rs:74)
+    /// — so keyless POSTs never collapse together; each is its own row. Proves distinct chats can't
+    /// silently fold into one stimulus (the "3 POSTs → 1" I saw was `max_concurrent_cycles=1` serial
+    /// dispatch, not coalescing).
+    #[tokio::test]
+    async fn webhook_missing_dedup_key_never_collapses_distinct_posts() {
+        let root = std::env::temp_dir().join(format!("dack-wh-nokey-{}", std::process::id()));
+        let (ingestor, queue) = webhook_ingestor(&root);
+
+        for (i, chat) in [5001i64, 5002, 5003].into_iter().enumerate() {
+            ingestor.process(tg_post(chat, i as i64 + 1, None), 1000).await.unwrap();
+        }
+        assert_eq!(
+            queue.depth().await.unwrap(),
+            3,
+            "null-key candidates never coalesce — three POSTs stay three rows"
+        );
+        while let Some(row) = queue.next().await.unwrap() {
+            assert!(row.dedup_key.is_none(), "keyless body → keyless (un-serialized) row");
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn watermark_is_numeric_then_lexical() {
         let c = |id: &str| SensorCandidate {

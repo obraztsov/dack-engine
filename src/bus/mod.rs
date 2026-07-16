@@ -20,11 +20,19 @@ use crate::stimuli::StimulusDef;
 pub struct Bus {
     config: Arc<DackConfig>,
     queue: Arc<dyn Queue>,
+    /// Monotonic per-process counter that makes every enqueued stimulus id globally unique.
+    /// `received_at` is SECONDS and the intra-call index `i` restarts at 0 each ingest call, so
+    /// two SEPARATE calls sharing a wall-clock second (e.g. two webhook POSTs from *different*
+    /// chats — different `dedup_key`, so neither coalesces) would both build `"{src}-{sec}-0"`.
+    /// `enqueue` is INSERT OR IGNORE, so that collision would SILENTLY DROP the second chat's wake
+    /// — latent at low traffic, a real message-loss bug under concurrent (launch) load. This
+    /// tie-breaker closes it.
+    seq: std::sync::atomic::AtomicU64,
 }
 
 impl Bus {
     pub fn new(config: Arc<DackConfig>, queue: Arc<dyn Queue>) -> Self {
-        Self { config, queue }
+        Self { config, queue, seq: std::sync::atomic::AtomicU64::new(0) }
     }
 
     /// Normalize sensor candidates from one duty firing into `Stimulus` rows and enqueue
@@ -168,7 +176,11 @@ impl Bus {
                 (a, b) => a.or(b),
             };
 
-            let id = StimulusId(format!("{}-{}-{}", fm.id, received_at, i));
+            // `{source}-{received_at}-{i}` is NOT unique across ingest calls that share a second
+            // (webhooks are one call per POST, so `i` is always 0) — append the monotonic `seq` so
+            // a same-second cross-chat POST can't collide + be dropped by INSERT OR IGNORE.
+            let seq = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let id = StimulusId(format!("{}-{}-{}-{}", fm.id, received_at, i, seq));
             self.queue
                 .enqueue(Stimulus {
                     id: id.clone(),

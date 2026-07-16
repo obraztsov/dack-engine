@@ -99,6 +99,12 @@ pub struct Harness {
     /// the key `(prompt-id, taint, …dims)`; idle entries past `session_ttl_secs` are evicted lazily.
     /// `Default` (empty) so the many test constructors need only `sessions: Default::default()`.
     pub sessions: std::sync::Mutex<std::collections::HashMap<String, (String, i64)>>,
+    /// **Memory/soul write-lock** (Axis-2 of multithreading): guards the durable FILE state (`memory/` +
+    /// the soul repo). Each step in `run_step` takes it WRITE (default — exclusive for the whole
+    /// read-modify-write cycle) or READ (a `parallel: true` prompt, wall-guaranteed to make no memory/soul
+    /// write). At `max_concurrent_cycles = 1` it is uncontended (single-flight) — inert until concurrency is
+    /// enabled. `Default` (unlocked) so the test constructors need only `mem_lock: Default::default()`.
+    pub mem_lock: std::sync::Arc<tokio::sync::RwLock<()>>,
 }
 
 impl Harness {
@@ -582,6 +588,12 @@ impl Harness {
         // nothing irreversible/self-modifying happened anywhere in the wake.
         wake_unretryable: &std::sync::atomic::AtomicBool,
     ) -> Result<(AgentOutput, String, Option<TrustTier>)> {
+        // MEMORY/SOUL LOCK (Axis-2): held for the WHOLE step. Context assembly READS memory/soul and a
+        // writer step later WRITES it, so the exclusive region must span read-through-write (making a
+        // writer's read-modify-write atomic — two writers can't clobber each other). P0: ALWAYS write
+        // (exclusive). P1 takes a READ-lock for a `parallel: true` prompt (wall-guaranteed to make no
+        // memory/soul write). Uncontended at `max_concurrent_cycles = 1` (single-flight) — inert until then.
+        let _mem_guard = self.mem_lock.write().await;
         let spec = default_spec(prompt.state);
         // The capabilities this state-prompt plugs (the two-sided handshake,).
         let (mcp_servers, inline_read) =
@@ -2781,6 +2793,7 @@ mod tests {
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
         broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
+            mem_lock: Default::default(),
         };
 
         harness.dispatch(poisoned_stimulus(), &Default::default()).await.unwrap();
@@ -2873,6 +2886,7 @@ mod tests {
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
         broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
+            mem_lock: Default::default(),
         };
 
         harness.dispatch(poisoned_stimulus(), &Default::default()).await.unwrap();
@@ -2930,6 +2944,7 @@ mod tests {
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
+            mem_lock: Default::default(),
         };
 
         harness.dispatch(poisoned_stimulus(), &Default::default()).await.unwrap();
@@ -2985,6 +3000,7 @@ mod tests {
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
+            mem_lock: Default::default(),
         };
 
         harness.dispatch(poisoned_stimulus(), &Default::default()).await.unwrap();
@@ -3053,6 +3069,7 @@ mod tests {
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
+            mem_lock: Default::default(),
         };
 
         harness.dispatch(poisoned_stimulus(), &Default::default()).await.unwrap(); // payload_tier = Public
@@ -3104,6 +3121,7 @@ mod tests {
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
+            mem_lock: Default::default(),
         };
 
         let mut stim = poisoned_stimulus();
@@ -3172,6 +3190,7 @@ mod tests {
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
+            mem_lock: Default::default(),
         }
     }
 
@@ -3272,6 +3291,7 @@ mod tests {
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
+            mem_lock: Default::default(),
         };
 
         // Self-tier so the settle branch is within the ceiling. Chat-shaped payload (hoisted scalars +
@@ -3363,6 +3383,7 @@ mod tests {
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
+            mem_lock: Default::default(),
         };
 
         // A continuation with an ANCIENT received_at (0) — far older than the 60s TTL.
@@ -3428,6 +3449,7 @@ mod tests {
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
+            mem_lock: Default::default(),
         };
 
         // Simulate this Express run's tool-driven writes straight to the working tree: an
@@ -3495,6 +3517,7 @@ mod tests {
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
+            mem_lock: Default::default(),
         });
 
         let (tx, rx) = tokio::sync::watch::channel(false);
@@ -3663,6 +3686,7 @@ mod tests {
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![Arc::new(StaticEnvProvider::new("cove", vec!["DACK_COVE_TEST".into()]))])),
             sessions: Default::default(),
+            mem_lock: Default::default(),
         };
         let stim = poisoned_stimulus();
         let prompt = |state| StatePrompt {
@@ -3741,6 +3765,7 @@ mod tests {
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
+            mem_lock: Default::default(),
         };
         // A CLEAN self-tier cycle (directive + payload self → seed self → ceiling Reflect).
         let mut stim = poisoned_stimulus();
@@ -3795,6 +3820,7 @@ mod tests {
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
+            mem_lock: Default::default(),
         };
         let stim = poisoned_stimulus();
         let inline = || McpRef::Inline { name: "rootai".into(), url: "https://mcp.rootai.xyz".into() };
@@ -3860,6 +3886,7 @@ mod tests {
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
+            mem_lock: Default::default(),
         };
         let stim = poisoned_stimulus();
         let express = StatePrompt {
@@ -3936,6 +3963,7 @@ mod tests {
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
+            mem_lock: Default::default(),
         };
         let mut stim = poisoned_stimulus();
         stim.payload = serde_json::json!({
@@ -4001,6 +4029,7 @@ mod tests {
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
+            mem_lock: Default::default(),
         };
         let perceive = StatePrompt {
             id: "p".into(), state: ConsciousnessState::Perceive,
@@ -4048,6 +4077,7 @@ mod tests {
             runlog: rec.clone(),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
+            mem_lock: Default::default(),
         };
         let out = AgentOutput {
             tag_notes: Some(vec![TagNote { tag: "chatX".into(), note: "trading-curious".into(), kind: Default::default() }]),
@@ -4102,6 +4132,7 @@ mod tests {
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
+            mem_lock: Default::default(),
         };
         let allow = |tool: &str| ToolCallRecord { tool: tool.into(), decision: "allow".into(), input: None };
 
@@ -4170,6 +4201,7 @@ mod tests {
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
+            mem_lock: Default::default(),
         };
 
         let mut stim = poisoned_stimulus();
@@ -4243,6 +4275,7 @@ mod tests {
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
+            mem_lock: Default::default(),
         };
         let stim = poisoned_stimulus();
         let prompt = |state, model: &str| StatePrompt {
@@ -4389,6 +4422,7 @@ mod tests {
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
+            mem_lock: Default::default(),
         };
         let sticky = StatePrompt {
             id: "twitter/perceive_thread".into(),
@@ -4507,6 +4541,7 @@ mod tests {
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
+            mem_lock: Default::default(),
         };
         let sticky = StatePrompt {
             id: "twitter/perceive_thread".into(),

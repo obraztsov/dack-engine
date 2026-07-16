@@ -217023,7 +217023,10 @@ function markForSnip(shortIds, messages) {
   return [...matched];
 }
 function isSnipRuntimeEnabled() {
-  return true;
+  return false; // DACK PATCH 2026-07-16: snip is wall-denied for the duck (it deleted its own grounding
+  // and confabulated a fake project in a Reflect). Returning false also kills the context-pressure NUDGE
+  // (getContextEfficiencyAttachment) that pushed the model toward snip and that it misread as "user kept
+  // interrupting". Re-apply on SDK upgrade. See memory openclaude-runtime-gotchas.
 }
 function estimateTokens(msg) {
   const content = msg?.message?.content ?? msg?.content ?? "";

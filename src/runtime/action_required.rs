@@ -325,7 +325,7 @@ fn normalize_lexical(p: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{default_spec, ConsciousnessState};
+    use crate::state::{default_spec, worker_spec, ConsciousnessState};
     use serde_json::json;
 
     fn caps() -> (Vec<CapabilityPrefix>, Vec<CapabilityPrefix>) {
@@ -403,17 +403,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snip_is_allowed_in_every_state() {
-        // `snip` trims the model's OWN context window (Read-class): allowed in every state so a long sticky
-        // session can self-trim stale turns instead of a full eviction. It can't reach the system prompt or
-        // the runlog, so there's nothing to gate by trust/state.
+    async fn snip_denied_for_duck_allowed_for_worker() {
+        // `snip` can delete the model's OWN grounding (the first user message / recall results — every user
+        // message is snippable, no first-message protection), which caused a Reflect to trim its context
+        // and confabulate. DENIED for every duck state (falls to `Other`); a WORKER keeps it (its scope
+        // admits `Other`) for its own long agentic sessions.
         for state in [ConsciousnessState::Perceive, ConsciousnessState::Express, ConsciousnessState::Reflect] {
             let r = responder(state);
             assert!(matches!(
                 r.decide(&req("snip", json!({"message_ids": ["ab12cd"]}))).await,
-                ActionDecision::Allow
-            ), "{state:?} may snip its own context window");
+                ActionDecision::Deny(_)
+            ), "{state:?} must NOT snip its own context");
         }
+        let (post, settle) = caps();
+        let worker = StatePolicyResponder::with_capabilities(worker_spec(), post, settle);
+        assert!(matches!(
+            worker.decide(&req("snip", json!({"message_ids": ["ab12cd"]}))).await,
+            ActionDecision::Allow
+        ), "a worker keeps snip (its scope admits Other-class tools)");
     }
 
     #[tokio::test]

@@ -57,11 +57,13 @@ fn disallowed_for(spec: &crate::state::StateSpec) -> Vec<String> {
         .filter(|t| !(is_worker && **t == "Bash"))
         .map(|s| s.to_string())
         .collect();
-    // `TodoWrite` (the SDK's task-list tool) is dead weight for the duck's consciousness states — it only
-    // produced "use TodoWrite" nudge noise the wall then denied. Hide it from the duck; a spawned WORKER
-    // (a real multi-step build agent) KEEPS it for task tracking.
+    // `TodoWrite` (task-list) and `snip` (context trimmer) are dead weight / actively harmful for the
+    // duck's consciousness states — TodoWrite was denied-nudge noise; `snip` let the model delete its OWN
+    // grounding (first user message / recall results) and confabulate a fake project in a Reflect
+    // (2026-07-16). Hide both from the duck; a spawned WORKER (real multi-step build agent) KEEPS them.
     if !is_worker {
         out.push("TodoWrite".into());
+        out.push("snip".into());
     }
     // Defense-in-depth: NETWORK egress (WebFetch/WebSearch = `Net`) is a distinct class scoped to
     // Perceive (+ the worker). Where a state's scope does NOT admit `Net`, hide these at the SDK layer
@@ -476,9 +478,12 @@ mod tests {
         // The other exec tools remain disallowed even for a worker (it builds with Bash, not these).
         assert!(worker.contains(&"PowerShell".to_string()));
         assert!(worker.contains(&"KillShell".to_string()));
-        // TodoWrite: hidden from the duck (noise), kept for a worker (multi-step task tracking).
-        assert!(duck.contains(&"TodoWrite".to_string()), "the duck must NOT get TodoWrite");
-        assert!(!worker.contains(&"TodoWrite".to_string()), "a worker keeps TodoWrite");
+        // TodoWrite + snip: hidden from the duck (noise / context-trim confabulation risk), kept for a
+        // worker (task tracking / long agentic sessions).
+        for t in ["TodoWrite", "snip"] {
+            assert!(duck.contains(&t.to_string()), "the duck must NOT get {t}");
+            assert!(!worker.contains(&t.to_string()), "a worker keeps {t}");
+        }
     }
 
     /// The model-routing split (8.7 + the gateway fix): on a gateway the resolved model must go to

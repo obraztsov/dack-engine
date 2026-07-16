@@ -561,6 +561,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reclaim_requeues_all_orphans_from_a_parallel_batch() {
+        // Under multithreading a crash can leave SEVERAL rows `dispatched` at once (an in-flight parallel
+        // batch). The boot sweep must requeue EVERY one — no lost or stuck stimulus.
+        let q = SqliteQueue::open_in_memory().unwrap();
+        for (i, k) in ["chatA", "chatB", "chatC"].into_iter().enumerate() {
+            q.enqueue(mk(&format!("s{i}"), Priority::Normal, i as i64, "mention", Some(k))).await.unwrap();
+        }
+        // Three distinct-thread wakes leased concurrently (all → dispatched), then a crash — none finished.
+        for _ in 0..3 {
+            assert!(q.next_eligible(&[]).await.unwrap().is_some());
+        }
+        assert_eq!(q.depth().await.unwrap(), 0, "all three in flight, nothing pending");
+        // The boot sweep requeues ALL three.
+        assert_eq!(q.reclaim_orphans().await.unwrap(), 3, "every orphan from the batch is requeued");
+        assert_eq!(q.depth().await.unwrap(), 3, "all three pending again");
+    }
+
+    #[tokio::test]
     async fn survives_reopen_persistence() {
         let dir = std::env::temp_dir().join(format!("dack-q-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

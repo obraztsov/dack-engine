@@ -657,8 +657,29 @@ impl Harness {
         }
         // The capabilities this state-prompt plugs (the two-sided handshake,). `unavailable` =
         // declared servers dropped by a fault/taint-degradation, announced in the orientation block.
-        let (mcp_servers, inline_read, unavailable) =
+        let (mcp_servers, inline_read, mut unavailable) =
             self.assemble_mcp_servers(prompt, stimulus, cycle_trust, scope_override).await;
+        // Health-fed LIVENESS (P3): a DECLARED+assembled server whose last connect FAILED (a remote MCP
+        // that's been down — cove staging) is announced as likely-unavailable too, so the model doesn't
+        // burn the cycle guessing at absent tools. The harness can't know THIS spawn's outcome before
+        // the bridge connects, but a live connect-failure streak is a strong "probably still down"
+        // signal; the orientation drops these from `capabilities_this_step` (see `orientation_block`).
+        {
+            let snap = self.broker.health().snapshot();
+            for name in mcp_servers.keys() {
+                if let Some(h) = snap.mcp.get(name) {
+                    if !h.is_ok() {
+                        unavailable.push(UnavailableMcp {
+                            name: name.clone(),
+                            reason: format!(
+                                "last connect failed ({}x in a row) — likely down",
+                                h.consecutive_failures
+                            ),
+                        });
+                    }
+                }
+            }
+        }
         let recorder = self.wall_for(spec.clone(), inline_read, cycle_trust);
         // Offer ONLY the transitions the current trust ceiling permits — the agent never sees a hop
         // it couldn't take (taint model). A step that then touches a lower-trust capability may drop
@@ -2358,14 +2379,20 @@ fn orientation_block(
     cycle_trust: &TrustTier,
     ceiling: ConsciousnessState,
 ) -> ContextBlock {
-    let caps = if mcp_servers.is_empty() {
+    // A server named in `unavailable` (taint-degraded, or a live liveness failure) is NOT listed as a
+    // capability — the model shouldn't see it in both lines. Taint-dropped servers aren't in
+    // `mcp_servers` anyway; this filter matters for liveness-flagged ones, which ARE still assembled.
+    let unavailable_names: std::collections::BTreeSet<&str> =
+        unavailable.iter().map(|u| u.name.as_str()).collect();
+    let live: Vec<String> = mcp_servers
+        .keys()
+        .filter(|n| !unavailable_names.contains(n.as_str()))
+        .map(|n| format!("mcp__{n}__*"))
+        .collect();
+    let caps = if live.is_empty() {
         "none this step (built-in file tools only)".to_string()
     } else {
-        mcp_servers
-            .keys()
-            .map(|n| format!("mcp__{n}__*"))
-            .collect::<Vec<_>>()
-            .join(", ")
+        live.join(", ")
     };
     // Servers a prompt DECLARED that aren't plugged this step (dead secret / taint-degraded / a remote
     // that failed to connect). Naming them + the reason stops the model guessing at missing tools — and
@@ -4201,19 +4228,23 @@ mod tests {
             mcp: vec![], transitions: vec![], model: None, session: None, reply_key: None,
             context: None, parallel: false, system_frame: String::new(), body: String::new(), resume_body: None,
         };
+        // Both servers assembled; cove-read will be flagged unavailable (a live liveness failure).
         let servers: BTreeMap<String, serde_json::Value> =
-            BTreeMap::from([("recall".to_string(), serde_json::json!({}))]);
+            BTreeMap::from([("recall".to_string(), serde_json::json!({})), ("cove-read".to_string(), serde_json::json!({}))]);
 
-        // Nothing missing → no unavailable line at all.
+        // Nothing missing → no unavailable line at all; both servers listed as capabilities.
         let clean = orientation_block(&p, Path::new("/soul"), &servers, &[], &TrustTier::self_(), ConsciousnessState::Reflect);
-        assert!(clean.body.contains("capabilities_this_step: mcp__recall__*"));
+        assert!(clean.body.contains("capabilities_this_step: mcp__cove-read__*, mcp__recall__*"));
         assert!(!clean.body.contains("unavailable_this_step"), "no line when nothing is missing");
 
-        // A missing server → named with its reason + the do-not-invent-names guard, trusted.
+        // cove-read flagged unavailable → named with reason + the do-not-invent-names guard, AND
+        // DROPPED from capabilities_this_step (never listed as both available and unavailable).
         let un = vec![UnavailableMcp { name: "cove-read".into(), reason: "connection failed".into() }];
         let flagged = orientation_block(&p, Path::new("/soul"), &servers, &un, &TrustTier::self_(), ConsciousnessState::Reflect);
         assert!(flagged.body.contains("unavailable_this_step: cove-read (connection failed)"), "{}", flagged.body);
         assert!(flagged.body.contains("do NOT attempt"));
+        assert!(flagged.body.contains("capabilities_this_step: mcp__recall__*"), "{}", flagged.body);
+        assert!(!flagged.body.contains("mcp__cove-read__*"), "a flagged server is not also listed available: {}", flagged.body);
         assert!(flagged.trusted, "orientation is harness-authored/trusted");
     }
 

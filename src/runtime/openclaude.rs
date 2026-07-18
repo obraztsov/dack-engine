@@ -125,11 +125,23 @@ enum FromBridge {
         session_id: Option<String>,
         #[serde(default)]
         usage: Option<super::InvokeUsage>,
+        /// Each capability server's connect outcome from the SDK `init` — so the harness records MCP
+        /// liveness health (a remote MCP that failed to connect this cycle). Absent on older bridges.
+        #[serde(default)]
+        mcp_status: Vec<McpStatus>,
     },
     /// The run failed inside the engine/bridge.
     Error { message: String },
     /// Diagnostic passthrough (surfaced to the harness log).
     Log { message: String },
+}
+
+/// One capability server's connect outcome, forwarded by the bridge on the result event.
+/// `status` is `"connected"` when the SDK established the session, else a liveness failure.
+#[derive(Debug, Deserialize)]
+struct McpStatus {
+    name: String,
+    status: String,
 }
 
 pub struct OpenClaudeClient {
@@ -162,6 +174,9 @@ pub struct OpenClaudeClient {
     /// would otherwise freeze the single-flight loop forever; on elapse `invoke` returns a
     /// `Runtime` error (dispatch logs + continues) and `kill_on_drop` reaps the child.
     pub timeout: Duration,
+    /// Shared runtime health registry — where this client records each invocation's MCP connect
+    /// outcomes (liveness). `None` in tests / mock runtimes that don't connect real servers.
+    pub health: Option<Arc<crate::health::HealthRegistry>>,
 }
 
 /// The container backend for delegated workers: the [`Sandbox`] (Docker), the
@@ -196,12 +211,19 @@ impl OpenClaudeClient {
             policy: IsolationPolicy::host_passthrough(),
             worker: None, // host workers by default; the CLI sets a Docker backend when configured
             timeout,
+            health: None, // the CLI attaches the shared registry via `with_health`
         }
     }
 
     /// Attach (or clear) the worker isolation backend — the CLI builds it from `runtime.worker_sandbox`.
     pub fn with_worker(mut self, worker: Option<WorkerBackend>) -> Self {
         self.worker = worker;
+        self
+    }
+
+    /// Attach the shared health registry so MCP connect outcomes are recorded per invocation.
+    pub fn with_health(mut self, health: Arc<crate::health::HealthRegistry>) -> Self {
+        self.health = Some(health);
         self
     }
 
@@ -427,8 +449,17 @@ impl RuntimeClient for OpenClaudeClient {
                         )
                         .await?;
                     }
-                    FromBridge::Result { output, session_id, usage } => {
-                        return Ok((output, session_id.map(SessionId), usage))
+                    FromBridge::Result { output, session_id, usage, mcp_status } => {
+                        // Record each capability server's connect outcome as MCP liveness health, so a
+                        // remote that failed (cove staging down) is visible to `dack status`, the NEXT
+                        // cycle's orientation, and Reflect — instead of the model silently guessing.
+                        if let Some(health) = &self.health {
+                            let now = chrono::Utc::now().timestamp();
+                            for s in &mcp_status {
+                                health.record_mcp_status(&s.name, s.status == "connected", now);
+                            }
+                        }
+                        return Ok((output, session_id.map(SessionId), usage));
                     }
                     FromBridge::Error { message } => return Err(DackError::Runtime(message)),
                     FromBridge::Log { message } => tracing::info!("[bridge] {message}"),
@@ -551,6 +582,7 @@ mod tests {
             policy: IsolationPolicy::host_passthrough(),
             worker: None,
             timeout: Duration::from_secs(30),
+            health: None,
         }
     }
 
@@ -614,6 +646,29 @@ mod tests {
         assert_eq!(out.proposal.unwrap().gist, "g");
     }
 
+    /// The bridge's `mcp_status` (per-server connect outcome from the SDK `init`) is recorded into the
+    /// shared health registry — a FAILED connect bumps that server's streak (→ orientation/Reflect can
+    /// surface it), a CONNECTED one keeps it healthy.
+    #[tokio::test]
+    async fn records_mcp_connect_status_into_health() {
+        let mock = "#!/bin/sh\n\
+            read invoke\n\
+            printf '{\"kind\":\"result\",\"output\":{\"thought\":\"hi\",\"proposal\":{\"intent\":\"noop\",\"gist\":\"g\"},\"transition\":{\"to_state\":null}},\"mcp_status\":[{\"name\":\"cove-read\",\"status\":\"failed\"},{\"name\":\"recall\",\"status\":\"connected\"}]}\\n'\n";
+        let health = Arc::new(crate::health::HealthRegistry::new(0));
+        let client = mock_client(mock, "mcphealth").with_health(health.clone());
+        let rec = Arc::new(Recorder { asked: Mutex::new(vec![]), allow: true });
+        let _ = client.invoke(perceive_req(), rec).await.unwrap();
+
+        let snap = health.snapshot();
+        let cove = snap.mcp.get("cove-read").expect("cove-read liveness recorded");
+        assert_eq!(cove.consecutive_failures, 1, "a failed connect bumps the streak");
+        assert_eq!(cove.fail_count, 1);
+        assert!(cove.last_fail.is_some() && cove.last_ok.is_none());
+        let recall = snap.mcp.get("recall").expect("recall liveness recorded");
+        assert_eq!(recall.consecutive_failures, 0, "a connected server stays healthy");
+        assert!(recall.last_ok.is_some());
+    }
+
     // ── Docker-isolated workers ────────────────────────────────────────────────
 
     /// Records the [`ProcessSpec`] it's handed, then runs a fixed mock bridge so the NDJSON protocol
@@ -668,6 +723,7 @@ mod tests {
             policy: IsolationPolicy::host_passthrough(),
             worker,
             timeout: Duration::from_secs(30),
+            health: None,
         };
         (client, rec)
     }

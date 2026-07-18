@@ -154,7 +154,7 @@ async function runInvoke(inv: any) {
   if (inv.agents && typeof inv.agents === 'object' && Object.keys(inv.agents).length) options.agents = inv.agents
 
   // First pass: the real invocation — tools live, the wall (canUseTool → Rust) gating every call.
-  let { finalText, sessionId, usage } = await runQuery(inv.user_prompt, options, inv.model)
+  let { finalText, sessionId, usage, mcpStatus } = await runQuery(inv.user_prompt, options, inv.model)
   let parsed = tryParseOutput(finalText, console.error)
 
   // Bounded PARSE-FAIL recovery: ONLY when the model emitted prose instead of the closing JSON
@@ -184,26 +184,31 @@ async function runInvoke(inv: any) {
   }
 
   // `usage` (the resumed-context token counts) rides the result so the harness can size-evict a session.
-  emit({ kind: 'result', output: parsed.output, session_id: sessionId, usage })
+  // `mcp_status` (per-server connect outcome from the SDK `init`) rides it too, so the harness records
+  // liveness health + can announce a failed remote (cove staging down) to the NEXT cycle + Reflect.
+  emit({ kind: 'result', output: parsed.output, session_id: sessionId, usage, mcp_status: mcpStatus })
   process.exit(0)
 }
 
-/** Drive one model turn to completion: accumulate its final text, session id, and usage. */
+/** Drive one model turn to completion: accumulate its final text, session id, usage, and — from the
+ *  SDK `init` — each capability server's connect outcome. */
 async function runQuery(
   prompt: string,
   options: any,
   model: string | null,
-): Promise<{ finalText: string; sessionId: string | null; usage: any }> {
+): Promise<{ finalText: string; sessionId: string | null; usage: any; mcpStatus: { name: string; status: string }[] }> {
   let finalText = ''
   let sessionId: string | null = null
   let usage: any = null
+  let mcpStatus: { name: string; status: string }[] = []
   for await (const m of query({ prompt, options }) as AsyncIterable<any>) {
     // Capture the engine session id (carried on the SDK messages) → returned for sticky resume.
     if (m?.session_id) sessionId = m.session_id
-    // Concise capability connection status (NOT the tool list — keep it grep-safe): an operator
-    // sees at a glance whether cove/twitter connected or failed.
+    // Capability connection status from the SDK `init`: log it (operator glance) AND capture it
+    // structurally so it rides the result event → the harness's MCP liveness health.
     if (m?.type === 'system' && m?.subtype === 'init' && Array.isArray(m.mcp_servers) && m.mcp_servers.length) {
-      console.error('[bridge:mcp]', JSON.stringify(m.mcp_servers.map((s: any) => `${s.name}:${s.status}`)))
+      mcpStatus = m.mcp_servers.map((s: any) => ({ name: String(s.name), status: String(s.status) }))
+      console.error('[bridge:mcp]', JSON.stringify(mcpStatus.map((s) => `${s.name}:${s.status}`)))
     }
     if (m?.type === 'assistant' && Array.isArray(m.message?.content)) {
       for (const b of m.message.content) if (b.type === 'text') finalText += b.text

@@ -457,7 +457,11 @@ async fn run(config_path: &str) -> Result<()> {
     // loop stays up (logging-not-rollback).
     // The runtime extensibility point: only openclaude+opengateway is wired; any other engine or
     // connector is a clear `NotImplemented` (the config slot exists, the adapter doesn't yet).
-    let runtime: Arc<dyn RuntimeClient> = build_runtime(&config)?;
+    // Shared runtime health registry (the "subconscious"): the broker records per-secret health, the
+    // loops record per-stimulus health, the runtime records per-MCP connect health, and Reflect /
+    // `dack status` read the one snapshot. Built here so it can be attached to the runtime.
+    let health = Arc::new(crate::health::HealthRegistry::new(chrono::Utc::now().timestamp()));
+    let runtime: Arc<dyn RuntimeClient> = build_runtime(&config, health.clone())?;
     // Identity: resolve the configured role dirs via the selected backend (native `local` by
     // default; `gitlawb` shells to `gl`). The Soul dir attributes soul commits (+ signs a
     // `gitlawb://` push, if any); its key never enters agent env.
@@ -477,9 +481,6 @@ async fn run(config_path: &str) -> Result<()> {
     // memory (durable = prompts + long-term `memory/`); a fresh DB is created on a missing/corrupt file.
     let runlog: Arc<dyn RunLogWriter> = Arc::new(SqliteRunLog::open(&config.runlog_db)?);
     tracing::info!("runlog store: {} (sqlite)", config.runlog_db);
-    // Shared runtime health registry (the "subconscious"): the broker records per-secret health,
-    // the loops record per-stimulus health, and Reflect / `dack status` read the one snapshot.
-    let health = Arc::new(crate::health::HealthRegistry::new(chrono::Utc::now().timestamp()));
     // Secrets broker from config — trusted provider scripts; shared by sensors (per-duty
     // `secrets:`) and the Express act phase (per-route `secrets:`). It records each materialize
     // outcome into `health`.
@@ -609,7 +610,10 @@ async fn run(config_path: &str) -> Result<()> {
 /// Construct the runtime client from `config.runtime` (the engine + connector extensibility point).
 /// Only `openclaude`+`opengateway` is wired; any other engine/connector returns a clear
 /// `NotImplemented` (the config parses, the adapter just isn't built yet — see `RuntimeConfig`).
-fn build_runtime(config: &DackConfig) -> Result<Arc<dyn RuntimeClient>> {
+fn build_runtime(
+    config: &DackConfig,
+    health: Arc<crate::health::HealthRegistry>,
+) -> Result<Arc<dyn RuntimeClient>> {
     use crate::config::{Connector, RuntimeEngine};
     let rt = &config.runtime;
     let RuntimeEngine::Openclaude { bridge_dir } = &rt.engine;
@@ -635,7 +639,8 @@ fn build_runtime(config: &DackConfig) -> Result<Arc<dyn RuntimeClient>> {
     );
     // a Docker backend for delegated workers (OS isolation) when `worker_sandbox.enabled`.
     let worker = build_worker_backend(config)?;
-    Ok(Arc::new(client.with_worker(worker)))
+    // Attach the shared health registry so the runtime records each invocation's MCP connect outcomes.
+    Ok(Arc::new(client.with_worker(worker).with_health(health)))
 }
 
 /// Build the worker isolation backend from `runtime.worker_sandbox`, with a STARTUP PREFLIGHT. Returns

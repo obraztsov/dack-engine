@@ -2900,6 +2900,7 @@ mod tests {
                 policy: crate::sandbox::IsolationPolicy::host_passthrough(),
                 worker: None,
                 timeout: std::time::Duration::from_secs(30),
+                health: None,
             }),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
             identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),

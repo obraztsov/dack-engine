@@ -80,12 +80,37 @@ pub struct DutyInfo {
     pub entry: String,
 }
 
+/// Health of one MCP capability server (keyed by server name, e.g. `cove-read`). "Connected" means
+/// the bridge/SDK established the session for a cycle; a `failed` is a **liveness fault** — a remote
+/// MCP that was handed to the bridge but couldn't connect (cove staging down). This is distinct from a
+/// taint/authz WITHHOLD, which the harness resolves before the bridge ever sees the server.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct McpHealth {
+    /// Last time it connected successfully (unix seconds).
+    pub last_ok: Option<i64>,
+    /// Last time a connection attempt FAILED.
+    pub last_fail: Option<i64>,
+    /// Failed connects in a row since the last success (0 ⇒ healthy).
+    pub consecutive_failures: u32,
+    /// Total failed connects since boot.
+    pub fail_count: u64,
+}
+
+impl McpHealth {
+    /// Healthy = not currently in a connect-failure streak.
+    pub fn is_ok(&self) -> bool {
+        self.consecutive_failures == 0
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct HealthState {
     /// The configured duty roster (from the registry) — the "stimulus configuration".
     duties: Vec<DutyInfo>,
     secrets: BTreeMap<String, SecretHealth>,
     stimuli: BTreeMap<String, StimulusHealth>,
+    /// Per-MCP-server connection health (liveness), keyed by server name.
+    mcp: BTreeMap<String, McpHealth>,
     cycles_ok: u64,
     cycles_err: u64,
     booted_at: i64,
@@ -97,6 +122,7 @@ pub struct HealthSnapshot {
     pub duties: Vec<DutyInfo>,
     pub secrets: BTreeMap<String, SecretHealth>,
     pub stimuli: BTreeMap<String, StimulusHealth>,
+    pub mcp: BTreeMap<String, McpHealth>,
     pub cycles_ok: u64,
     pub cycles_err: u64,
     pub booted_at: i64,
@@ -169,6 +195,23 @@ impl HealthRegistry {
         h.last_error = Some(err.to_string());
     }
 
+    /// The bridge reported an MCP server's connection status for a cycle: `connected` = the SDK
+    /// established it (clears the streak); otherwise a **liveness fault** (a remote MCP that failed to
+    /// connect) — bumps the streak + stamps the time. Fed from the openclaude runtime as it parses each
+    /// invocation's `mcp_status`. Read back by the orientation block (P3) + the subconscious-health view.
+    pub fn record_mcp_status(&self, name: &str, connected: bool, now: i64) {
+        let mut st = self.lock();
+        let h = st.mcp.entry(name.to_string()).or_default();
+        if connected {
+            h.last_ok = Some(now);
+            h.consecutive_failures = 0;
+        } else {
+            h.last_fail = Some(now);
+            h.consecutive_failures = h.consecutive_failures.saturating_add(1);
+            h.fail_count = h.fail_count.saturating_add(1);
+        }
+    }
+
     /// Seed the configured duty roster (at boot, and on `stimuli/` hot-reload). Replaces the list.
     pub fn set_duties(&self, duties: Vec<DutyInfo>) {
         self.lock().duties = duties;
@@ -190,6 +233,7 @@ impl HealthRegistry {
             duties: st.duties.clone(),
             secrets: st.secrets.clone(),
             stimuli: st.stimuli.clone(),
+            mcp: st.mcp.clone(),
             cycles_ok: st.cycles_ok,
             cycles_err: st.cycles_err,
             booted_at: st.booted_at,
@@ -229,6 +273,32 @@ impl HealthSnapshot {
                         h.last_error.as_deref().unwrap_or("?"),
                         opt_ago(now, h.last_ok),
                     ));
+                }
+            }
+        }
+
+        // MCP capability servers — liveness (per-cycle connect outcomes). Terse when all connecting;
+        // per-server detail when any is in a connect-failure streak (a remote MCP down, e.g. cove
+        // staging). Only servers seen at least once appear; a purely taint-withheld server never does.
+        if !self.mcp.is_empty() {
+            let any_mcp_bad = self.mcp.values().any(|h| !h.is_ok());
+            if !any_mcp_bad {
+                let names: Vec<&str> = self.mcp.keys().map(String::as_str).collect();
+                s.push_str(&format!("\nMCP servers: all connecting — {}\n", names.join(", ")));
+            } else {
+                s.push_str("\nMCP servers:\n");
+                for (name, h) in &self.mcp {
+                    if h.is_ok() {
+                        s.push_str(&format!("  - {name}: ok (last ok {})\n", opt_ago(now, h.last_ok)));
+                    } else {
+                        s.push_str(&format!(
+                            "  - {name}: FAILING to connect ({} in a row, {} total) — last fail {}, last ok {}\n",
+                            h.consecutive_failures,
+                            h.fail_count,
+                            opt_ago(now, h.last_fail),
+                            opt_ago(now, h.last_ok),
+                        ));
+                    }
                 }
             }
         }
@@ -378,11 +448,16 @@ mod tests {
         reg.record_stimulus_err("twitter-mentions", "mcp twitter-read: X_BEARER_TOKEN not set");
         reg.record_stimulus_fired("heartbeat", now - 120);
         reg.record_stimulus_ok("heartbeat", now - 119);
+        // cove-read failing to connect (staging down); recall connecting fine.
+        reg.record_mcp_status("cove-read", false, now - 40);
+        reg.record_mcp_status("recall", true, now - 40);
 
         let out = reg.snapshot().render(now);
         // Secrets: x flagged (because one is bad, secrets go to detail mode), cove not flagged.
         assert!(out.contains("x: FAILING"), "{out}");
         assert!(out.contains("RE-AUTH NEEDED"), "{out}");
+        // MCP: cove-read flagged as failing to connect; because one is bad, MCP goes to detail mode.
+        assert!(out.contains("cove-read: FAILING to connect"), "{out}");
         // The whole roster shows, including the duty that never fired.
         assert!(out.contains("twitter-mentions [cron */2 * * * * → perceive]: FAILING"), "{out}");
         assert!(out.contains("heartbeat [cron 0 * * * * → perceive]: ok"), "{out}");
@@ -399,8 +474,11 @@ mod tests {
         reg.record_secret_ok("cove_read", now - 10);
         reg.record_stimulus_fired("heartbeat", now - 30);
         reg.record_stimulus_ok("heartbeat", now - 29);
+        reg.record_mcp_status("recall", true, now - 5);
+        reg.record_mcp_status("cove-read", true, now - 5);
         let out = reg.snapshot().render(now);
         assert!(out.contains("Secrets: all ok — cove_read, x"), "{out}"); // BTreeMap ⇒ sorted
+        assert!(out.contains("MCP servers: all connecting — cove-read, recall"), "{out}");
         assert!(!out.contains("FAILING"), "{out}");
     }
 }

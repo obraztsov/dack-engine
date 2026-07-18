@@ -655,8 +655,9 @@ impl Harness {
         if prompt.parallel {
             spec.writable_dirs.clear();
         }
-        // The capabilities this state-prompt plugs (the two-sided handshake,).
-        let (mcp_servers, inline_read) =
+        // The capabilities this state-prompt plugs (the two-sided handshake,). `unavailable` =
+        // declared servers dropped by a fault/taint-degradation, announced in the orientation block.
+        let (mcp_servers, inline_read, unavailable) =
             self.assemble_mcp_servers(prompt, stimulus, cycle_trust, scope_override).await;
         let recorder = self.wall_for(spec.clone(), inline_read, cycle_trust);
         // Offer ONLY the transitions the current trust ceiling permits — the agent never sees a hop
@@ -702,6 +703,7 @@ impl Harness {
             prompt,
             &self.soul_root(),
             &mcp_servers,
+            &unavailable,
             cycle_trust,
             ceiling,
         )];
@@ -1212,12 +1214,15 @@ impl Harness {
         stimulus: &Stimulus,
         cycle_trust: &TrustTier,
         scope_override: Option<&serde_json::Value>,
-    ) -> (BTreeMap<String, serde_json::Value>, Vec<CapabilityPrefix>) {
+    ) -> (BTreeMap<String, serde_json::Value>, Vec<CapabilityPrefix>, Vec<UnavailableMcp>) {
         let state = prompt.state;
         let policy = self.config.tier_policy_for(state);
         let lattice = self.config.lattice();
         let mut out = BTreeMap::new();
         let mut inline_read = Vec::new();
+        // Declared servers dropped for a FAULT or a taint DEGRADATION — announced to the model so it
+        // doesn't guess at missing tools (static authoring skips stay debug-log-only, not model noise).
+        let mut unavailable: Vec<UnavailableMcp> = Vec::new();
         for req in &prompt.mcp {
             let name = req.name();
             if policy.deny.iter().any(|d| d == name) {
@@ -1243,6 +1248,21 @@ impl Harness {
                     // the privileged tool mid-walk — the firebreak, for free. `None` = no trust gate.
                     if let Some(min) = &server.min_trust {
                         if !lattice.permits(cycle_trust, min) {
+                            // Announce ONLY a genuine mid-walk DEGRADATION: the cycle's ENTRY trust (the
+                            // stimulus directive tier) would have cleared this server, but the CURRENT
+                            // (post-taint) trust no longer does — the firebreak took it away because the
+                            // cycle touched lower-trust data. A server the entry trust never could reach
+                            // is a static authoring choice, not news the model needs every cycle.
+                            if lattice.permits(&stimulus.directive_tier, min) {
+                                unavailable.push(UnavailableMcp {
+                                    name: name.to_string(),
+                                    reason: format!(
+                                        "needs {} trust — lost to taint (cycle degraded to {})",
+                                        min.name(),
+                                        cycle_trust.name()
+                                    ),
+                                });
+                            }
                             tracing::debug!(
                                 "mcp `{name}` needs min_trust `{}` > cycle trust `{}` — skipped",
                                 min.name(),
@@ -1260,6 +1280,13 @@ impl Harness {
                                 .and_then(|k| env.get(&k).cloned()),
                             Err(e) => {
                                 tracing::warn!("mcp `{name}` secret `{}`: {e}", auth.secret);
+                                unavailable.push(UnavailableMcp {
+                                    name: name.to_string(),
+                                    reason: format!(
+                                        "auth secret `{}` unavailable — fail-closed",
+                                        auth.secret
+                                    ),
+                                });
                                 continue; // fail-closed: no token → don't expose a half-authed server.
                             }
                         },
@@ -1333,7 +1360,7 @@ impl Harness {
                 }
             }
         }
-        (out, inline_read)
+        (out, inline_read, unavailable)
     }
 
     /// The state's context blocks, **resume-aware** (the de-bloat that keeps a sticky session coherent):
@@ -2327,6 +2354,7 @@ fn orientation_block(
     prompt: &StatePrompt,
     soul_root: &std::path::Path,
     mcp_servers: &BTreeMap<String, serde_json::Value>,
+    unavailable: &[UnavailableMcp],
     cycle_trust: &TrustTier,
     ceiling: ConsciousnessState,
 ) -> ContextBlock {
@@ -2339,6 +2367,19 @@ fn orientation_block(
             .collect::<Vec<_>>()
             .join(", ")
     };
+    // Servers a prompt DECLARED that aren't plugged this step (dead secret / taint-degraded / a remote
+    // that failed to connect). Naming them + the reason stops the model guessing at missing tools — and
+    // it's a signal it can carry into Reflect ("cove-read keeps failing"). Absent line ⇒ nothing missing.
+    let unavailable_line = if unavailable.is_empty() {
+        String::new()
+    } else {
+        let list = unavailable
+            .iter()
+            .map(|u| format!("{} ({})", u.name, u.reason))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("\nunavailable_this_step: {list} — do NOT attempt these tools or invent names; treat them as down")
+    };
     // Live facts only — SOUL.md says how to use them (navigation, the one-outward-action rule, …).
     // `now` is AUTHORITATIVE and lives here (sent on every message, fresh + resume) so a resumed
     // session never reads a stale clock — unlike the SDK's memoized date, which freezes at bridge start.
@@ -2346,7 +2387,7 @@ fn orientation_block(
         "now: {} (authoritative — this is the real current time)\n\
          state: {:?} (prompt `{}`)\n\
          working_dir: {}\n\
-         capabilities_this_step: {}\n\
+         capabilities_this_step: {}{}\n\
          cycle_trust: {} -> may reach up to: {:?}\n\
          next_steps: see the allowed-transitions block.",
         chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC (%a)"),
@@ -2354,10 +2395,21 @@ fn orientation_block(
         prompt.id,
         soul_root.display(),
         caps,
+        unavailable_line,
         cycle_trust.name(),
         ceiling,
     );
     ContextBlock { label: "orientation".into(), body, trusted: true }
+}
+
+/// A declared MCP server that was NOT plugged this step, with a concise model-facing reason. Surfaced
+/// in the `orientation` block's `unavailable_this_step:` line so the model is TOLD a capability is gone
+/// — a dead auth-secret, a `min_trust` server taint took away, or (P3) a remote that failed to connect
+/// last time — instead of confabulating tool names against an empty toolset.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnavailableMcp {
+    pub name: String,
+    pub reason: String,
 }
 
 /// Render a [`Baton`] as the act-step context block — the agent's own digested product + the
@@ -3879,16 +3931,16 @@ mod tests {
         };
 
         // Perceive: only read-tier cove-read; trading (settle) is NOT exposed.
-        let (p, _) = harness.assemble_mcp_servers(&prompt(ConsciousnessState::Perceive), &stim, &TrustTier::self_(), None).await;
+        let (p, _, _) = harness.assemble_mcp_servers(&prompt(ConsciousnessState::Perceive), &stim, &TrustTier::self_(), None).await;
         assert!(p.contains_key("cove-read") && !p.contains_key("cove-trading"));
         assert_eq!(p["cove-read"]["headers"]["Authorization"], "Bearer cove-tok", "token injected, not in agent ctx");
 
         // Express: read but NEVER trading.
-        let (e, _) = harness.assemble_mcp_servers(&prompt(ConsciousnessState::Express), &stim, &TrustTier::self_(), None).await;
+        let (e, _, _) = harness.assemble_mcp_servers(&prompt(ConsciousnessState::Express), &stim, &TrustTier::self_(), None).await;
         assert!(e.contains_key("cove-read") && !e.contains_key("cove-trading"), "trading never in Express");
 
         // Settle: trading IS exposed (the only state that reaches it).
-        let (s, _) = harness.assemble_mcp_servers(&prompt(ConsciousnessState::Settle), &stim, &TrustTier::self_(), None).await;
+        let (s, _, _) = harness.assemble_mcp_servers(&prompt(ConsciousnessState::Settle), &stim, &TrustTier::self_(), None).await;
         assert!(s.contains_key("cove-trading") && s.contains_key("cove-read"));
 
         std::env::remove_var("DACK_COVE_TEST");
@@ -4004,7 +4056,7 @@ mod tests {
             id: "p".into(), state: ConsciousnessState::Perceive,
             mcp: vec![inline(), McpRef::Import("cove-read".into())], transitions: vec![], model: None, session: None, reply_key: None, context: None, parallel: false, system_frame: String::new(), body: String::new(), resume_body: None,
         };
-        let (servers, inline_read) = harness.assemble_mcp_servers(&open, &stim, &TrustTier::self_(), None).await;
+        let (servers, inline_read, _) = harness.assemble_mcp_servers(&open, &stim, &TrustTier::self_(), None).await;
         assert!(servers.contains_key("rootai"), "inline admitted on an open tier");
         assert_eq!(servers["rootai"]["type"], "http");
         assert!(servers["rootai"]["headers"].as_object().unwrap().is_empty(), "inline carries NO secret");
@@ -4017,7 +4069,7 @@ mod tests {
             id: "e".into(), state: ConsciousnessState::Express,
             mcp: vec![inline()], transitions: vec![], model: None, session: None, reply_key: None, context: None, parallel: false, system_frame: String::new(), body: String::new(), resume_body: None,
         };
-        let (servers, inline_read) = harness.assemble_mcp_servers(&locked, &stim, &TrustTier::self_(), None).await;
+        let (servers, inline_read, _) = harness.assemble_mcp_servers(&locked, &stim, &TrustTier::self_(), None).await;
         assert!(servers.is_empty() && inline_read.is_empty(), "no self-plug on a locked tier");
 
         std::fs::remove_dir_all(&tmp).ok();
@@ -4068,17 +4120,100 @@ mod tests {
             mcp: vec![McpRef::Import("telegram".into())], transitions: vec![], model: None, session: None, reply_key: None, context: None, parallel: false, system_frame: String::new(), body: String::new(), resume_body: None,
         };
 
-        // public cycle (rank 0) < org (rank 1) → telegram WITHHELD.
-        let (servers, _) = harness.assemble_mcp_servers(&express, &stim, &TrustTier::public(), None).await;
+        // public cycle (rank 0) < org (rank 1) → telegram WITHHELD. And because the stimulus' ENTRY
+        // trust (directive_tier=self) WOULD have cleared org, this is a taint DEGRADATION → announced.
+        let (servers, _, unavail) = harness.assemble_mcp_servers(&express, &stim, &TrustTier::public(), None).await;
         assert!(!servers.contains_key("telegram"), "min_trust:org is denied to a public cycle");
-        // org cycle (rank 1) == org → admitted.
-        let (servers, _) = harness.assemble_mcp_servers(&express, &stim, &TrustTier("org".into()), None).await;
+        assert_eq!(unavail.len(), 1, "the degraded-away server is announced");
+        assert_eq!(unavail[0].name, "telegram");
+        assert!(unavail[0].reason.contains("lost to taint"), "reason names the degradation: {}", unavail[0].reason);
+        // org cycle (rank 1) == org → admitted, nothing degraded/announced.
+        let (servers, _, unavail) = harness.assemble_mcp_servers(&express, &stim, &TrustTier("org".into()), None).await;
         assert!(servers.contains_key("telegram"), "min_trust:org is admitted to an org cycle");
+        assert!(unavail.is_empty(), "an admitted server is not announced unavailable");
         // self cycle (rank 2) > org → a higher-trust cycle also clears it.
-        let (servers, _) = harness.assemble_mcp_servers(&express, &stim, &TrustTier::self_(), None).await;
+        let (servers, _, unavail) = harness.assemble_mcp_servers(&express, &stim, &TrustTier::self_(), None).await;
         assert!(servers.contains_key("telegram"), "a higher-trust (self) cycle clears min_trust:org");
+        assert!(unavail.is_empty());
 
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A `min_trust` server the cycle's ENTRY trust never could reach is a STATIC authoring choice, not
+    /// a degradation — so it is silently withheld, NOT announced (no per-cycle `unavailable` noise on a
+    /// prompt that lists higher-trust servers a low-trust entry was never going to get).
+    #[tokio::test]
+    async fn static_min_trust_mismatch_is_not_announced() {
+        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::queue::InMemoryQueue;
+        use crate::repo::git::PlainGitRepo;
+        use crate::runlog::sqlite::SqliteRunLog;
+        use std::collections::HashMap;
+
+        let config = Arc::new(
+            DackConfig::from_yaml(
+                "operator_did: \"did:x\"\n\
+                 trust_tiers:\n  - { name: public, reaches: express }\n  - { name: org, reaches: settle }\n  \
+                   - { name: self, reaches: reflect }\n  - { name: operator_signed, reaches: reflect }\n\
+                 tier_policy:\n  express: { mcp_whitelist: true, import: [telegram] }\n\
+                 mcp_servers:\n  \
+                   - name: telegram\n    transport: { type: stdio, command: bun, args: [run, t.ts] }\n    tier: post\n    min_trust: org\n",
+            )
+            .unwrap(),
+        );
+        let queue: Arc<dyn Queue> = Arc::new(InMemoryQueue::new());
+        let tmp = std::env::temp_dir().join(format!("dack-staticmt-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).ok();
+        let harness = Harness {
+            config: config.clone(),
+            queue: queue.clone(),
+            bus: Arc::new(Bus::new(config.clone(), queue.clone())),
+            runtime: Arc::new(RecordingRuntime { seen: std::sync::Mutex::new(Vec::new()), out: perceive_output(), usage: None }),
+            repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
+            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
+            broker: Arc::new(SecretsBroker::new_test(vec![])),
+            sessions: Default::default(),
+            mem_lock: Default::default(),
+        };
+        // ENTRY trust = public (a stranger cycle), and telegram needs org → the entry never could reach
+        // it, so it's static, not a degradation.
+        let mut stim = poisoned_stimulus();
+        stim.directive_tier = TrustTier::public();
+        let express = StatePrompt {
+            id: "e".into(), state: ConsciousnessState::Express,
+            mcp: vec![McpRef::Import("telegram".into())], transitions: vec![], model: None, session: None, reply_key: None, context: None, parallel: false, system_frame: String::new(), body: String::new(), resume_body: None,
+        };
+        let (servers, _, unavail) = harness.assemble_mcp_servers(&express, &stim, &TrustTier::public(), None).await;
+        assert!(!servers.contains_key("telegram"));
+        assert!(unavail.is_empty(), "a statically-out-of-reach server is withheld silently, not announced");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The `orientation` block names unavailable servers with their reason + a do-not-guess guard, and
+    /// omits the line entirely when nothing is missing (no per-cycle noise).
+    #[test]
+    fn orientation_block_announces_unavailable_mcps() {
+        use std::path::Path;
+        let p = StatePrompt {
+            id: "cove/perceive_trade".into(), state: ConsciousnessState::Perceive,
+            mcp: vec![], transitions: vec![], model: None, session: None, reply_key: None,
+            context: None, parallel: false, system_frame: String::new(), body: String::new(), resume_body: None,
+        };
+        let servers: BTreeMap<String, serde_json::Value> =
+            BTreeMap::from([("recall".to_string(), serde_json::json!({}))]);
+
+        // Nothing missing → no unavailable line at all.
+        let clean = orientation_block(&p, Path::new("/soul"), &servers, &[], &TrustTier::self_(), ConsciousnessState::Reflect);
+        assert!(clean.body.contains("capabilities_this_step: mcp__recall__*"));
+        assert!(!clean.body.contains("unavailable_this_step"), "no line when nothing is missing");
+
+        // A missing server → named with its reason + the do-not-invent-names guard, trusted.
+        let un = vec![UnavailableMcp { name: "cove-read".into(), reason: "connection failed".into() }];
+        let flagged = orientation_block(&p, Path::new("/soul"), &servers, &un, &TrustTier::self_(), ConsciousnessState::Reflect);
+        assert!(flagged.body.contains("unavailable_this_step: cove-read (connection failed)"), "{}", flagged.body);
+        assert!(flagged.body.contains("do NOT attempt"));
+        assert!(flagged.trusted, "orientation is harness-authored/trusted");
     }
 
     /// Reply targeting (firebreak): `resolve_scope_override` returns the in-batch item a `reply_to`
@@ -4151,19 +4286,19 @@ mod tests {
         };
 
         // No override → the top-level latest (message_id 20).
-        let (s, _) = harness.assemble_mcp_servers(&express, &stim, &TrustTier::self_(), None).await;
+        let (s, _, _) = harness.assemble_mcp_servers(&express, &stim, &TrustTier::self_(), None).await;
         assert_eq!(s["telegram"]["env"]["TELEGRAM_REPLY_TO"], "20");
         assert_eq!(s["telegram"]["env"]["TELEGRAM_REPLY_CHAT"], "7");
 
         // Override to the FIRST message → reply targets 10; chat stays 7.
         let item = serde_json::json!({ "chat_id": 7, "message_id": 10 });
-        let (s, _) = harness.assemble_mcp_servers(&express, &stim, &TrustTier::self_(), Some(&item)).await;
+        let (s, _, _) = harness.assemble_mcp_servers(&express, &stim, &TrustTier::self_(), Some(&item)).await;
         assert_eq!(s["telegram"]["env"]["TELEGRAM_REPLY_TO"], "10", "per-baton: the selected message");
         assert_eq!(s["telegram"]["env"]["TELEGRAM_REPLY_CHAT"], "7");
 
         // Per-field fallback: a partial item (only message_id) → chat_id falls back to the top-level.
         let partial = serde_json::json!({ "message_id": 10 });
-        let (s, _) = harness.assemble_mcp_servers(&express, &stim, &TrustTier::self_(), Some(&partial)).await;
+        let (s, _, _) = harness.assemble_mcp_servers(&express, &stim, &TrustTier::self_(), Some(&partial)).await;
         assert_eq!(s["telegram"]["env"]["TELEGRAM_REPLY_TO"], "10");
         assert_eq!(s["telegram"]["env"]["TELEGRAM_REPLY_CHAT"], "7", "chat_id falls back to top-level");
 
@@ -4214,13 +4349,13 @@ mod tests {
         // dedup_key set → RECALL_TAG carries the conversation tag (recall public → cycle stays public).
         let mut stim = poisoned_stimulus();
         stim.dedup_key = Some("chat-7".into());
-        let (s, _) = harness.assemble_mcp_servers(&perceive, &stim, &TrustTier::public(), None).await;
+        let (s, _, _) = harness.assemble_mcp_servers(&perceive, &stim, &TrustTier::public(), None).await;
         assert_eq!(s["recall"]["env"]["RECALL_TAG"], "chat-7");
 
         // No dedup_key → the var is simply unset (recall_conversation will report no tag in scope).
         let mut bare = poisoned_stimulus();
         bare.dedup_key = None;
-        let (s, _) = harness.assemble_mcp_servers(&perceive, &bare, &TrustTier::public(), None).await;
+        let (s, _, _) = harness.assemble_mcp_servers(&perceive, &bare, &TrustTier::public(), None).await;
         assert!(s["recall"]["env"].get("RECALL_TAG").is_none(), "no conversation key → RECALL_TAG unset");
 
         std::fs::remove_dir_all(&tmp).ok();

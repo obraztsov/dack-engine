@@ -122,6 +122,9 @@ pub struct HealthSnapshot {
     pub duties: Vec<DutyInfo>,
     pub secrets: BTreeMap<String, SecretHealth>,
     pub stimuli: BTreeMap<String, StimulusHealth>,
+    /// `#[serde(default)]` so a snapshot persisted by an OLDER binary (no `mcp` field) still
+    /// deserializes — `dack status` must never fail to read an in-flight/old `dack.health.json`.
+    #[serde(default)]
     pub mcp: BTreeMap<String, McpHealth>,
     pub cycles_ok: u64,
     pub cycles_err: u64,
@@ -480,5 +483,15 @@ mod tests {
         assert!(out.contains("Secrets: all ok — cove_read, x"), "{out}"); // BTreeMap ⇒ sorted
         assert!(out.contains("MCP servers: all connecting — cove-read, recall"), "{out}");
         assert!(!out.contains("FAILING"), "{out}");
+    }
+
+    /// Forward-compat: a `dack.health.json` persisted by an OLDER binary (before the `mcp` field
+    /// existed) must still deserialize — `dack status` reads it during the restart window.
+    #[test]
+    fn snapshot_without_mcp_field_still_deserializes() {
+        let json = r#"{"duties":[],"secrets":{},"stimuli":{},"cycles_ok":1,"cycles_err":0,"booted_at":0}"#;
+        let snap: HealthSnapshot = serde_json::from_str(json).unwrap();
+        assert!(snap.mcp.is_empty());
+        assert_eq!(snap.cycles_ok, 1);
     }
 }

@@ -231,5 +231,5 @@ async function runQuery(
       )
     }
   }
-  return { finalText, sessionId, usage }
+  return { finalText, sessionId, usage, mcpStatus }
 }

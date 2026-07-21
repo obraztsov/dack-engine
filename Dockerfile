@@ -36,6 +36,11 @@ RUN apt-get update \
        git openssh-client python3 bubblewrap socat ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 
+# The per-duck volume (soul repo + nested runlog repo) is owned by the HOST user (uid 1000), but the
+# container runs as root → git refuses it as "dubious ownership", breaking the soul tripwire + push.
+# The container is the isolation boundary and every repo under /duck is the duck's own, so trust them.
+RUN git config --system --add safe.directory '*'
+
 # The harness binary → on PATH.
 COPY --from=build /build/target/release/dack /usr/local/bin/dack
 

@@ -1,0 +1,33 @@
+# The image is CODE ONLY. Keep the build context lean and, critically, keep all per-duck STATE and
+# SECRETS out of it (never bake config/secrets/soul into a shared image).
+
+# Per-duck state (lives in the bind-mounted /duck volume, never the image):
+dack-soul/
+soul-template/
+secrets/
+identities/
+dack.config.yaml
+dack.config.example.yaml
+telegram-ingress.config.json
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+dack.health.json
+
+# Build artifacts + wrong-arch installs (stage 1 rebuilds; bun re-installs linux node_modules):
+target/
+**/node_modules/
+openclaude-0.18.0/
+
+# Repo cruft irrelevant to the build:
+.git/
+.gitignore
+.idea/
+.claude/
+.DS_Store
+docs/
+examples/
+*.md
+Dockerfile*
+.dockerignore
+Makefile

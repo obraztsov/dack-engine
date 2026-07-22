@@ -43,6 +43,12 @@ type Cfg = {
   pub_path: string
   // Trusted/known groups: chat_id (as a string key) → the webhook path its members route to.
   groups: Record<string, string>
+  // OPT-IN chat-type split (both fall back to `pub_path` when unset — so an existing single-webhook
+  // config is unchanged). A non-operator PRIVATE chat → `dm_path` (e.g. the pond client/DM prompt); a
+  // non-trusted GROUP/supergroup → `group_path`. Lets private clients and public groups get different
+  // prompts + MCP sets while staying the same `public` tier.
+  dm_path?: string
+  group_path?: string
 }
 function loadConfig(): Cfg {
   const def: Cfg = {
@@ -57,11 +63,20 @@ function loadConfig(): Cfg {
   return raw ? { ...def, ...JSON.parse(raw) } : def
 }
 
-/** Resolve a message's webhook path by sender precedence: operator → trusted group → public. */
-function routeFor(cfg: Cfg, fromId: number | null, chatId: number): { path: string; why: string } {
+/** Resolve a message's webhook path by precedence: operator → trusted group → chat-type split → public.
+ *  `chatType` is Telegram's `chat.type` (`private` | `group` | `supergroup` | `channel`). */
+function routeFor(
+  cfg: Cfg,
+  fromId: number | null,
+  chatId: number,
+  chatType: string,
+): { path: string; why: string } {
   if (cfg.operator_user_id != null && fromId === cfg.operator_user_id) return { path: cfg.op_path, why: 'OP→org' }
   const group = cfg.groups[String(chatId)]
-  if (group) return { path: group, why: `group→${group}` }
+  if (group) return { path: group, why: `group→${group}` } // an explicitly trusted group wins
+  // OPT-IN chat-type split (unset → falls through to pub_path, the current single-webhook behavior).
+  if (chatType === 'private' && cfg.dm_path) return { path: cfg.dm_path, why: 'dm' }
+  if (chatType !== 'private' && cfg.group_path) return { path: cfg.group_path, why: 'group' }
   return { path: cfg.pub_path, why: 'pub' }
 }
 
@@ -71,7 +86,7 @@ const bot = new Bot(loadToken())
 bot.on('message', async (ctx) => {
   const m = ctx.message
   const fromId = m.from?.id ?? null
-  const { path, why } = routeFor(cfg, fromId, m.chat.id)
+  const { path, why } = routeFor(cfg, fromId, m.chat.id, m.chat.type)
   // When the user ACTUALLY sent this message (Telegram `m.date`, unix seconds) → a readable UTC
   // string the model can compare against its `now` block. A coalesced wake keeps each message's
   // `sent_at` in `items[]`, so the model can tell messages that arrived WHILE it was thinking/replying

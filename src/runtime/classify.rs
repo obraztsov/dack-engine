@@ -41,11 +41,15 @@ pub fn classify_tool(
         (read_tools, ToolClass::Read),
     ] {
         if let Some(cp) = prefixes.iter().find(|cp| tool.starts_with(cp.prefix.as_str())) {
+            let bare = &tool[cp.prefix.len()..];
             if !cp.tools.is_empty() {
-                let bare = &tool[cp.prefix.len()..];
+                // WHITELIST (fail-closed) wins: only listed tools admitted.
                 if !cp.tools.iter().any(|t| t == bare) {
                     return (ToolClass::Other, None); // whitelisted server, tool not on the list.
                 }
+            } else if cp.banned_tools.iter().any(|t| t == bare) {
+                // BLACKLIST (fail-open): consulted only when no whitelist; a banned tool is denied.
+                return (ToolClass::Other, None);
             }
             return (class, None);
         }
@@ -198,6 +202,7 @@ mod tests {
         let read = vec![CapabilityPrefix {
             prefix: "mcp__cove-read__".into(),
             tools: vec!["get_balance".into(), "scan_trending_tokens".into()],
+            banned_tools: vec![],
         }];
         let post = post();
         let settle = settle();
@@ -208,6 +213,43 @@ mod tests {
         assert_eq!(
             classify_tool("mcp__cove-read__buy_token", &json!({}), &settle, &post, &read).0,
             ToolClass::Other // fail-closed: not on the allowlist → denied, never Read.
+        );
+    }
+
+    /// `banned_tools` (blacklist): consulted ONLY when no `tools` whitelist — admits the whole surface
+    /// EXCEPT the banned names (fail-open), and a whitelist still takes precedence over it.
+    #[test]
+    fn banned_tools_blacklist_admits_all_but_the_banned() {
+        let post = post();
+        let read = vec![];
+        // A settle-tier server (e.g. a trading MCP) with a blacklist: everything is SettleTx except the banned tool.
+        let settle = vec![CapabilityPrefix {
+            prefix: "mcp__bunnyos__".into(),
+            tools: vec![],
+            banned_tools: vec!["drain_wallet".into()],
+        }];
+        assert_eq!(
+            classify_tool("mcp__bunnyos__swap", &json!({}), &settle, &post, &read).0,
+            ToolClass::SettleTx // not banned → admitted at the server's tier (fail-open).
+        );
+        assert_eq!(
+            classify_tool("mcp__bunnyos__new_upstream_tool", &json!({}), &settle, &post, &read).0,
+            ToolClass::SettleTx // fail-OPEN: an unlisted tool is admitted (the blacklist tradeoff).
+        );
+        assert_eq!(
+            classify_tool("mcp__bunnyos__drain_wallet", &json!({}), &settle, &post, &read).0,
+            ToolClass::Other // banned → denied.
+        );
+
+        // Whitelist wins over blacklist when BOTH are set (whitelist is fail-closed).
+        let both = vec![CapabilityPrefix {
+            prefix: "mcp__bunnyos__".into(),
+            tools: vec!["swap".into()],
+            banned_tools: vec!["swap".into()],
+        }];
+        assert_eq!(
+            classify_tool("mcp__bunnyos__swap", &json!({}), &both, &post, &read).0,
+            ToolClass::SettleTx // whitelist admits it; banned_tools ignored when tools is set.
         );
     }
 

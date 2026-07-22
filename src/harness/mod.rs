@@ -1368,6 +1368,7 @@ impl Harness {
                         auth: None,
                         tier: CapabilityTier::Read,
                         tools: Vec::new(),
+                        banned_tools: Vec::new(),
                         // Inline = 3rd-party; it taints `public` at access time (it isn't in the
                         // registry, so `accessed_trust` falls through to public regardless).
                         trust: TrustTier::public(),
@@ -3811,6 +3812,7 @@ mod tests {
             auth: Some(McpAuth { secret: "cove_read".into(), key: None, header: None, scheme: None, env: None }),
             tier: CapabilityTier::Read,
             tools: vec![],
+            banned_tools: vec![],
             trust: TrustTier::self_(),
             min_trust: None,
             scope_env: std::collections::BTreeMap::new(),
@@ -3837,6 +3839,7 @@ mod tests {
             }),
             tier: CapabilityTier::Read,
             tools: vec![],
+            banned_tools: vec![],
             trust: TrustTier::public(),
             min_trust: None,
             scope_env: std::collections::BTreeMap::new(),
@@ -3872,6 +3875,7 @@ mod tests {
             auth: Some(McpAuth { secret: "x".into(), key: None, header: None, scheme: None, env: Some("X_BEARER_TOKEN".into()) }),
             tier: CapabilityTier::Post,
             tools: vec![],
+            banned_tools: vec![],
             trust: TrustTier::public(),
             min_trust: None,
             scope_env: std::collections::BTreeMap::from([("TELEGRAM_REPLY_CHAT".into(), "chat_id".into())]),

@@ -641,6 +641,7 @@ mod tests {
         r.read_tools = vec![CapabilityPrefix {
             prefix: "mcp__cove-read__".into(),
             tools: vec!["get_balance".into(), "scan_trending_tokens".into()],
+            banned_tools: vec![],
         }];
         assert!(matches!(
             r.decide(&req("mcp__cove-read__get_balance", json!({}))).await,

@@ -346,6 +346,13 @@ pub struct McpServerConfig {
     /// the `cove-trading` (settle-tier) sibling. Empty = expose everything the server provides.
     #[serde(default)]
     pub tools: Vec<String>,
+    /// **Blacklist** (alternative to `tools`): admit the server's whole surface EXCEPT these tools.
+    /// Precedence — `tools` (whitelist, fail-CLOSED) wins if set; else `banned_tools` (blacklist,
+    /// fail-OPEN: a NEW tool the server adds upstream is auto-admitted at this server's `tier`); else
+    /// (both empty) admit everything. Spares enumerating a large trusted surface; for irreversible
+    /// (settle) servers prefer the fail-closed `tools` whitelist. Bare tool names (no `mcp__…__`).
+    #[serde(default)]
+    pub banned_tools: Vec<String>,
     /// **Trust tier** of the data this server puts in play (the taint model — distinct from the
     /// capability `tier` above). Actually *calling* a tool from this server degrades the cycle's
     /// trust to (at most) this tier, capping how far the chain may then walk: e.g. `rootai`
@@ -795,14 +802,18 @@ pub struct ModuleConfig {
 #[derive(Debug, Clone)]
 pub struct CapabilityPrefix {
     pub prefix: String,
+    /// Whitelist (fail-closed): if non-empty, ONLY these bare tool names match this prefix.
     pub tools: Vec<String>,
+    /// Blacklist (fail-open): consulted ONLY when `tools` is empty — these bare tool names are denied,
+    /// everything else under the prefix is admitted.
+    pub banned_tools: Vec<String>,
 }
 
 impl CapabilityPrefix {
-    /// A prefix with no tool allowlist (explicit `post_tools`/`settle_tools` entries, or a server
-    /// that exposes its full surface).
+    /// A prefix with no tool allow/deny-list (explicit `post_tools`/`settle_tools` entries, or a
+    /// server that exposes its full surface).
     pub fn open(prefix: impl Into<String>) -> Self {
-        Self { prefix: prefix.into(), tools: Vec::new() }
+        Self { prefix: prefix.into(), tools: Vec::new(), banned_tools: Vec::new() }
     }
 }
 
@@ -1019,6 +1030,7 @@ impl DackConfig {
             let cp = CapabilityPrefix {
                 prefix: format!("mcp__{}__", s.name),
                 tools: s.tools.clone(),
+                banned_tools: s.banned_tools.clone(),
             };
             match s.tier {
                 CapabilityTier::Read => p.read.push(cp),

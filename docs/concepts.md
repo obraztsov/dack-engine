@@ -16,6 +16,12 @@ YAML frontmatter declaring its `state`, the MCP capabilities it requests, and wh
 transition to. A cycle walks from one state-prompt to the next, picking exactly one allowed transition
 per step (or terminating). See [authoring souls](authoring-souls.md).
 
+The harness can run up to `max_concurrent_cycles` cycles at once (config, default `1` = serial). With
+concurrency on, work on **different** threads (chats) runs in parallel while work on the **same** thread
+stays strictly ordered, and any cycle that writes memory or the soul (settle, reflect, digest) runs
+exclusively — a chat never processes out of order and a writer is never raced. See
+[architecture](architecture.md#concurrency).
+
 ## The four consciousness states
 
 The states form a one-way **reversibility ladder** — each rung admits strictly more dangerous
@@ -35,7 +41,8 @@ only in certain states:
 - **FileWrite** — the single Write/Edit tool. The *path* decides what it touches: `memory/`
   (long-term memory) is writable in Express/Settle but only by a sufficiently-trusted cycle (see
   [Memory](#memory-short-term-vs-long-term) below); the soul's own directories (`prompts/`, `skills/`,
-  sensors) are writable only in Reflect. The harness-authored `runlogs/` are never agent-writable.
+  sensors) — plus `protected_memory_paths` like `memory/INDEX.md` — are writable only in Reflect. The
+  runlog is a harness-authored SQLite store and is never agent-writable at all.
 - **Post** — a reversible capability MCP tool (e.g. `mcp__twitter__post`). Express only.
 - **SettleTx** — an irreversible capability MCP tool. Settle only.
 - **Shell** — raw Bash/REPL. Denied in every consciousness state (it would bypass the path gate). Real
@@ -96,21 +103,26 @@ untrusted stimulus (`public`), to be judged like any other input — never as a 
 
 The agent has two memories, mirroring a mind:
 
-- **Short-term — the runlog.** The harness writes one append-only record per cycle to `runlogs/<date>.md`
-  (a separate, private store). It ages off (a configurable retention window, e.g. ~10 days). The agent
-  never reads or writes these files directly — it reaches them only through **recall** tools (so a
-  fresh or context-evicted session can reconstruct what just happened). Alongside the entries is a
-  **tag-notes catalogue**: short "sticky notes" the agent leaves about a conversation as it goes
-  (`{tag, note}`), which the harness stamps with the writing cycle's **trust** (unfakeable provenance —
-  a public chat's note is `public`, a trusted cycle's is `self`).
+- **Short-term — the runlog.** The harness writes one append-only record per cycle to a single
+  SQLite+FTS5 database `runlogs.sqlite` (config `runlog_db`), which lives **outside** the soul in the
+  harness working dir. It ages off via a hard GC after `runlog_retention_days` (default `10`). The agent
+  can **never** write it and never reads it directly — it reaches it only through **recall** tools (so a
+  fresh or context-evicted session can reconstruct what just happened). Alongside the entries is a typed
+  **tag-notes catalogue**: short "sticky notes" (`kind = memory | digest`, each with one or more tags)
+  the agent leaves about a conversation as it goes, which the harness stamps with the writing cycle's
+  **trust** (unfakeable provenance — a public chat's note is `public`, a trusted cycle's is `self`).
+  Entries and notes also carry a **channel auto-tag** (e.g. `telegram`, `twitter`) that routes them to
+  the right digest.
 
 - **Long-term — `memory/`.** Durable knowledge: who people are, lasting context, the agent's own notes
   to itself. It is **trust-gated**: only a cycle at or above `memory_write_min_trust` (default `org`)
   may write `memory/`. An untrusted in-run cycle therefore cannot launder a note into long-term memory;
-  it can only leave a short-term, trust-stamped tag-note.
+  it can only leave a short-term, trust-stamped tag-note. A few `protected_memory_paths` (e.g.
+  `memory/INDEX.md`, which is injected into every context) are writable **only in Reflect** — a
+  non-Reflect rewrite of an injected file would be an injection surface, so the wall denies it.
 
-Two recall surfaces let the model navigate its own history, and the *choice between them is a trust
-decision the model makes*:
+Two recall surfaces (the `recall-mcp/` servers) let the model navigate its own history, and the *choice
+between them is a trust decision the model makes*:
 
 - **`recall`** returns the verbatim transcript (incl. others' words). Reading it taints the cycle
   `public` — raw untrusted text crossing back in.

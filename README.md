@@ -55,7 +55,8 @@ Full walkthrough: **[docs/getting-started.md](docs/getting-started.md)**.
 | [Capabilities](docs/capabilities.md) | Give the agent tools (MCP servers) |
 | [Channels](docs/channels.md) | Connect Telegram or another live channel |
 | [Workers](docs/workers.md) | Delegated, sandboxed subagents |
-| [Operations](docs/operations.md) | Daemon lifecycle, signed soul repos, identities |
+| [Operations](docs/operations.md) | Daemon lifecycle, soul repos, identities, health |
+| [Deployment](docs/deployment.md) | Containerized + multi-duck (image = code, per-duck volume) |
 | [Secrets & sandbox](docs/secrets-and-sandbox.md) | The secret + isolation model |
 
 Design rationale lives inline in the code's module doc comments (`src/`) and across the
@@ -72,9 +73,12 @@ in production it's a separate, signed repo).
 
 ## Status
 
-The harness is functional: the full ingestion → consciousness loop runs, with the trust/state model,
-MCP capabilities, channels (Telegram), delegated workers, and a signed soul repo. The runtime is wired
-for OpenClaude over an OpenAI-compatible gateway; the engine/connector are an extensibility seam.
+The harness is functional and runs in production: the full ingestion → consciousness loop, the
+trust/state model, MCP capabilities, channels (Telegram/X), delegated workers, and a signed soul repo.
+It is **multithreaded** (independent conversations process concurrently; a conversation and any
+memory-writing cycle serialize), keeps short-term memory in a **SQLite** runlog, and ships a
+**containerized, multi-duck** deployment (one image, a directory per duck). The runtime is wired for
+OpenClaude over any OpenAI-compatible endpoint; the engine/connector are an extensibility seam.
 
 ## License
 

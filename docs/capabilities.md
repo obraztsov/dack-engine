@@ -73,6 +73,11 @@ are the trusted side of the firebreak and so don't taint. A digest job calls `re
 history and *still* write long-term memory; calling `recall` in the same cycle would degrade it to
 `public` and forfeit that. The label is the contract — choosing which server to call is a trust decision.
 
+The same split recurs across the X surface: `twitter-read` (`trust: public`) returns tweet text and so
+taints, while its sibling `twitter-graph` (`trust: self`) returns only structured follower/following
+records (`{id, username, name}` — no bio or tweet text to smuggle an injection), so the `twitter-digest`
+job can read the duck's own social graph and *still* write long-term memory in the same cycle.
+
 ## Authorization (`min_trust`)
 
 Set `min_trust` to require a floor of caller trust. The server is only assembled for a cycle whose
@@ -82,6 +87,16 @@ Set `min_trust` to require a floor of caller trust. The server is only assembled
 - available to an `org`/`self`/`operator_signed` cycle,
 - withheld from a `public` cycle,
 - **lost mid-cycle** if an `org` cycle reads public data and degrades — the firebreak, for free.
+
+## When a declared capability isn't there (`unavailable_this_step`)
+
+A server a state-prompt requested can be *absent this cycle* for a few reasons: its auth secret is dead
+(fail-closed — no token, no half-authed server), taint took it away (`min_trust` above the cycle's
+post-taint trust), or a remote MCP **failed to connect** last time. Rather than leave the model to
+guess at missing tools, the harness names each one — with its reason — on the orientation block's
+`unavailable_this_step:` line (so it's TOLD e.g. `cove-read (connection failed) — treat as down`, not
+left confabulating tool names against an empty toolset). Connect-failures are also recorded in health,
+surfaced by `dack status` and the Reflect `subconscious-health` block.
 
 ## Locking a capability to per-cycle data (`scope_env`)
 
@@ -99,6 +114,16 @@ an argument. The canonical use is destination-locking a reply:
 The harness reads `chat_id`/`message_id` from the waking stimulus and injects them; the reply tool takes
 only `text`. A prompt-injected message cannot redirect the reply anywhere else, because there is no
 destination argument to hijack.
+
+This is the general **destination-lock** primitive, and it generalizes past replies to **tenant
+isolation**. The harness always resolves the field from *trusted, harness-held* data — the stimulus
+payload (or a validated in-batch item), **never** the model's baton — and injects it into the MCP's
+env; the tool exposes no matching argument, so the model can't set the target. Fail-closed: a missing
+field means the env var is absent and the MCP refuses. For a per-user "pond" / tenant MCP,
+`scope_env: { POND_OWNER: from_user_id }` makes every tool self-scope to the authenticated caller — a
+prompt-injection ("act on user X's resources") has no target argument to hijack. Lock on
+`from_user_id` (the Telegram-authenticated person, not forgeable from message text), **not** `chat_id`
+— a group chat is shared.
 
 ## Limiting an endpoint's surface (`tools`)
 
@@ -119,6 +144,38 @@ under the prefix that isn't in the allowlist, fail-closed.
   tier: settle
   trust: self
   tools: [buy_token, sell_token]                        # writes only, settle-gated
+```
+
+## A blacklist instead (`banned_tools`)
+
+`banned_tools:` is the inverse of `tools:` on the same entry — admit the server's *whole* surface
+**except** the named tools, rather than admitting *only* the named ones. There is one classification
+point (`src/runtime/classify.rs`) and a fixed precedence:
+
+- `tools` set → **whitelist, fail-closed**: only the listed bare names are admitted; an unknown or a
+  newly-added upstream tool is **denied**.
+- else `banned_tools` set → **blacklist, fail-open**: everything is admitted at the server's `tier`
+  *except* the named ones — so a brand-new upstream tool is **auto-admitted**.
+- neither set → the whole surface is admitted.
+
+Reach for `banned_tools` to plug a large **trusted** server without enumerating every tool (ban the
+one or two you don't want). For an irreversible / `settle` (money) server, prefer the fail-closed
+`tools` whitelist — a fail-open blacklist would auto-admit a brand-new trade tool the moment the
+provider ships it. Both filter **within the server's single `tier`**: to give reads and trades
+*different* tiers you still use two entries (the `cove-read` / `cove-trading` pattern above), not a
+blacklist.
+
+> This is the **wall's call-time authorization**, not a menu edit. The SDK still *announces* every
+> connected tool to the model, so a banned tool is **visible** in the toolset — the wall just denies
+> it when called. Banned means uncallable, not invisible.
+
+```yaml
+- name: toolbox              # a large trusted server — admit everything but the destructive tool
+  transport: { type: http, url: "https://toolbox.example/mcp" }
+  auth: { secret: toolbox }
+  tier: read
+  trust: self
+  banned_tools: [wipe_all]   # fail-open: any NEW upstream tool is auto-admitted at read tier
 ```
 
 ## Tokens (secrets providers)
@@ -176,7 +233,7 @@ dry_run:
 
 ## Adding a capability — checklist
 
-1. Add an `mcp_servers` entry (name, transport, tier, trust, optional `tools`/`min_trust`/`scope_env`).
+1. Add an `mcp_servers` entry (name, transport, tier, trust, optional `tools`/`banned_tools`/`min_trust`/`scope_env`).
 2. Add an `auth.secret` + a `secrets_providers` entry if it needs a token.
 3. Add the server name to the relevant `tier_policy.<state>.import`.
 4. Have a state-prompt request it in its `mcp:` frontmatter.

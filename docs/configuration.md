@@ -12,7 +12,7 @@ The only required field is `operator_did`. Everything else has a safe default.
 ```yaml
 operator_did: "did:key:z6Mk…"
 runtime:
-  connector: { type: opengateway, api_url: "https://gateway.example/v1", api_key: "…" }
+  connector: { type: openai-compatible, api_url: "https://gateway.example/v1", api_key: "…" }
   model: "your-model-id"
 ```
 
@@ -54,7 +54,8 @@ Each entry:
 | `transport` | object | required | `{ type: stdio, command, args }` (a local process) or `{ type: http, url }` (a remote server). |
 | `auth` | object | none | `{ secret, env?, key?, header?, scheme? }`. `secret` names a `secrets_providers` entry; its token is injected into the server's stdio `env` (named by `env`) or HTTP header (`header`/`scheme`, default `Authorization: Bearer`). The token reaches the server, never the agent context. |
 | `tier` | enum | required | `read` (safe in every state), `post` (Express — reversible), or `settle` (Settle only — irreversible). The wall classifies the server's tools from this. |
-| `tools` | list | `[]` = all | Per-server tool allowlist (bare names). When set, the wall denies any other tool under `mcp__<name>__` fail-closed. Use it to expose a read-only subset of an endpoint that otherwise serves write tools to every token. |
+| `tools` | list | `[]` | Per-server tool **whitelist** (bare names). When set, ONLY these are admitted: the wall denies any other tool under `mcp__<name>__` **fail-closed**. Use it to expose a read-only subset of an endpoint that otherwise serves write tools to every token. |
+| `banned_tools` | list | `[]` | Per-server tool **blacklist** — the alternative to `tools`. **Precedence**: `tools` (whitelist, fail-**closed** — only listed tools admitted) wins if set; else `banned_tools` (blacklist, fail-**open** — everything admitted except these, so a tool the upstream server adds later auto-admits at this server's `tier`); else (both empty) admit everything. Prefer the fail-closed `tools` whitelist for irreversible/settle (money) servers. Both are the wall's **call-time** authorization, not what's announced — the SDK still exposes every connected tool; the wall denies at call time. |
 | `trust` | tier | `self` | The taint label of the *data* this server puts in play. Calling any of its tools degrades the cycle's trust to (at most) this tier. Anything touching the public world must be `trust: public`. |
 | `min_trust` | tier | none | Authorization floor: the server is only assembled for a cycle whose current (post-taint) trust ranks `>=` this tier. A high-trust cycle that degrades mid-walk loses the capability. |
 | `scope_env` | map | `{}` | `{ ENV_VAR: payload_field }`. At assembly the harness reads `payload_field` from the waking stimulus and injects it into this server's env — locking the capability to per-cycle data the model can't supply (e.g. a reply destination). |
@@ -169,9 +170,9 @@ The engine + connector extensibility point. Swapping runtime/provider is one con
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `runtime.engine` | object | `{ type: openclaude, bridge_dir: openclaude-bridge }` | Which agent runtime drives the loop. Only `openclaude` is wired (spawns `bun run bridge.ts`). `bridge_dir` is the bridge project directory. |
-| `runtime.connector` | object | `{ type: opengateway }` | How the engine reaches models. `opengateway` (OpenAI-compatible): `{ api_url, api_key }` → `OPENAI_BASE_URL`/`OPENAI_API_KEY` (both optional; `None` falls back to the harness env). It also sets `CLAUDE_CODE_USE_OPENAI=1`. `anthropic` (`{ api_key }`, native catalog) parses but is **not yet wired**. |
-| `runtime.model` | string | none | The default model id. `tier_policy.<tier>.model` overrides it per state. On `opengateway` the per-state model is routed via the child's `OPENAI_MODEL` env (the SDK rejects a gateway name as `options.model`). |
+| `runtime.engine` | object | `{ type: openclaude, bridge_dir: openclaude-bridge }` | Which agent runtime drives the loop. Only `openclaude` is defined/wired (spawns `bun run bridge.ts`); `bridge_dir` is the bridge project directory. `claude-code` (the Claude Code CLI/SDK directly, for corporate prod) is the documented next variant, not yet wired. |
+| `runtime.connector` | object | `{ type: openai-compatible }` | How the engine reaches models. `openai-compatible` (renamed from `opengateway` — the old `type: opengateway` still parses via a serde alias) is an OpenAI-compatible env shim: `{ api_url, api_key }` → `OPENAI_BASE_URL`/`OPENAI_API_KEY` (both optional; `None` falls back to the harness env), plus it sets `CLAUDE_CODE_USE_OPENAI=1`. Point `api_url` at any OpenAI-compatible endpoint (a hosted gateway, provider-direct, a local vLLM). `anthropic` (`{ api_key }`, native catalog) parses but is a **NotImplemented stub** (`cli::run` rejects it). |
+| `runtime.model` | string | none | The default model id. `tier_policy.<tier>.model` overrides it per state. On `openai-compatible` the per-state model is routed via the child's `OPENAI_MODEL` env (the SDK rejects a gateway name as `options.model`). |
 | `runtime.env` | list | `[OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL, …]` | Extra env-var names forwarded into the runtime bridge (values from the harness env). The connector's own creds are applied on top. |
 
 ### `runtime.worker_sandbox` — Docker isolation for delegated workers
@@ -191,30 +192,35 @@ runs its bridge inside a container.
 
 ## Soul repo & push destinations
 
-The soul is one local git repo (`soul_repo`); `soul_remotes` is the list of places it's pushed after
-each cycle. Backend is inferred per URL — `gitlawb://…` signs a ref-update, anything else is a plain
-`git push`. Each target is best-effort unless `required: true`, so a flaky mirror never blocks a cycle.
+The soul is one local git repo (`soul_repo`); `soul_remotes` is the list of **plain-git** remotes it's
+pushed to after each cycle. There is no other backend — every target is a plain `git push`. Each is
+best-effort unless `required: true`, so a flaky mirror never blocks a cycle.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `soul_repo` | string | `.` | Path to the actor bundle (holds `SOUL.md`, `prompts/`, `stimuli/`, `memory/`, …). |
-| `soul_remotes` | list | `[]` | Push destinations (see entry fields below). Empty ⇒ local-only (commits, no push). |
-| `soul_remote` | string | none | **Legacy** single remote. Still honored — treated as a one-element best-effort `soul_remotes` list. Prefer `soul_remotes`. |
-| `gitlawb_node` | string | `https://node.gitlawb.com` | Default node for any `gitlawb://` entry that omits its own `node:` (and for the legacy `soul_remote`). |
+| `soul_remotes` | list | `[]` | Plain-git push destinations (see entry fields below). Empty ⇒ fall back to the legacy `soul_remote`; if that's unset too, local-only (commits, no push). |
+| `soul_remote` | string | none | **Legacy** single remote (a bare URL string). Still honored — normalized to a one-element best-effort `soul_remotes` list. Prefer `soul_remotes`. |
+| `soul_remote_authority` | bool | `false` | **Remote-authoritative boot reconcile**: when `true`, `dack run` reconciles the local soul with the primary remote at boot — adopt config an operator pushed externally, keep the duck's own local memory — so you reconfigure a duck by pushing + restarting. Always safe (skips a dirty tree; a divergence first snapshots local HEAD to a `pre-sync-<ts>` branch). Default `false` = local-authoritative (no boot fetch). |
+| `soul_local_paths` | list | `["memory/"]` | The duck-OWNED paths kept LOCAL during a `soul_remote_authority` reconcile — everything else is adopted from the remote. |
 | `identities` | object | `{}` | Identity key directories per role: `operator`, `soul`, `builder` (each holds a PKCS8 `identity.pem`). Create with `dack keygen --role <role> --dir <dir>`. The operator key signs `dack say`; the Soul dir attributes soul commits and never enters agent env. |
-| `identities.backend` | `local` \| `gitlawb` | `local` | Signing/DID backend. `local` = native Ed25519, no external tools (reads `identity.pem` directly). `gitlawb` = shell out to the `gl` CLI (requires it on `PATH`). Both derive the same `did:key` from the same key. |
-| `secrets.soul_did_key` | ref | — | Reference to the Soul DID key (resolved by the harness; never forwarded). |
+| `identities.backend` | `local` | `local` | Signing/DID backend — native Ed25519, the only backend: reads `identity.pem` directly and signs in-process, no external tools. Keys are made with `dack keygen`. (The former `gitlawb` backend that shelled out to a `gl` CLI is removed.) |
+| `secrets.soul_did_key` | ref | — | Reference to the Soul DID key (resolved by the harness; never forwarded to the agent). |
 
 ### `soul_remotes[]` — one push destination
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `url` | string | — | The push URL. Scheme selects the backend: `gitlawb://<soul-did>/<repo>` → signed push; `git@…` / `https://…` / local path → plain `git push`. |
-| `kind` | `git` \| `gitlawb` | inferred | Force the backend instead of inferring from `url`. |
-| `required` | bool | `false` | `true` ⇒ a push failure to this target fails the cycle's push step. `false` ⇒ best-effort (logged, retried next cycle). |
-| `node` | string | `gitlawb_node` | gitlawb only — the node this signed push targets. |
-| `identity` | string | `soul` | gitlawb only — which `identities.<role>` key signs the push. |
-| `auth` | object | none | Plain-git HTTPS only — `{ token_env, username }`. `token_env` names an env var in the daemon's environment holding the access token (e.g. a GitHub PAT), injected as an ephemeral credential at push time; never in config, disk, argv, or agent context. `username` defaults to `x-access-token`. SSH remotes need no `auth`. |
+| `url` | string | — | The plain-git push URL — `git@host:…` (SSH), `https://…`, or a local path. Always a plain `git push`. |
+| `required` | bool | `false` | `true` ⇒ a push failure to this target fails the cycle's push step. `false` ⇒ best-effort (logged, re-pushed next cycle). Set `true` on the primary you require to durably persist the soul. |
+| `auth` | object | none | HTTPS token push only — `{ token_env, username? }`. `token_env` names an env var in the **daemon's** environment holding the access token (e.g. a GitHub PAT), injected as an ephemeral git credential at push time; never in config, disk, argv, or agent context. `username` defaults to `x-access-token`. SSH remotes (`git@…`) need no `auth` (the ambient key authenticates). |
+
+```yaml
+soul_remotes:
+  - { url: "git@github.com:you/dack-soul.git", required: true }   # SSH primary
+  - url: "https://github.com/you/dack-soul.git"                   # HTTPS mirror
+    auth: { token_env: GITHUB_TOKEN }                             # PAT from the daemon env
+```
 
 GitHub (or any plain-git host) transport auth is **independent of the soul DID** — the DID is the
 commit author; you authenticate the push with an SSH deploy key (no `auth` needed) or an HTTPS PAT via
@@ -236,10 +242,16 @@ commit author; you authenticate the push with an SSH deploy key (no `auth` neede
 | `webhook_addr` | string | `127.0.0.1:8787` | The localhost bind for the webhook listener. Nothing is public without a proxy. |
 | `invoke_timeout_secs` | int | `300` | Wall-clock budget for one consciousness invocation incl. the wall round-trips. A hung LLM/bridge elapses here. A **zero-completion timeout** (the model did nothing) is then re-scheduled up to 3× with backoff — *unless* the wake already took an outward action (post/trade) or was a Reflect, which fail terminally to avoid a double-effect. |
 | `reflect_invoke_timeout_secs` | int \| null | `null` | Optional **longer** budget (seconds) for a **Reflect** invocation (the daily self-modification cycle — may chew through prompts/skills/memory), e.g. `900` = 15 min. `null` ⇒ Reflect uses `invoke_timeout_secs`. Applies only to Reflect. |
-| `session_max_context_tokens` | int \| null | `null` | Evict a sticky engine session once its model context exceeds this many tokens (the next wake starts fresh) — bounds context bloat. `null` = off (only the idle TTL applies). |
+| `session_max_context_tokens` | int \| null | `null` | Evict a sticky engine session once its model context (input + cache-read tokens) exceeds this many tokens (the next wake starts fresh) — bounds context bloat. `null` = off (only the idle TTL applies). A common setting is `120000`. |
+| `max_concurrent_cycles` | int | `1` | **Multithreading** — the bounded worker-pool size for the dispatch loop. `1` (default) = single-flight, byte-identical to the pre-MT serial behavior. `>1` runs independent wakes in parallel: different chats concurrently, but a same chat still serializes (one in-flight wake per `dedup_key`), and write-lock cycles (settle / reflect / digest) run exclusively. A prompt opts into parallelism with `parallel: true` frontmatter (memory + soul are read-only → it takes a shared read-lock; every other cycle takes the exclusive write-lock). Bound it by the model gateway's rate/cost, not CPU. |
 | `memory_write_min_trust` | string | `org` | Trust floor for writing **long-term `memory/`**. A cycle below this tier is denied the write (it can still leave a short-term tag-note). Keeps untrusted in-run cycles from laundering into long-term memory; the digest jobs run at `self` and clear it. |
-| `tag_notes_max` | int | `200` | Cap on the short-term **tag-notes** catalogue (`runlogs/tag-notes.ndjson`): only the last N notes are kept. |
-| `runlog_retention_days` | int | `10` | **Short-term memory retention**: keep only the last N `runlogs/<date>.md` day-files; older ones are deleted on boot and day-rollover. Also bounds how far back the recall tools can scan. |
+| `protected_memory_paths` | list | `[]` | Long-term `memory/` paths (repo-relative, e.g. `memory/INDEX.md`) writable ONLY in Reflect — like `SOUL.md`/`prompts/`/`stimuli/`. These files are engine-injected into every context, so a non-Reflect cycle (even org+) rewriting them would be a context-injection surface; the wall denies it. A plain path matches exactly; a trailing-`/` entry protects a whole subtree. |
+| `runlog_db` | string | `runlogs.sqlite` | The **short-term memory** store — a SQLite + FTS5 database (NOT markdown/git), in the harness cwd, outside the soul. Separate from the queue `db_path`. Losing it loses only short-term memory (prompts + long-term `memory/` are durable); a fresh one is created on boot. Read-only to the recall MCPs. |
+| `runlog_retention_days` | int | `10` | **Short-term memory retention**: runlog entries age off (are deleted) after this many days — also bounds how far back the recall tools can scan. |
+| `runlog_hard_days` | int | `30` | Hard-GC ceiling: delete runlog entries older than this (the multi-GB guard, above the smaller surfaced window). Large by design. |
+| `tag_notes_max` | int | `200` | Cap on the short-term **tag-notes** catalogue: only the last N notes are kept (the read tool dedups to latest-per-tag anyway). |
+| `tag_note_hard_days` | int | `90` | Hard-GC ceiling: delete any tag-note older than this. Large by design. |
+| `runlog_remote` | object | none | Optional push destination for the runlogs' own **private** git repo (kept out of the public soul because runlogs carry chat detail / handles). Same shape as a `soul_remotes` entry (`url` / `auth` / `required`). `None` ⇒ local-only. |
 
 ### `log` — structured logging
 

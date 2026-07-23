@@ -11,7 +11,8 @@ the safety model. The rest are reference and how-to.
 ### Build & run
 - **[Configuration](configuration.md)** — every `dack.config.yaml` field, with defaults.
 - **[Authoring souls](authoring-souls.md)** — `SOUL.md`, state-prompts, duties, memory, skills.
-- **[Operations](operations.md)** — CLI reference, daemon lifecycle, signed soul repos, identities.
+- **[Operations](operations.md)** — CLI reference, daemon lifecycle, soul repos, identities, health.
+- **[Deployment](deployment.md)** — containerized + multi-duck (one image, a directory per duck).
 
 ### Extend
 - **[Capabilities](capabilities.md)** — give the agent tools (MCP servers).

@@ -68,6 +68,18 @@ Frontmatter fields:
 | `transitions` | The allowed next prompt ids; the run picks exactly one (or terminates). The target's state is ceiling-checked against the cycle's trust before it opens. |
 | `model` | Optional per-prompt model, honored only where `tier_policy.<state>.allow_model_override` is set. |
 | `session` | Optional sticky session: `{ sticky: true, key: [thread_id] }` resumes the same engine session across stimuli that share the key (cheaper context, conversational memory). A different prompt or trust tier is always a different session — the firebreak holds. |
+| `parallel` | `true` marks this step **read-only** w.r.t. long-term state so it runs CONCURRENTLY with other cycles (see below). Default `false` (exclusive write-lock). |
+
+**Concurrency (`parallel`).** The harness can run up to `max_concurrent_cycles` (config) wake-cycles at
+once. Two rules keep that safe. First, a given conversation never races itself: only one in-flight wake
+per `dedup_key`, so a chat's messages and its sticky session stay ordered. Second, every step takes a
+memory/soul lock — an exclusive **write-lock** by default, since a step reads memory then writes it.
+Marking a prompt `parallel: true` opts it into a shared **read-lock** so different conversations process
+at the same time — but only for a step that writes NO memory/soul file: the harness clears its
+`writable_dirs`, so the wall denies any such write and the read-lock is sound. Use it on conversational
+read → reply steps (e.g. `telegram/perceive` + `telegram/express`); leave settle/reflect/digest (which
+write memory) on the default write-lock. Replying/posting (an outward MCP call) and the runlog (SQLite,
+outside the lock) still work under a parallel step.
 
 The model always returns a structured result (a thought, an optional proposal/gist, an optional
 `spawn` for delegation, and a transition). The harness reads the transition and walks the machine.

@@ -1,7 +1,7 @@
 # Getting started
 
-This walks you from a fresh clone to a running agent you can talk to — no gitlawb, no team-internal
-tooling required.
+This walks you from a fresh clone to a running agent you can talk to — no team-internal tooling
+required.
 
 ## Prerequisites
 
@@ -9,14 +9,15 @@ tooling required.
   (`rusqlite` bundled), which needs the C compiler; there is no `protoc`/OpenSSL requirement.
 - **Bun** (1.x) — runs the runtime bridge (`openclaude-bridge/`), which drives the OpenClaude SDK.
   (Node/npm are **not** used.)
-- **git** — the soul and its runlogs are git repos the harness commits to at boot and each cycle.
+- **git** — the soul is a git repo the harness commits to at boot and each cycle. (The runlog is
+  *not* git: it's a single SQLite+FTS5 file, `runlogs.sqlite`, outside the soul — see below.)
 - **A model endpoint** — an OpenAI-compatible gateway (base URL + key + a model id). Any provider that
   speaks the OpenAI chat API works.
 - *Optional:* **python3** — only if you enable the built-in X/Twitter capability or its duties (the
   provider scripts are stdlib-only, no `pip`). **Docker** — only if you turn on sandboxed workers
   (`runtime.worker_sandbox`); the daemon itself never runs in a container.
 
-You do **not** need the gitlawb `gl` CLI. Identities are native Ed25519 keys created with `dack keygen`.
+Identities are native Ed25519 keys created with `dack keygen` — no external key-management tool required.
 
 ## Build
 
@@ -57,10 +58,6 @@ gitignored; **never commit or forward a private key**. (You can also generate `-
 `--role builder` keys now; the soul key signs/attributes the soul repo's commits. All three are
 optional for a first local run.)
 
-> Already manage keys with the gitlawb `gl` CLI? Set `identities: { backend: gitlawb }` and dack will
-> shell out to `gl` instead — the native backend derives the identical `did:key` from the same
-> `identity.pem`, so switching is a no-op.
-
 ## Get a soul
 
 The agent's identity, prompts, memory, and duties live in a **soul** repo. Start from the public
@@ -92,7 +89,7 @@ identities:
   operator: "identities/operator"     # so `dack say` can sign
 runtime:
   connector:
-    type: opengateway
+    type: openai-compatible               # any OpenAI-compatible endpoint (base URL + key + model)
     api_url: "https://your-gateway/v1"
     api_key: "…"                      # gitignored config only
   model: "your-model-id"
@@ -128,8 +125,9 @@ dack status          # alive? queue depth? machinery + secret health?
 dack log --follow    # tail the runlog (the agent "syslog")
 ```
 
-The runlog records every cycle — the model's thought, the tools it called, and the wall's allow/deny —
-under the soul's `runlogs/` directory.
+The runlog records every cycle — the model's thought, the tools it called, and the wall's allow/deny.
+It's the harness-authored SQLite store (`runlogs.sqlite`, config `runlog_db`), the agent's "syslog";
+`dack log` reads it and the agent reaches it read-only through its recall MCP tools.
 
 ## Next steps
 
@@ -140,3 +138,4 @@ under the soul's `runlogs/` directory.
 - [Capabilities](capabilities.md) — give the agent tools (MCP servers).
 - [Channels](channels.md) — connect Telegram or another live channel.
 - [Operations](operations.md) — running as a daemon, soul-repo push targets, identities.
+- [Deployment](deployment.md) — running the daemon in Docker or on a VPS.

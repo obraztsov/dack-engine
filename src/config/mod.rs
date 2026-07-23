@@ -718,6 +718,17 @@ pub struct DackConfig {
     /// back to the legacy single `soul_remote` (and if that's unset too, local-only / no push).
     #[serde(default)]
     pub soul_remotes: Vec<SoulRemote>,
+    /// **Remote-authoritative soul**: when true, `dack run` reconciles the local soul with the
+    /// PRIMARY remote at boot — adopt config an operator pushed externally, keep the duck's own memory
+    /// — so a duck is reconfigured by pushing + restarting. Always safe (skips a dirty tree; a
+    /// divergence snapshots local HEAD to a `pre-sync-<ts>` branch first). Default `false`
+    /// (local-authoritative, no boot fetch — the pre-existing behavior).
+    #[serde(default)]
+    pub soul_remote_authority: bool,
+    /// The duck-OWNED soul paths kept LOCAL during a remote-authority reconcile (everything else is
+    /// adopted from the remote). Default `["memory/"]`.
+    #[serde(default = "default_soul_local_paths")]
+    pub soul_local_paths: Vec<String>,
     /// **Runlog push destination** (optional) — the runlogs live in their OWN private git repo
     /// (`<soul>/runlogs/`, gitignored by the soul) so they never reach the PUBLIC soul (they carry chat
     /// detail + telegram handles). `None` ⇒ local-only (the repo stays on the box, disposable: a corrupt
@@ -914,6 +925,9 @@ fn default_bridge_dir() -> String {
 }
 fn default_invoke_timeout_secs() -> u64 {
     300
+}
+fn default_soul_local_paths() -> Vec<String> {
+    vec!["memory/".to_string()]
 }
 fn default_post_tools() -> Vec<String> {
     vec!["mcp__twitter__".to_string()]

@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::gitcore::{is_transient_push_error, GitCore};
+use super::gitcore::{is_transient_push_error, GitCore, ReconcileOutcome};
 use super::{CommitId, CommitMeta, RepoChange, RepoHost, RepoPath};
 use crate::error::{DackError, Result};
 
@@ -221,6 +221,22 @@ impl RepoHost for MultiRemoteRepo {
                 Ok(())
             }
         }
+    }
+
+    async fn reconcile_with_remote(
+        &self,
+        local_paths: &[String],
+        now: i64,
+    ) -> Result<ReconcileOutcome> {
+        // Reconcile against the PRIMARY remote — the first `required` target, else the first target.
+        let Some(target) = self.targets.iter().find(|t| t.required()).or_else(|| self.targets.first())
+        else {
+            return Ok(ReconcileOutcome::Skipped("no soul_remotes configured — local-only".into()));
+        };
+        let PushTarget::Git { url, .. } = target;
+        self.core
+            .reconcile_with_remote(url, local_paths, &self.core.default_author, now)
+            .await
     }
 }
 

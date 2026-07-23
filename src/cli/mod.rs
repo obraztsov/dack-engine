@@ -432,6 +432,17 @@ async fn run(config_path: &str) -> Result<()> {
     // (`soul_remotes`, GitHub / self-hosted). The Soul DID attributes the commit history. Best-effort
     // per target unless `required`, so a down mirror never blocks a cycle.
     let repo = build_soul_repo(&config, &repo_root, &soul_did);
+    // Remote-authoritative soul (opt-in): BEFORE the harness runs, reconcile the local soul with the
+    // primary remote — adopt config an operator pushed externally while keeping the duck's own memory,
+    // so a duck is reconfigured by pushing + restarting. Safe (skips a dirty tree; snapshots a
+    // divergence to a `pre-sync-*` branch). A failure is non-fatal — the duck boots on its local soul.
+    if config.soul_remote_authority {
+        let now = chrono::Utc::now().timestamp();
+        match repo.reconcile_with_remote(&config.soul_local_paths, now).await {
+            Ok(outcome) => tracing::info!("soul reconcile (remote-authority): {outcome:?}"),
+            Err(e) => tracing::warn!("soul reconcile failed — booting on local soul: {e}"),
+        }
+    }
     // Runlogs (short-term memory) live in a SQLite store OUTSIDE the soul (`runlog_db`, harness cwd) —
     // harness-authored, read-only to the recall MCPs. No git repo: losing it loses only short-term
     // memory (durable = prompts + long-term `memory/`); a fresh DB is created on a missing/corrupt file.

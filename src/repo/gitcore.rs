@@ -298,6 +298,93 @@ impl GitCore {
     }
 }
 
+/// The result of a boot-time reconcile against the remote (for logging + health).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReconcileOutcome {
+    /// Local HEAD already matches the remote — nothing to do.
+    InSync,
+    /// Local was strictly behind (clean) → fast-forwarded to the remote (adopted operator changes).
+    FastForwarded,
+    /// Local was strictly ahead (unpushed local commits; remote unchanged) → left as-is; the cycle
+    /// push ships it.
+    Ahead,
+    /// Local and remote DIVERGED → snapshotted local HEAD to `backup_branch`, adopted the remote for
+    /// everything, then restored the duck-owned `local_paths` (memory) from the snapshot + committed.
+    Merged { backup_branch: String },
+    /// Reconcile did NOT run (no remote, dirty working tree, or an offline fetch) — local is used
+    /// as-is. `reason` says which.
+    Skipped(String),
+}
+
+impl GitCore {
+    /// Boot-time reconcile against `url`/`branch`, making the REMOTE authoritative for everything
+    /// EXCEPT `local_paths` (the duck's own memory, kept local) — so an operator can reconfigure a
+    /// duck by pushing config + restarting. SAFE by construction: never clobbers uncommitted work
+    /// (skips a dirty tree), and a divergence snapshots local HEAD to a `pre-sync-<now>` branch before
+    /// adopting the remote (nothing is ever lost). `now` (unix secs) names the snapshot + is passed in
+    /// so this stays testable. An offline/failed fetch is non-fatal (uses local).
+    pub async fn reconcile_with_remote(
+        &self,
+        url: &str,
+        local_paths: &[String],
+        author_did: &str,
+        now: i64,
+    ) -> Result<ReconcileOutcome> {
+        // Never touch a dirty tree — the operator should `dack reconcile` (commit) first, else a
+        // reset would silently discard their uncommitted hand-edits (which aren't in any snapshot).
+        if !self.git(&["status", "--porcelain"]).await?.trim().is_empty() {
+            return Ok(ReconcileOutcome::Skipped(
+                "soul working tree has uncommitted changes — run `dack reconcile` first".into(),
+            ));
+        }
+        let branch = self.git(&["rev-parse", "--abbrev-ref", "HEAD"]).await?.trim().to_string();
+        // Fetch the remote branch → FETCH_HEAD. A fetch failure (offline / auth) is NON-fatal.
+        if let Err(e) = self.git(&["fetch", url, &branch]).await {
+            return Ok(ReconcileOutcome::Skipped(format!("fetch failed ({e}) — using local soul")));
+        }
+        let local = self.git(&["rev-parse", "HEAD"]).await?.trim().to_string();
+        let remote = self.git(&["rev-parse", "FETCH_HEAD"]).await?.trim().to_string();
+        if local == remote {
+            return Ok(ReconcileOutcome::InSync);
+        }
+        let base = self
+            .git(&["merge-base", &local, &remote])
+            .await
+            .ok()
+            .map(|s| s.trim().to_string());
+        match base.as_deref() {
+            // Local is an ancestor of remote → strictly behind, CLEAN → fast-forward adopt.
+            Some(b) if b == local => {
+                self.git(&["reset", "--hard", &remote]).await?;
+                Ok(ReconcileOutcome::FastForwarded)
+            }
+            // Remote is an ancestor of local → local is ahead (unpushed) → leave it; push ships it.
+            Some(b) if b == remote => Ok(ReconcileOutcome::Ahead),
+            // Diverged (or unrelated histories): snapshot local, adopt remote, restore duck-owned paths.
+            _ => {
+                let backup = format!("pre-sync-{now}");
+                self.git(&["branch", "-f", &backup, &local]).await?; // snapshot local HEAD (safety net)
+                self.git(&["reset", "--hard", &remote]).await?; // adopt remote wholesale
+                for p in local_paths {
+                    // Restore the duck-owned path (memory) from the snapshot. A path absent in the
+                    // snapshot just errors harmlessly (ignored).
+                    let _ = self.git(&["checkout", &backup, "--", p]).await;
+                }
+                self.git(&["add", "-A"]).await?;
+                if self.git(&["status", "--porcelain"]).await?.trim().is_empty() {
+                    // Remote already matched local memory → no merge commit needed.
+                    return Ok(ReconcileOutcome::Merged { backup_branch: backup });
+                }
+                let name = format!("user.name={author_did}");
+                let email = format!("user.email={author_did}@dack");
+                let msg = format!("reconcile: adopt remote, keep local {}", local_paths.join(","));
+                self.git(&["-c", &name, "-c", &email, "commit", "-m", &msg]).await?;
+                Ok(ReconcileOutcome::Merged { backup_branch: backup })
+            }
+        }
+    }
+}
+
 /// Is a `git push` failure TRANSIENT (worth a backoff-retry) vs PERMANENT (auth / non-fast-forward /
 /// bad repo — retrying can't fix it, fail fast)? Used by the multi-remote push retry loop.
 pub(crate) fn is_transient_push_error(msg: &str) -> bool {
@@ -337,6 +424,119 @@ mod tests {
                 .unwrap();
         }
         dir
+    }
+
+    // ── reconcile_with_remote helpers ────────────────────────────────────────────
+    async fn git(dir: &std::path::Path, args: &[&str]) {
+        Command::new("git").arg("-C").arg(dir).args(args).output().await.unwrap();
+    }
+    async fn writef(dir: &std::path::Path, rel: &str, content: &str) {
+        let p = dir.join(rel);
+        tokio::fs::create_dir_all(p.parent().unwrap()).await.unwrap();
+        tokio::fs::write(&p, content).await.unwrap();
+    }
+    async fn readf(dir: &std::path::Path, rel: &str) -> String {
+        tokio::fs::read_to_string(dir.join(rel)).await.unwrap_or_default()
+    }
+    /// A bare remote + a work repo (soul) sharing an initial commit (`prompts/p.md` + `memory/m.md`),
+    /// with `work` pushed to the bare. Returns (bare_url, work_dir, GitCore-over-work).
+    async fn setup_reconcile(tag: &str) -> (String, PathBuf, GitCore) {
+        let base = std::env::temp_dir().join(format!("dack-reconcile-{}-{tag}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&base).await;
+        let bare = base.join("remote.git");
+        let work = base.join("work");
+        tokio::fs::create_dir_all(&work).await.unwrap();
+        Command::new("git").args(["init", "-q", "--bare"]).arg(&bare).output().await.unwrap();
+        for a in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.name", "seed"],
+            vec!["config", "user.email", "s@d"],
+        ] {
+            git(&work, &a).await;
+        }
+        writef(&work, "prompts/p.md", "base-config\n").await;
+        writef(&work, "memory/m.md", "base-mem\n").await;
+        git(&work, &["add", "-A"]).await;
+        git(&work, &["commit", "-q", "-m", "init"]).await;
+        let bare_url = bare.to_string_lossy().to_string();
+        git(&work, &["push", "-q", &bare_url, "HEAD:refs/heads/main"]).await;
+        let core = GitCore::new(&work, "did:key:zSoul");
+        (bare_url, work, core)
+    }
+    /// Simulate an OPERATOR editing `rel`=`content` on the remote (clone bare → edit → push).
+    async fn operator_push(bare_url: &str, tag: &str, rel: &str, content: &str) {
+        let op = std::env::temp_dir().join(format!("dack-op-{}-{tag}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&op).await;
+        Command::new("git").args(["clone", "-q", bare_url]).arg(&op).output().await.unwrap();
+        git(&op, &["config", "user.name", "op"]).await;
+        git(&op, &["config", "user.email", "op@d"]).await;
+        writef(&op, rel, content).await;
+        git(&op, &["add", "-A"]).await;
+        git(&op, &["commit", "-q", "-m", "operator edit"]).await;
+        git(&op, &["push", "-q", "origin", "main"]).await;
+    }
+    const MEM: &[&str] = &["memory/"];
+
+    #[tokio::test]
+    async fn reconcile_in_sync_is_noop() {
+        let (url, _w, core) = setup_reconcile("insync").await;
+        let out = core.reconcile_with_remote(&url, &["memory/".into()], "did:key:zSoul", 1).await.unwrap();
+        assert_eq!(out, ReconcileOutcome::InSync);
+    }
+
+    #[tokio::test]
+    async fn reconcile_behind_fast_forwards_and_adopts_config() {
+        let (url, work, core) = setup_reconcile("behind").await;
+        operator_push(&url, "behind", "prompts/p.md", "operator-config\n").await;
+        let out = core.reconcile_with_remote(&url, &["memory/".into()], "did:key:zSoul", 1).await.unwrap();
+        assert_eq!(out, ReconcileOutcome::FastForwarded);
+        assert_eq!(readf(&work, "prompts/p.md").await, "operator-config\n", "adopted the operator's config");
+    }
+
+    #[tokio::test]
+    async fn reconcile_ahead_leaves_local_untouched() {
+        let (url, work, core) = setup_reconcile("ahead").await;
+        writef(&work, "memory/m.md", "duck-mem-v2\n").await; // an unpushed local commit
+        git(&work, &["add", "-A"]).await;
+        git(&work, &["commit", "-q", "-m", "duck memory"]).await;
+        let out = core.reconcile_with_remote(&url, &["memory/".into()], "did:key:zSoul", 1).await.unwrap();
+        assert_eq!(out, ReconcileOutcome::Ahead);
+        assert_eq!(readf(&work, "memory/m.md").await, "duck-mem-v2\n", "local commits untouched");
+    }
+
+    #[tokio::test]
+    async fn reconcile_diverged_adopts_remote_config_keeps_local_memory() {
+        let (url, work, core) = setup_reconcile("div").await;
+        // The DUCK edits its memory locally (unpushed) …
+        writef(&work, "memory/m.md", "duck-mem-latest\n").await;
+        git(&work, &["add", "-A"]).await;
+        git(&work, &["commit", "-q", "-m", "duck memory"]).await;
+        // … while the OPERATOR pushes a config change to the remote → DIVERGED.
+        operator_push(&url, "div", "prompts/p.md", "operator-config\n").await;
+
+        let out = core.reconcile_with_remote(&url, &MEM.iter().map(|s| s.to_string()).collect::<Vec<_>>(), "did:key:zSoul", 42).await.unwrap();
+        match out {
+            ReconcileOutcome::Merged { backup_branch } => assert_eq!(backup_branch, "pre-sync-42"),
+            other => panic!("expected Merged, got {other:?}"),
+        }
+        // Config adopted from the remote; memory KEPT from local — no loss either way.
+        assert_eq!(readf(&work, "prompts/p.md").await, "operator-config\n", "config ← remote");
+        assert_eq!(readf(&work, "memory/m.md").await, "duck-mem-latest\n", "memory ← local");
+        // The pre-reconcile local HEAD is preserved as a branch (nothing lost).
+        let branches = String::from_utf8_lossy(
+            &Command::new("git").arg("-C").arg(&work).args(["branch", "--list", "pre-sync-42"]).output().await.unwrap().stdout,
+        ).to_string();
+        assert!(branches.contains("pre-sync-42"), "snapshot branch exists: {branches}");
+    }
+
+    #[tokio::test]
+    async fn reconcile_skips_a_dirty_tree() {
+        let (url, work, core) = setup_reconcile("dirty").await;
+        operator_push(&url, "dirty", "prompts/p.md", "operator-config\n").await;
+        writef(&work, "prompts/p.md", "uncommitted-local-edit\n").await; // dirty, NOT committed
+        let out = core.reconcile_with_remote(&url, &["memory/".into()], "did:key:zSoul", 1).await.unwrap();
+        assert!(matches!(out, ReconcileOutcome::Skipped(_)), "dirty tree is skipped, not clobbered");
+        assert_eq!(readf(&work, "prompts/p.md").await, "uncommitted-local-edit\n", "uncommitted work preserved");
     }
 
     #[tokio::test]

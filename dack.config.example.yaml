@@ -147,6 +147,13 @@ secrets:
 #
 # Legacy single-remote form (still supported; becomes a one-element best-effort list):
 # soul_remote: "git@github.com:youruser/my-soul.git"
+#
+# REMOTE-AUTHORITATIVE soul (opt-in): reconcile the local soul with the PRIMARY remote at boot —
+# adopt config an operator pushed externally, keep the duck's own memory — so you reconfigure a duck
+# by pushing config + restarting. Safe: skips a dirty tree; a divergence snapshots local HEAD to a
+# `pre-sync-<ts>` branch before adopting the remote. Default false (local-authoritative).
+# soul_remote_authority: true
+# soul_local_paths: [memory/]   # duck-owned paths kept LOCAL during that reconcile (default: memory/)
 
 identities:
   operator: "identities/operator"  # signs `dack say`  — make it with `dack keygen --role operator …`

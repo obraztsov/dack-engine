@@ -83,6 +83,19 @@ pub trait RepoHost: Send + Sync {
     /// ([`git::PlainGitRepo`] / [`multi::MultiRemoteRepo`]). No-op when no remote is set (offline /
     /// local-only). Called at the end of a successful commit-sweep.
     async fn push(&self) -> Result<()>;
+
+    /// Boot-time reconcile against the primary remote so an operator can reconfigure a duck by
+    /// pushing config + restarting: REMOTE-authoritative for everything except `local_paths` (the
+    /// duck's own memory, kept local). Always safe — never clobbers uncommitted work, and a
+    /// divergence snapshots local HEAD to a `pre-sync-<now>` branch first. Default: a no-op for
+    /// backends without a remote. See [`gitcore::GitCore::reconcile_with_remote`].
+    async fn reconcile_with_remote(
+        &self,
+        _local_paths: &[String],
+        _now: i64,
+    ) -> Result<gitcore::ReconcileOutcome> {
+        Ok(gitcore::ReconcileOutcome::Skipped("no remote reconcile for this backend".into()))
+    }
 }
 
 pub mod git;

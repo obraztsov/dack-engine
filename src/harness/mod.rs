@@ -91,7 +91,7 @@ enum MemGuard {
     Write(tokio::sync::OwnedRwLockWriteGuard<()>),
 }
 
-/// All the seams, owned as trait objects so the v1 (Gitlawb/OpenClaude) and corp
+/// All the seams, owned as trait objects so the OpenClaude and corp
 /// (GitHub/Claude Code) wirings differ only at construction.
 pub struct Harness {
     pub config: Arc<DackConfig>,
@@ -609,7 +609,7 @@ impl Harness {
         }
 
         // One push per cycle ships every local commit made above (per-state runlogs, memory
-        // append, the sweep) as one signed `gitlawb://` ref-update. No-op offline.
+        // append, the sweep) with a single `git push`. No-op offline.
         self.push_soul().await;
         Ok(())
     }
@@ -1171,9 +1171,9 @@ impl Harness {
         reverted
     }
 
-    /// Push the cycle's local soul commits (runlog + memory + sweep) to the configured remote,
-    /// signed for `gitlawb://`. Best-effort: a node-down/offline push is logged, never fatal
-    /// — the commits are durable locally and re-push next cycle.
+    /// Push the cycle's local soul commits (runlog + memory + sweep) to the configured remote(s).
+    /// Best-effort: an offline/rejected push is logged, never fatal — the commits are durable
+    /// locally and re-push next cycle.
     async fn push_soul(&self) {
         if let Err(e) = self.repo.push().await {
             tracing::warn!("soul push failed (kept local): {e}");
@@ -1181,7 +1181,7 @@ impl Harness {
     }
 
     /// The Soul DID that authors soul commits, or a stable placeholder if the identity isn't
-    /// wired (tests). Attribution only — the cryptographic signature is the `gitlawb://` push.
+    /// wired (tests). Attribution only (the commit author), never a transport credential.
     fn soul_did(&self) -> String {
         self.identity
             .did(IdentityRole::Soul)
@@ -2878,7 +2878,7 @@ mod tests {
     /// opens a **fresh** Express invocation. The mock counts invocations via a file.
     #[tokio::test]
     async fn dispatch_runs_perceive_then_opens_express_and_logs() {
-        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::identity::local::LocalIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
         use crate::runlog::sqlite::SqliteRunLog;
@@ -2931,7 +2931,7 @@ mod tests {
                 health: None,
             }),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
-            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            identity: Arc::new(LocalIdentity::resolve(HashMap::new()).unwrap()),
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
         broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
@@ -3000,7 +3000,7 @@ mod tests {
     /// context must not — the firebreak, asserted over the real assembled requests.
     #[tokio::test]
     async fn raw_payload_never_reaches_express_context() {
-        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::identity::local::LocalIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
         use crate::runlog::sqlite::SqliteRunLog;
@@ -3024,7 +3024,7 @@ mod tests {
             bus: Arc::new(Bus::new(config.clone(), queue.clone())),
             runtime: runtime.clone(),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
-            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            identity: Arc::new(LocalIdentity::resolve(HashMap::new()).unwrap()),
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
         broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
@@ -3058,7 +3058,7 @@ mod tests {
     /// agent's context — so every invocation's `secret_env` is empty.
     #[tokio::test]
     async fn no_state_receives_a_raw_secret_env() {
-        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::identity::local::LocalIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
         use crate::runlog::sqlite::SqliteRunLog;
@@ -3082,7 +3082,7 @@ mod tests {
             bus: Arc::new(Bus::new(config.clone(), queue.clone())),
             runtime: runtime.clone(),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
-            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            identity: Arc::new(LocalIdentity::resolve(HashMap::new()).unwrap()),
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
@@ -3106,7 +3106,7 @@ mod tests {
     /// The firebreak still holds: the thought crosses as the gist, the raw payload does not.
     #[tokio::test]
     async fn transition_with_no_proposal_uses_thought_as_fallback_gist() {
-        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::identity::local::LocalIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
         use crate::runlog::sqlite::SqliteRunLog;
@@ -3138,7 +3138,7 @@ mod tests {
             bus: Arc::new(Bus::new(config.clone(), queue.clone())),
             runtime: runtime.clone(),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
-            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            identity: Arc::new(LocalIdentity::resolve(HashMap::new()).unwrap()),
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
@@ -3167,7 +3167,7 @@ mod tests {
     /// perceive runs. (A public tweet reaches reversible Express, never Settle)
     #[tokio::test]
     async fn public_stimulus_cannot_reach_settle() {
-        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::identity::local::LocalIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
         use crate::runlog::sqlite::SqliteRunLog;
@@ -3207,7 +3207,7 @@ mod tests {
             bus: Arc::new(Bus::new(config.clone(), queue.clone())),
             runtime: runtime.clone(),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
-            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            identity: Arc::new(LocalIdentity::resolve(HashMap::new()).unwrap()),
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
@@ -3227,7 +3227,7 @@ mod tests {
     /// operator ceiling. A public cycle can't (see `public_stimulus_cannot_reach_settle`).
     #[tokio::test]
     async fn self_tier_cycle_reaches_settle_by_taint() {
-        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::identity::local::LocalIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
         use crate::runlog::sqlite::SqliteRunLog;
@@ -3259,7 +3259,7 @@ mod tests {
             bus: Arc::new(Bus::new(config.clone(), queue.clone())),
             runtime: runtime.clone(),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
-            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            identity: Arc::new(LocalIdentity::resolve(HashMap::new()).unwrap()),
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
@@ -3346,7 +3346,7 @@ mod tests {
     /// Boot the run-loop at N=4 with one wake per `keys` entry (its `dedup_key`) on a perceive prompt
     /// whose `parallel` flag is `parallel`; return the max concurrent invocations observed.
     async fn observe_concurrency(parallel: bool, keys: &[&str]) -> usize {
-        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::identity::local::LocalIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
         use crate::runlog::sqlite::SqliteRunLog;
@@ -3378,7 +3378,7 @@ mod tests {
             bus: Arc::new(Bus::new(config.clone(), queue.clone())),
             runtime: probe.clone(),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
-            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            identity: Arc::new(LocalIdentity::resolve(HashMap::new()).unwrap()),
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
@@ -3427,13 +3427,13 @@ mod tests {
     }
 
     async fn fanout_harness(tmp: &std::path::Path, runtime: Arc<ScriptedRuntime>) -> Harness {
-        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::identity::local::LocalIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
         use crate::runlog::sqlite::SqliteRunLog;
         let config = Arc::new(DackConfig::from_yaml("operator_did: \"did:x\"").unwrap());
         let queue: Arc<dyn Queue> = Arc::new(InMemoryQueue::new());
-        let identity = GitlawbIdentity::resolve("gl", std::collections::HashMap::new()).await.unwrap();
+        let identity = LocalIdentity::resolve(std::collections::HashMap::new()).unwrap();
         Harness {
             config: config.clone(),
             queue: queue.clone(),
@@ -3507,7 +3507,7 @@ mod tests {
     /// carried baton — no re-perceive. The express branch (no explicit priority) still runs in-wake.
     #[tokio::test]
     async fn low_prio_baton_defers_to_queue_then_runs_as_continuation() {
-        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::identity::local::LocalIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
         use crate::runlog::sqlite::SqliteRunLog;
@@ -3541,7 +3541,7 @@ mod tests {
             bus: Arc::new(Bus::new(config.clone(), queue.clone())),
             runtime: runtime.clone(),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
-            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            identity: Arc::new(LocalIdentity::resolve(HashMap::new()).unwrap()),
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
@@ -3609,7 +3609,7 @@ mod tests {
     /// dispatch (the world moved on while it waited) — it never invokes the model.
     #[tokio::test]
     async fn stale_baton_continuation_is_expired_at_dispatch() {
-        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::identity::local::LocalIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
         use crate::runlog::sqlite::SqliteRunLog;
@@ -3633,7 +3633,7 @@ mod tests {
             bus: Arc::new(Bus::new(config.clone(), queue.clone())),
             runtime: runtime.clone(),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
-            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            identity: Arc::new(LocalIdentity::resolve(HashMap::new()).unwrap()),
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
@@ -3665,7 +3665,7 @@ mod tests {
     /// committed as the Soul DID, an out-of-allowlist `skills/` write is reverted + alarmed.
     #[tokio::test]
     async fn reconcile_commits_allowlisted_writes_and_reverts_the_rest() {
-        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::identity::local::LocalIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
         use crate::runlog::sqlite::SqliteRunLog;
@@ -3699,7 +3699,7 @@ mod tests {
                 usage: None,
             }),
             repo: Arc::new(PlainGitRepo::new(&soul, "did:dack:soul")),
-            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            identity: Arc::new(LocalIdentity::resolve(HashMap::new()).unwrap()),
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
@@ -3737,7 +3737,7 @@ mod tests {
     /// on the signal — the in-flight cycle finishes, then the loop exits.
     #[tokio::test]
     async fn run_loop_reclaims_marks_terminal_and_shuts_down_gracefully() {
-        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::identity::local::LocalIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
         use crate::runlog::sqlite::SqliteRunLog;
@@ -3767,7 +3767,7 @@ mod tests {
             bus: Arc::new(Bus::new(config.clone(), queue.clone())),
             runtime: runtime.clone(),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
-            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            identity: Arc::new(LocalIdentity::resolve(HashMap::new()).unwrap()),
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
@@ -3907,7 +3907,7 @@ mod tests {
 
     #[tokio::test]
     async fn assemble_exposes_capabilities_by_tier_and_never_trading_outside_settle() {
-        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::identity::local::LocalIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
         use crate::runlog::sqlite::SqliteRunLog;
@@ -3939,7 +3939,7 @@ mod tests {
             bus: Arc::new(Bus::new(config.clone(), queue.clone())),
             runtime: Arc::new(RecordingRuntime { seen: std::sync::Mutex::new(Vec::new()), out: perceive_output() , usage: None }),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
-            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            identity: Arc::new(LocalIdentity::resolve(HashMap::new()).unwrap()),
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![Arc::new(StaticEnvProvider::new("cove", vec!["DACK_COVE_TEST".into()]))])),
             sessions: Default::default(),
@@ -3985,7 +3985,7 @@ mod tests {
     /// ceiling.)
     #[tokio::test]
     async fn reflect_reachable_from_clean_cycle_but_rate_limited() {
-        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::identity::local::LocalIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
         use crate::runlog::sqlite::SqliteRunLog;
@@ -4019,7 +4019,7 @@ mod tests {
             bus: Arc::new(Bus::new(config.clone(), queue.clone())),
             runtime: runtime.clone(),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
-            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            identity: Arc::new(LocalIdentity::resolve(HashMap::new()).unwrap()),
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
@@ -4049,7 +4049,7 @@ mod tests {
     /// `import` list doesn't name is rejected even though the server exists.
     #[tokio::test]
     async fn inline_self_plug_only_on_open_tier_imports_gated_by_policy() {
-        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::identity::local::LocalIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
         use crate::runlog::sqlite::SqliteRunLog;
@@ -4074,7 +4074,7 @@ mod tests {
             bus: Arc::new(Bus::new(config.clone(), queue.clone())),
             runtime: Arc::new(RecordingRuntime { seen: std::sync::Mutex::new(Vec::new()), out: perceive_output() , usage: None }),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
-            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            identity: Arc::new(LocalIdentity::resolve(HashMap::new()).unwrap()),
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
@@ -4113,7 +4113,7 @@ mod tests {
     /// gated purely by the cycle's live (post-taint) trust, orthogonal to the state.
     #[tokio::test]
     async fn min_trust_gates_assembly_by_cycle_trust() {
-        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::identity::local::LocalIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
         use crate::runlog::sqlite::SqliteRunLog;
@@ -4140,7 +4140,7 @@ mod tests {
             bus: Arc::new(Bus::new(config.clone(), queue.clone())),
             runtime: Arc::new(RecordingRuntime { seen: std::sync::Mutex::new(Vec::new()), out: perceive_output() , usage: None }),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
-            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            identity: Arc::new(LocalIdentity::resolve(HashMap::new()).unwrap()),
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
@@ -4176,7 +4176,7 @@ mod tests {
     /// prompt that lists higher-trust servers a low-trust entry was never going to get).
     #[tokio::test]
     async fn static_min_trust_mismatch_is_not_announced() {
-        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::identity::local::LocalIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
         use crate::runlog::sqlite::SqliteRunLog;
@@ -4202,7 +4202,7 @@ mod tests {
             bus: Arc::new(Bus::new(config.clone(), queue.clone())),
             runtime: Arc::new(RecordingRuntime { seen: std::sync::Mutex::new(Vec::new()), out: perceive_output(), usage: None }),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
-            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            identity: Arc::new(LocalIdentity::resolve(HashMap::new()).unwrap()),
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
@@ -4279,7 +4279,7 @@ mod tests {
     /// top-level/latest payload — and per FIELD, so `chat_id` stays correct even on a partial item.
     #[tokio::test]
     async fn assemble_resolves_scope_env_per_baton_from_the_selected_item() {
-        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::identity::local::LocalIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
         use crate::runlog::sqlite::SqliteRunLog;
@@ -4304,7 +4304,7 @@ mod tests {
             bus: Arc::new(Bus::new(config.clone(), queue.clone())),
             runtime: Arc::new(RecordingRuntime { seen: std::sync::Mutex::new(Vec::new()), out: perceive_output() , usage: None }),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
-            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            identity: Arc::new(LocalIdentity::resolve(HashMap::new()).unwrap()),
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
@@ -4345,7 +4345,7 @@ mod tests {
     /// field) — how the recall MCP gets `RECALL_TAG` = this chat. Missing dedup_key → the var is unset.
     #[tokio::test]
     async fn scope_env_dedup_key_injects_the_conversation_tag() {
-        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::identity::local::LocalIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
         use crate::runlog::sqlite::SqliteRunLog;
@@ -4370,7 +4370,7 @@ mod tests {
             bus: Arc::new(Bus::new(config.clone(), queue.clone())),
             runtime: Arc::new(RecordingRuntime { seen: std::sync::Mutex::new(Vec::new()), out: perceive_output(), usage: None }),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
-            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            identity: Arc::new(LocalIdentity::resolve(HashMap::new()).unwrap()),
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
@@ -4401,7 +4401,7 @@ mod tests {
     /// note's trust from the cycle's taint (NOT model-asserted) — so provenance is unfakeable.
     #[tokio::test]
     async fn honor_tag_notes_stamps_cycle_trust_from_any_state() {
-        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::identity::local::LocalIdentity;
         use crate::model::proposal::TagNote;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
@@ -4418,7 +4418,7 @@ mod tests {
             bus: Arc::new(Bus::new(config.clone(), queue.clone())),
             runtime: Arc::new(RecordingRuntime { seen: std::sync::Mutex::new(Vec::new()), out: perceive_output(), usage: None }),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
-            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            identity: Arc::new(LocalIdentity::resolve(HashMap::new()).unwrap()),
             runlog: rec.clone(),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
@@ -4448,7 +4448,7 @@ mod tests {
     /// public; a builtin or a DENIED call carries no taint.
     #[tokio::test]
     async fn accessed_trust_is_the_meet_of_called_mcp_servers() {
-        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::identity::local::LocalIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
         use crate::runlog::sqlite::SqliteRunLog;
@@ -4473,7 +4473,7 @@ mod tests {
             bus: Arc::new(Bus::new(config.clone(), queue.clone())),
             runtime: Arc::new(RecordingRuntime { seen: std::sync::Mutex::new(Vec::new()), out: perceive_output() , usage: None }),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
-            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            identity: Arc::new(LocalIdentity::resolve(HashMap::new()).unwrap()),
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
@@ -4507,7 +4507,7 @@ mod tests {
     /// non-operator directive (`self`) passes through untouched.
     #[tokio::test]
     async fn operator_signed_directive_requires_a_valid_signature() {
-        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::identity::local::LocalIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
         use crate::runlog::sqlite::SqliteRunLog;
@@ -4542,7 +4542,7 @@ mod tests {
                 usage: None,
             }),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
-            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            identity: Arc::new(LocalIdentity::resolve(HashMap::new()).unwrap()),
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
@@ -4586,7 +4586,7 @@ mod tests {
     /// `InvocationRequest.model` (the operator-boundary / soul-self-select shape, like mcp_whitelist).
     #[tokio::test]
     async fn model_override_is_operator_gated() {
-        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::identity::local::LocalIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
         use crate::runlog::sqlite::SqliteRunLog;
@@ -4616,7 +4616,7 @@ mod tests {
             bus: Arc::new(Bus::new(config.clone(), queue.clone())),
             runtime: runtime.clone(),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
-            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            identity: Arc::new(LocalIdentity::resolve(HashMap::new()).unwrap()),
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
@@ -4730,7 +4730,7 @@ mod tests {
     /// `RecordingRuntime` echoes a stable id so we can assert the resume.)
     #[tokio::test]
     async fn sticky_session_resumes_within_a_thread() {
-        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::identity::local::LocalIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
         use crate::runlog::sqlite::SqliteRunLog;
@@ -4764,7 +4764,7 @@ mod tests {
             bus: Arc::new(Bus::new(config.clone(), queue.clone())),
             runtime: runtime.clone(),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
-            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            identity: Arc::new(LocalIdentity::resolve(HashMap::new()).unwrap()),
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),
@@ -4859,7 +4859,7 @@ mod tests {
     /// session is EVICTED (not stored) so the next wake in that thread starts FRESH (no resume).
     #[tokio::test]
     async fn oversized_session_is_evicted_so_the_next_wake_is_fresh() {
-        use crate::identity::gitlawb::GitlawbIdentity;
+        use crate::identity::local::LocalIdentity;
         use crate::queue::InMemoryQueue;
         use crate::repo::git::PlainGitRepo;
         use crate::runlog::sqlite::SqliteRunLog;
@@ -4884,7 +4884,7 @@ mod tests {
             bus: Arc::new(Bus::new(config.clone(), queue.clone())),
             runtime: runtime.clone(),
             repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
-            identity: Arc::new(GitlawbIdentity::resolve("gl", HashMap::new()).await.unwrap()),
+            identity: Arc::new(LocalIdentity::resolve(HashMap::new()).unwrap()),
             runlog: Arc::new(SqliteRunLog::open_in_memory().unwrap()),
             broker: Arc::new(SecretsBroker::new_test(vec![])),
             sessions: Default::default(),

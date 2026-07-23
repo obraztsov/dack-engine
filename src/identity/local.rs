@@ -1,7 +1,6 @@
 //! Native Ed25519 identity backend — the default. Reads each role's PKCS8 `identity.pem` directly,
 //! derives the `did:key` from the public key, and signs with `ed25519-dalek` in-process. No external
-//! tools: a fresh deployer needs only `dack keygen` (below) — NOT the gitlawb `gl` CLI (that legacy
-//! adapter lives in [`super::gitlawb`] and stays available via `identities.backend: gitlawb`).
+//! tools: a fresh deployer needs only `dack keygen` (below).
 //!
 //! The Soul key never enters agent env (the harness holds it); the Builder key is env-forwardable.
 //! The `did:key` derivation is deterministic, so a key generated here (or by `gl` before) resolves to

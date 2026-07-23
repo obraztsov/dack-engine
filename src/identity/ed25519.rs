@@ -1,8 +1,8 @@
 //! Pure Ed25519 / `did:key` crypto shared by every [`IdentityProvider`](super::IdentityProvider)
-//! backend. No I/O, no external tools — just the `did:key` codec and signature verify. Both the
-//! native [`local`](super::local) backend and the legacy [`gitlawb`](super::gitlawb) adapter build on
-//! this, so the wire formats (a `did:key:z6Mk…` and a base64url signature) are defined in exactly one
-//! place. Provenance is this local crypto check, never a sentence the model evaluates.
+//! backend. No I/O, no external tools — just the `did:key` codec and signature verify. The native
+//! [`local`](super::local) backend builds on this, so the wire formats (a `did:key:z6Mk…` and a
+//! base64url signature) are defined in exactly one place. Provenance is this local crypto check,
+//! never a sentence the model evaluates.
 
 use super::{Did, Signature};
 use crate::error::{DackError, Result};

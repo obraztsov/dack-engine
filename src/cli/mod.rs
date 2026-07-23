@@ -21,7 +21,6 @@ use crate::harness::modules::ModuleSupervisor;
 use crate::harness::Harness;
 use crate::sandbox::{DockerSandbox, HostSandbox, IsolationPolicy, NetworkPolicy, Sandbox};
 use crate::config::IdentityBackend;
-use crate::identity::gitlawb::GitlawbIdentity;
 use crate::identity::local::LocalIdentity;
 use crate::identity::{IdentityProvider, IdentityRole};
 use crate::model::stimulus::{Priority, Stimulus, StimulusId, StimulusStatus, StimulusType, TrustTier};
@@ -139,7 +138,7 @@ async fn migrate_runlogs(config_path: &str, from: Option<String>, to: Option<Str
     Ok(())
 }
 
-/// `dack keygen --role <r> --dir <d>` — generate a native Ed25519 identity (no `gl`, no gitlawb).
+/// `dack keygen --role <r> --dir <d>` — generate a native Ed25519 identity (no external tools).
 /// Writes `<dir>/identity.pem` (0600) and prints the `did:key` to paste into `dack.config.yaml`.
 fn keygen(role: &str, dir: &str) -> Result<()> {
     let did = crate::identity::local::generate(std::path::Path::new(dir))?;
@@ -154,14 +153,12 @@ fn keygen(role: &str, dir: &str) -> Result<()> {
     Ok(())
 }
 
-/// Build the configured identity provider. Native `LocalIdentity` (default) needs no external tools;
-/// `GitlawbIdentity` (legacy) shells out to the `gl` CLI. Both derive the same `did:key` from the
-/// same `identity.pem`, so switching backends never changes an actor's DID.
+/// Build the identity provider — native `LocalIdentity`: it reads the PKCS8 `identity.pem` and signs
+/// in-process (no external tools; keys made with `dack keygen`).
 async fn build_identity(config: &DackConfig) -> Result<Arc<dyn IdentityProvider>> {
     let dirs = config.identity_dirs();
     match config.identities.backend {
         IdentityBackend::Local => Ok(Arc::new(LocalIdentity::resolve(dirs)?)),
-        IdentityBackend::Gitlawb => Ok(Arc::new(GitlawbIdentity::resolve("gl", dirs).await?)),
     }
 }
 
@@ -266,50 +263,19 @@ async fn reflect_now(config_path: &str) -> Result<()> {
 }
 
 /// Build the soul repo-host from `effective_soul_remotes()`: ONE local working tree (all
-/// reads/writes/commits) fanned out to every configured push target. A `gitlawb://` entry pushes a
-/// signed ref-update via its named identity key; every other URL is a plain `git push` (GitHub /
-/// GitLab / Gitea / self-hosted / local), optionally with an HTTPS token from the daemon env. A
-/// gitlawb entry whose signing identity dir is missing is skipped with a warning (it can't sign
-/// without the key) rather than aborting boot; an empty list ⇒ local-only (commits, no push).
-/// Convert soul-remote specs into push targets (shared by the soul repo and the runlog repo). A
-/// gitlawb entry whose signing identity isn't configured is skipped (logged), so it never blocks boot.
-fn remotes_to_targets(
-    remotes: &[crate::config::SoulRemote],
-    config: &DackConfig,
-) -> Vec<PushTarget> {
-    use crate::config::RemoteKind;
+/// reads/writes/commits) fanned out to every configured push target. Each URL is a plain `git push`
+/// (GitHub / GitLab / Gitea / self-hosted / local), optionally with an HTTPS token from the daemon
+/// env. An empty list ⇒ local-only (commits, no push).
+/// Convert soul-remote specs into plain-git push targets (shared by the soul repo and the runlog repo).
+fn remotes_to_targets(remotes: &[crate::config::SoulRemote]) -> Vec<PushTarget> {
     let mut targets: Vec<PushTarget> = Vec::new();
     for r in remotes {
-        let is_gitlawb = match r.kind {
-            Some(RemoteKind::Gitlawb) => true,
-            Some(RemoteKind::Git) => false,
-            None => r.url.starts_with("gitlawb://"),
-        };
-        let name = remote_label(&r.url);
-        if is_gitlawb {
-            let role = r.identity.as_deref().unwrap_or("soul");
-            let Some(dir) = config.identities.dir(role) else {
-                tracing::warn!("remote `{name}` (gitlawb) needs identities.{role} to sign — skipping");
-                continue;
-            };
-            // Absolutize: `GITLAWB_KEY` is read by the push helper running with cwd = the repo,
-            // so a relative dir would not resolve (→ unsigned / 401).
-            let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| PathBuf::from(dir));
-            targets.push(PushTarget::Gitlawb {
-                name,
-                url: r.url.clone(),
-                key_path: dir.join("identity.pem"),
-                node: r.node.clone().unwrap_or_else(|| config.gitlawb_node.clone()),
-                required: r.required,
-            });
-        } else {
-            targets.push(PushTarget::Git {
-                name,
-                url: r.url.clone(),
-                token: r.auth.as_ref().map(|a| (a.username.clone(), a.token_env.clone())),
-                required: r.required,
-            });
-        }
+        targets.push(PushTarget::Git {
+            name: remote_label(&r.url),
+            url: r.url.clone(),
+            token: r.auth.as_ref().map(|a| (a.username.clone(), a.token_env.clone())),
+            required: r.required,
+        });
     }
     targets
 }
@@ -319,7 +285,7 @@ fn build_soul_repo(
     repo_root: &std::path::Path,
     author_did: &str,
 ) -> Arc<dyn RepoHost> {
-    let targets = remotes_to_targets(&config.effective_soul_remotes(), config);
+    let targets = remotes_to_targets(&config.effective_soul_remotes());
     if targets.is_empty() {
         tracing::info!("no soul_remotes — plain-git, local-only (commits stay on the box, no push)");
     } else {
@@ -335,16 +301,8 @@ fn build_soul_repo(
     ))
 }
 
-/// A short, human label for a remote URL (logs only): the host for `https`/`ssh`/`git@`,
-/// `gitlawb:<repo>` for a `gitlawb://` URL, else the URL itself.
+/// A short, human label for a remote URL (logs only): the host for `https`/`ssh`/`git@`, else the URL.
 fn remote_label(url: &str) -> String {
-    if let Some(rest) = url.strip_prefix("gitlawb://") {
-        return rest
-            .rsplit('/')
-            .next()
-            .map(|s| format!("gitlawb:{s}"))
-            .unwrap_or_else(|| "gitlawb".into());
-    }
     if let Some(rest) = url.strip_prefix("git@") {
         return rest.split(':').next().unwrap_or(rest).to_string();
     }
@@ -361,8 +319,8 @@ fn remote_label(url: &str) -> String {
 /// (memory/prompts/stimuli) so the daemon's per-run integrity tripwire (`reconcile_soul`, which
 /// reverts anything outside the running state's writable dirs) doesn't clobber them. Commits are
 /// authored as the **operator DID** (the human shaping the soul, distinct from the duck's Soul-DID
-/// Reflect output) and pushed with the soul key (the node credential — author and push are
-/// independent: `commit_paths` stamps the author, `push` uses `GITLAWB_KEY`).
+/// Reflect output) and pushed to the configured `soul_remotes` (author and push are independent:
+/// `commit_paths` stamps the author, `push` uses the ambient git credentials).
 async fn reconcile(config_path: &str) -> Result<()> {
     let config = DackConfig::load(config_path)?;
     let repo_root = std::fs::canonicalize(&config.soul_repo)
@@ -411,9 +369,9 @@ async fn run(config_path: &str) -> Result<()> {
             config.dry_run.block.join(", ")
         );
     }
-    // Absolutize the soul repo so sensor exes (spawned with a changed cwd) and the signed-push
-    // `GITLAWB_KEY` resolve regardless of where `dack` is launched from (relative config paths
-    // otherwise break under subprocess cwd changes). Falls back to as-written if it doesn't exist.
+    // Absolutize the soul repo so sensor exes (spawned with a changed cwd) resolve it regardless of
+    // where `dack` is launched from (relative config paths otherwise break under subprocess cwd
+    // changes). Falls back to as-written if it doesn't exist.
     let repo_root = std::fs::canonicalize(&config.soul_repo)
         .unwrap_or_else(|_| PathBuf::from(&config.soul_repo));
     // Boot GC: reclaim stale worker workspaces left by crashes / old runs.
@@ -462,19 +420,17 @@ async fn run(config_path: &str) -> Result<()> {
     // `dack status` read the one snapshot. Built here so it can be attached to the runtime.
     let health = Arc::new(crate::health::HealthRegistry::new(chrono::Utc::now().timestamp()));
     let runtime: Arc<dyn RuntimeClient> = build_runtime(&config, health.clone())?;
-    // Identity: resolve the configured role dirs via the selected backend (native `local` by
-    // default; `gitlawb` shells to `gl`). The Soul dir attributes soul commits (+ signs a
-    // `gitlawb://` push, if any); its key never enters agent env.
+    // Identity: resolve the configured role dirs via the native Ed25519 backend. The Soul dir
+    // attributes soul commits; its key never enters agent env.
     let identity: Arc<dyn IdentityProvider> = build_identity(&config).await?;
     let soul_did = identity
         .did(IdentityRole::Soul)
         .map(|d| d.0.clone())
         .unwrap_or_else(|| config.operator_did.clone());
 
-    // Repo-host: ONE local soul working tree fanned out to every configured push target
-    // (`soul_remotes`) — signed `gitlawb://` pushes alongside plain-git primaries (GitHub /
-    // self-hosted). The Soul DID attributes the commit history; a gitlawb push adds cryptographic
-    // provenance. Best-effort per target unless `required`, so a down mirror never blocks a cycle.
+    // Repo-host: ONE local soul working tree fanned out to every configured plain-git push target
+    // (`soul_remotes`, GitHub / self-hosted). The Soul DID attributes the commit history. Best-effort
+    // per target unless `required`, so a down mirror never blocks a cycle.
     let repo = build_soul_repo(&config, &repo_root, &soul_did);
     // Runlogs (short-term memory) live in a SQLite store OUTSIDE the soul (`runlog_db`, harness cwd) —
     // harness-authored, read-only to the recall MCPs. No git repo: losing it loses only short-term

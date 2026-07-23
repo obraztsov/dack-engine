@@ -1,10 +1,7 @@
-//! Shared git operations behind the [`RepoHost`](super::RepoHost) seam.
-//!
-//! Grounded against `gl` 0.3.8: Gitlawb has **no `repo commit`/`push`** — commits and
-//! pushes go through plain `git`, and the `git-remote-gitlawb` helper signs the ref-update
-//! on a `gitlawb://` remote. So `GitlawbRepo` and `PlainGitRepo` share *this* core and
-//! differ only in the remote URL + push-signing identity (made literal: the
-//! bundle is just a git repo).
+//! Shared git operations behind the [`RepoHost`](super::RepoHost) seam. Commits and pushes go
+//! through plain `git`, so the single-remote ([`PlainGitRepo`](super::git::PlainGitRepo)) and
+//! multi-remote ([`MultiRemoteRepo`](super::multi::MultiRemoteRepo)) hosts share *this* core and
+//! differ only in how many remotes they fan out to.
 //!
 //! The duck "authors its own commits" via per-commit `git -c user.name=<DID>` — the commit
 //! history is attributed to the Soul DID (on-thesis), while the *signing key* stays in the
@@ -37,8 +34,8 @@ impl GitCore {
         self.git_env(args, &[]).await
     }
 
-    /// As [`git`](Self::git), but with extra environment overlaid — used by the signed
-    /// `gitlawb://` push (`GITLAWB_KEY`/`GITLAWB_NODE`, read by the `git-remote-gitlawb` helper).
+    /// As [`git`](Self::git), but with extra environment overlaid — used to pass an ephemeral HTTPS
+    /// credential helper's `DACK_GIT_USER`/`DACK_GIT_TOKEN` for a token push (out of argv).
     async fn git_env(&self, args: &[&str], env: &[(&str, String)]) -> Result<String> {
         let mut cmd = Command::new("git");
         cmd.arg("-C").arg(&self.workdir).args(args);
@@ -267,8 +264,8 @@ impl GitCore {
         Ok(())
     }
 
-    /// `git push <remote> HEAD:<branch>` with `env` overlaid (the signed `gitlawb://` helper
-    /// reads `GITLAWB_KEY`/`GITLAWB_NODE`). The branch is HEAD's current branch.
+    /// `git push <remote> HEAD:<branch>` with `env` overlaid (an ephemeral token credential, if any).
+    /// The branch is HEAD's current branch.
     pub async fn push(&self, remote: &str, env: &[(&str, String)]) -> Result<()> {
         self.push_with(remote, env, &[]).await
     }
@@ -299,6 +296,21 @@ impl GitCore {
         self.git_env(&args, env).await?;
         Ok(())
     }
+}
+
+/// Is a `git push` failure TRANSIENT (worth a backoff-retry) vs PERMANENT (auth / non-fast-forward /
+/// bad repo — retrying can't fix it, fail fast)? Used by the multi-remote push retry loop.
+pub(crate) fn is_transient_push_error(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    [
+        "500", "502", "503", "504",
+        "internal server error", "bad gateway", "service unavailable", "gateway timeout",
+        "unexpected disconnect", "hung up", "sideband", "early eof", "rpc failed",
+        "timed out", "timeout", "connection reset", "connection refused", "broken pipe",
+        "could not read from remote", "failed to connect", "temporarily unavailable",
+    ]
+    .iter()
+    .any(|p| m.contains(p))
 }
 
 #[cfg(test)]
@@ -408,7 +420,7 @@ mod tests {
         let work = base.join("work");
         let bare = base.join("remote.git");
         tokio::fs::create_dir_all(&work).await.unwrap();
-        // A local bare remote stands in for the gitlawb node (the push path, offline-tested).
+        // A local bare remote stands in for a real git remote (the push path, offline-tested).
         Command::new("git").args(["init", "-q", "--bare"]).arg(&bare).output().await.unwrap();
         for args in [vec!["init", "-q", "-b", "main"], vec!["config", "user.name", "s"], vec!["config", "user.email", "s@d"]] {
             Command::new("git").arg("-C").arg(&work).args(&args).output().await.unwrap();

@@ -1,7 +1,7 @@
 //! SQLite-backed single-flight queue — the v1 durable store for the
 //! ephemeral stimulus/dedup queue. `bundled` SQLite compiles in-tree (no system libsqlite),
 //! keeping the box dependency-light. Losing this DB loses only the queue, never the soul
-//! (that lives on Gitlawb).
+//! (that lives in the soul git repo).
 //!
 //! Threading: `rusqlite::Connection` is `Send` but `!Sync`, so a `Mutex<Connection>` is
 //! `Send + Sync`. The queries are sub-millisecond and the harness is single-flight

@@ -390,7 +390,7 @@ pub struct McpServerConfig {
 
 /// Which agent runtime drives the consciousness loop — the [`crate::runtime::RuntimeClient`] impl
 /// and how it is spawned, with the engine's own config inline (tagged by `type`). The seam
-///: v1 (Gitlawb/OpenClaude) vs a corp wiring differ only here + in construction.
+///: the OpenClaude wiring vs a corp wiring differ only here + in construction.
 /// **Only `openclaude` is wired**; `claude-code` (the Claude Code CLI/SDK directly, for corporate
 /// prod) is the documented next variant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -426,10 +426,11 @@ impl RuntimeEngine {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum Connector {
-    /// OpenAI-compatible gateway (opengateway/gitlawb): the per-state model is routed via the
-    /// child's `OPENAI_MODEL` env (the SDK rejects a gateway name passed as `options.model`).
+    /// OpenAI-compatible gateway (any OpenAI-compat endpoint — a hosted gateway, xiaomi-direct, a
+    /// local vLLM, …): the per-state model is routed via the child's `OPENAI_MODEL` env (the SDK
+    /// rejects a gateway name passed as `options.model`).
     Opengateway {
-        /// OpenAI-compat base URL → `OPENAI_BASE_URL` (e.g. `https://opengateway.gitlawb.com/v1`).
+        /// OpenAI-compat base URL → `OPENAI_BASE_URL` (e.g. `https://api.provider.example/v1`).
         /// `None` ⇒ taken from the forwarded env instead.
         #[serde(default)]
         api_url: Option<String>,
@@ -706,21 +707,14 @@ pub struct DackConfig {
     /// Soul dir signs soul commits/pushes and **never enters agent env**.
     #[serde(default)]
     pub identities: IdentityDirs,
-    /// The soul repo's signed push remote, e.g. `gitlawb://<soul-did>/dack-soul`. When set
-    /// (with `identities.soul`), the harness uses the Gitlawb repo-host (signed `gitlawb://`
-    /// push); otherwise plain-git degraded mode. `None` = local-only / offline.
+    /// The soul repo's push remote (legacy single-entry form), e.g. `git@github.com:you/dack-soul.git`.
+    /// Superseded by `soul_remotes` (plural); kept as a convenience. `None` = local-only / offline.
     #[serde(default)]
     pub soul_remote: Option<String>,
-    /// The gitlawb node the legacy single-`soul_remote` signed push targets (`GITLAWB_NODE`).
-    /// Also the default node for any `soul_remotes` gitlawb entry that omits its own `node`.
-    #[serde(default = "default_gitlawb_node")]
-    pub gitlawb_node: String,
-    /// **Soul push destinations** — a list of backends the harness pushes the soul repo to after
-    /// each commit-sweep. The soul is ONE local git repo; each entry is a push *target*, so several
-    /// remotes give redundancy: a reliable primary (GitHub / self-hosted) plus a best-effort
-    /// decentralized mirror (`gitlawb://`). Empty ⇒ fall back to the legacy single `soul_remote`
-    /// (and if that's unset too, local-only / no push). The backend is inferred from each URL's
-    /// scheme unless `kind` overrides it.
+    /// **Soul push destinations** — a list of plain-git remotes the harness pushes the soul repo to
+    /// after each commit-sweep. The soul is ONE local git repo; each entry is a push *target*, so
+    /// several remotes give redundancy (a reliable primary plus best-effort mirrors). Empty ⇒ fall
+    /// back to the legacy single `soul_remote` (and if that's unset too, local-only / no push).
     #[serde(default)]
     pub soul_remotes: Vec<SoulRemote>,
     /// **Runlog push destination** (optional) — the runlogs live in their OWN private git repo
@@ -837,12 +831,9 @@ pub struct CapabilityPrefixes {
 #[serde(rename_all = "snake_case")]
 pub enum IdentityBackend {
     /// Native Ed25519 — reads the PKCS8 `identity.pem` directly, signs in-process. No external
-    /// tools; keys are made with `dack keygen`. The default, and what makes a fresh deploy possible.
+    /// tools; keys are made with `dack keygen`. What makes a fresh deploy possible.
     #[default]
     Local,
-    /// Legacy: shell out to the gitlawb `gl` CLI (`gl identity show`/`sign`). Requires the `gl`
-    /// binary on PATH. Only for setups that already manage keys through gitlawb.
-    Gitlawb,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -853,44 +844,20 @@ pub struct IdentityDirs {
     pub operator: Option<String>,
     #[serde(default)]
     pub builder: Option<String>,
-    /// Signing/DID backend (default `local`, native Ed25519). Set `gitlawb` to use the `gl` CLI.
+    /// Signing/DID backend — native Ed25519 (`local`), the only backend.
     #[serde(default)]
     pub backend: IdentityBackend,
 }
 
-impl IdentityDirs {
-    /// Resolve a role name (`"soul"`/`"operator"`/`"builder"`) to its identity dir, for a
-    /// `soul_remotes` gitlawb entry that names which key signs the push (default: soul).
-    pub fn dir(&self, role: &str) -> Option<&String> {
-        match role {
-            "soul" => self.soul.as_ref(),
-            "operator" => self.operator.as_ref(),
-            "builder" => self.builder.as_ref(),
-            _ => None,
-        }
-    }
-}
-
 /// One push destination for the soul repo. The soul is a local git repo; this is *where* the
-/// harness pushes it. The backend follows the URL scheme (`kind` overrides):
-///   - `gitlawb://<did>/<repo>` → a signed ref-update via the `git-remote-gitlawb` helper.
-///   - anything else (`git@host:…`, `https://…`, a local path) → plain `git push`.
+/// harness pushes it — a plain `git push` to `url` (`git@host:…`, `https://…`, or a local path).
 ///
-/// A list of these is how a duck keeps its soul on a reliable primary AND a decentralized mirror
-/// at once; a `required: false` mirror that's down is logged, never fatal.
+/// A list of these keeps a duck's soul on a reliable primary AND best-effort mirrors at once; a
+/// `required: false` mirror that's down is logged, never fatal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SoulRemote {
-    /// The push URL (its scheme selects the backend unless `kind` is set).
+    /// The push URL.
     pub url: String,
-    /// Force the backend instead of inferring it from `url`'s scheme.
-    #[serde(default)]
-    pub kind: Option<RemoteKind>,
-    /// gitlawb only: the node the signed push targets (`GITLAWB_NODE`). Defaults to `gitlawb_node`.
-    #[serde(default)]
-    pub node: Option<String>,
-    /// gitlawb only: which `identities.<role>` key signs the push. Defaults to `"soul"`.
-    #[serde(default)]
-    pub identity: Option<String>,
     /// Plain-git over HTTPS only: an access token (e.g. a GitHub PAT) read from the daemon's
     /// environment and injected as an EPHEMERAL git credential at push time — never written to
     /// disk, never in agent env. SSH remotes (`git@…`) need none (the ambient key authenticates).
@@ -901,16 +868,6 @@ pub struct SoulRemote {
     /// blocks the agent). Set `true` on the primary you require to durably persist the soul.
     #[serde(default)]
     pub required: bool,
-}
-
-/// The soul-push backend behind a [`SoulRemote`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum RemoteKind {
-    /// Plain `git push` (GitHub / GitLab / Gitea / self-hosted / local path). No gitlawb signing.
-    Git,
-    /// Signed `gitlawb://` ref-update via the `git-remote-gitlawb` helper.
-    Gitlawb,
 }
 
 /// HTTPS access-token auth for a plain-git [`SoulRemote`]. The token VALUE never lives in config:
@@ -953,9 +910,6 @@ fn default_webhook_addr() -> String {
 }
 fn default_bridge_dir() -> String {
     "openclaude-bridge".to_string()
-}
-fn default_gitlawb_node() -> String {
-    "https://node.gitlawb.com".to_string()
 }
 fn default_invoke_timeout_secs() -> u64 {
     300
@@ -1072,8 +1026,8 @@ impl DackConfig {
         }
     }
 
-    /// The configured `gl` identity dirs keyed by role — fed to
-    /// [`GitlawbIdentity::resolve`](crate::identity::gitlawb::GitlawbIdentity::resolve) so the
+    /// The configured identity dirs keyed by role — fed to
+    /// [`LocalIdentity::resolve`](crate::identity::local::LocalIdentity::resolve) so the
     /// harness can sign as the Soul (and, later, verify operator_signed via the Operator DID).
     pub fn identity_dirs(
         &self,
@@ -1102,9 +1056,6 @@ impl DackConfig {
         match &self.soul_remote {
             Some(url) => vec![SoulRemote {
                 url: url.clone(),
-                kind: None,
-                node: None,
-                identity: None,
                 auth: None,
                 required: false,
             }],
@@ -1187,21 +1138,20 @@ secrets:
              \x20 - { url: \"git@github.com:obraztsov/dack-soul.git\", required: true }\n\
              \x20 - url: \"https://github.com/obraztsov/dack-soul.git\"\n\
              \x20   auth: { token_env: GITHUB_TOKEN }\n\
-             \x20 - { url: \"gitlawb://did:key:zSoul/dack-soul\" }\n",
+             \x20 - { url: \"git@git.self-hosted.example:soul.git\" }\n",
         )
         .unwrap();
         let rs = cfg.effective_soul_remotes();
         assert_eq!(rs.len(), 3);
-        // First: SSH primary, required, no token, backend inferred git (non-gitlawb scheme).
+        // First: SSH primary, required, no token.
         assert!(rs[0].required);
         assert!(rs[0].auth.is_none());
-        assert!(!rs[0].url.starts_with("gitlawb://"));
         // Second: HTTPS with a token env + the default x-access-token username.
         assert_eq!(rs[1].auth.as_ref().unwrap().token_env, "GITHUB_TOKEN");
         assert_eq!(rs[1].auth.as_ref().unwrap().username, "x-access-token");
         assert!(!rs[1].required);
-        // Third: a gitlawb mirror, best-effort by default.
-        assert!(rs[2].url.starts_with("gitlawb://"));
+        // Third: a self-hosted mirror, best-effort by default.
+        assert_eq!(rs[2].url, "git@git.self-hosted.example:soul.git");
         assert!(!rs[2].required);
     }
 
@@ -1210,12 +1160,12 @@ secrets:
         // An OLD config (single field) keeps working: it becomes a one-element best-effort list.
         let cfg = DackConfig::from_yaml(
             "operator_did: \"did:x\"\n\
-             soul_remote: \"gitlawb://did:key:zSoul/dack-soul\"\n",
+             soul_remote: \"git@github.com:obraztsov/dack-soul.git\"\n",
         )
         .unwrap();
         let rs = cfg.effective_soul_remotes();
         assert_eq!(rs.len(), 1);
-        assert_eq!(rs[0].url, "gitlawb://did:key:zSoul/dack-soul");
+        assert_eq!(rs[0].url, "git@github.com:obraztsov/dack-soul.git");
         assert!(!rs[0].required, "legacy remote is best-effort (matches old behavior)");
         // No remote at all ⇒ empty list (local-only).
         let none = DackConfig::from_yaml("operator_did: \"did:x\"\n").unwrap();

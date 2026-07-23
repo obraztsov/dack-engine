@@ -33,7 +33,7 @@ pub enum DackError {
     #[error("timeout: {0}")]
     Timeout(String),
 
-    /// Repo-host adapter (Gitlawb / plain-git fallback).
+    /// Repo-host adapter (plain-git).
     #[error("repo: {0}")]
     Repo(String),
 

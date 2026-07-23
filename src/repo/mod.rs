@@ -1,6 +1,5 @@
-//! Repo-host seam. The core speaks **"commit to repo Y"**; the
-//! actor bundle is *a git repo*, so the degraded-mode fallback is a plain git remote
-//! with no state-logic change ( — Gitlawb node software is pre-alpha).
+//! Repo-host seam. The core speaks **"commit to repo Y"**; the actor bundle is *a git repo* pushed
+//! to one or more plain git remotes (GitHub / self-hosted).
 //!
 //! This is where the soul/memory/skills/runlogs live (off-VPS): durable state
 //! with a different lifetime than the ephemeral SQLite queue.
@@ -80,13 +79,12 @@ pub trait RepoHost: Send + Sync {
     /// commit (the revert is the absence of a change, not a new commit).
     async fn restore_to_head(&self, change: &RepoChange) -> Result<()>;
 
-    /// Push committed history to the configured remote — plain `git push` for [`git::PlainGitRepo`],
-    /// a signed `gitlawb://` ref-update for [`gitlawb::GitlawbRepo`]. No-op when no remote is set
-    /// (offline / degraded mode). Called at the end of a successful commit-sweep.
+    /// Push committed history to the configured remote(s) — a plain `git push`
+    /// ([`git::PlainGitRepo`] / [`multi::MultiRemoteRepo`]). No-op when no remote is set (offline /
+    /// local-only). Called at the end of a successful commit-sweep.
     async fn push(&self) -> Result<()>;
 }
 
 pub mod git;
 pub mod gitcore;
-pub mod gitlawb;
 pub mod multi;

@@ -1,5 +1,5 @@
 //! Identity-provider seam. The core speaks **"sign as identity X"**;
-//! Gitlawb specifics stay in the adapter so the corporate variant
+//! backend specifics stay in the adapter so a corporate variant
 //! (`CorporateIdentity`) is an adapter swap, not a harness refactor. Provenance is a
 //! signature check (RFC 9421 / Ed25519), never a sentence the model evaluates
 //! ("provenance beats persuasion").
@@ -28,7 +28,7 @@ pub enum IdentityRole {
     Builder,
 }
 
-/// Sign / verify on behalf of a DID. v1 impl: [`gitlawb::GitlawbIdentity`].
+/// Sign / verify on behalf of a DID. Native impl: [`local::LocalIdentity`].
 #[async_trait]
 pub trait IdentityProvider: Send + Sync {
     fn did(&self, role: IdentityRole) -> Option<&Did>;
@@ -44,5 +44,4 @@ pub trait IdentityProvider: Send + Sync {
 }
 
 pub mod ed25519;
-pub mod gitlawb;
 pub mod local;

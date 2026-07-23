@@ -27,7 +27,7 @@
 //! - [`sensor`]   — the pure-perceiver sensor contract
 //! - [`bus`] / [`queue`] / [`sources`] / [`webserver`] — the dumb stimulus pipeline
 //! - [`runtime`]  — the OpenClaude stdio-bridge seam + the `action_required` wall (taint-gated Settle)
-//! - [`identity`] / [`repo`] — the swappable seams (Gitlawb v1; corp later). Memory has **no**
+//! - [`identity`] / [`repo`] — the swappable seams (native Ed25519 + plain-git; corp later). Memory has **no**
 //!   Rust seam — the agent reaches it through the path-gated file tools.
 //! - [`secrets`] / [`runlog`] — harness-owned plumbing stores
 //! - [`harness`]  — the actor-scheduler that wires it all together

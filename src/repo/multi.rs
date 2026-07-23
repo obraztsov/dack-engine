@@ -2,9 +2,9 @@
 //! single working tree (shared [`GitCore`], identical local semantics to [`PlainGitRepo`]) and a
 //! list of independent *push targets* it fans out to after each commit-sweep.
 //!
-//! Why a list: a duck can keep its soul on a reliable primary (GitHub / self-hosted, plain `git
-//! push`) AND a decentralized mirror (`gitlawb://`, signed ref-update) at the same time. Each
-//! target is best-effort by default — a flaky/down mirror is logged and retried next cycle, never
+//! Why a list: a duck can keep its soul on a reliable primary (GitHub / self-hosted) AND one or more
+//! mirrors at the same time (all plain `git push`). Each target is best-effort by default — a
+//! flaky/down mirror is logged and retried next cycle, never
 //! blocking the agent — while a `required` target propagates its failure to the caller. The local
 //! read/write/commit/status/revert path is untouched: only `push()` changed shape.
 //!
@@ -14,8 +14,7 @@ use async_trait::async_trait;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::gitcore::GitCore;
-use super::gitlawb::is_transient_push_error;
+use super::gitcore::{is_transient_push_error, GitCore};
 use super::{CommitId, CommitMeta, RepoChange, RepoHost, RepoPath};
 use crate::error::{DackError, Result};
 
@@ -30,27 +29,18 @@ pub enum PushTarget {
         token: Option<(String, String)>,
         required: bool,
     },
-    /// Signed `gitlawb://` push: the `git-remote-gitlawb` helper signs the ref-update with the key
-    /// at `key_path` (`GITLAWB_KEY`), pushing to `node` (`GITLAWB_NODE`).
-    Gitlawb {
-        name: String,
-        url: String,
-        key_path: PathBuf,
-        node: String,
-        required: bool,
-    },
 }
 
 impl PushTarget {
     pub fn name(&self) -> &str {
         match self {
-            PushTarget::Git { name, .. } | PushTarget::Gitlawb { name, .. } => name,
+            PushTarget::Git { name, .. } => name,
         }
     }
 
     pub fn required(&self) -> bool {
         match self {
-            PushTarget::Git { required, .. } | PushTarget::Gitlawb { required, .. } => *required,
+            PushTarget::Git { required, .. } => *required,
         }
     }
 
@@ -62,15 +52,6 @@ impl PushTarget {
         let mut attempt = 1u32;
         loop {
             let res = match self {
-                PushTarget::Gitlawb {
-                    url, key_path, node, ..
-                } => {
-                    let env = [
-                        ("GITLAWB_KEY", key_path.to_string_lossy().into_owned()),
-                        ("GITLAWB_NODE", node.clone()),
-                    ];
-                    core.push(url, &env).await
-                }
                 PushTarget::Git { url, token, .. } => match token {
                     None => core.push(url, &[]).await,
                     Some((user, token_env)) => match std::env::var(token_env) {

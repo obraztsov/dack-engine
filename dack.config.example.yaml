@@ -132,31 +132,26 @@ secrets:
 #   image: dack/worker:latest
 
 # ── Soul push destinations + identities ──────────────────────────────────────────────────────────
-# The soul is ONE local git repo; `soul_remotes` is the LIST of places the harness pushes it after
-# each cycle. Several entries = redundancy. The backend is inferred from each URL's scheme:
-#   • gitlawb://<soul-did>/<repo>  → signed ref-update (the `git-remote-gitlawb` helper signs with
-#     the identity named by `identity:`, default soul). `node:` overrides the default gitlawb node.
-#   • anything else (git@…, https://…, a local path) → plain `git push`.
-# `required: true` makes a push failure to THAT target fail the cycle's push; default false =
-# best-effort (logged, re-pushed next cycle — a down mirror never blocks the agent). Omit the whole
+# The soul is ONE local git repo; `soul_remotes` is the LIST of places the harness pushes it (a plain
+# `git push`) after each cycle. Several entries = redundancy (a reliable primary + best-effort
+# mirrors). `required: true` makes a push failure to THAT target fail the cycle's push; default false
+# = best-effort (logged, re-pushed next cycle — a down mirror never blocks the agent). Omit the whole
 # list for local-only (commits, no push). GITIGNORE /identities/ — these are private keys.
 # soul_remotes:
 #   - url: "git@github.com:youruser/my-soul.git"   # SSH primary: add a deploy key to the repo;
 #     required: true                               #   no token needed, the ambient key authenticates
 #   - url: "https://github.com/youruser/my-soul.git"   # HTTPS alt: token read from the daemon env
 #     auth: { token_env: GITHUB_TOKEN }                #   (a fine-grained PAT with contents:write)
-#   - url: "gitlawb://did:key:z6MkYourSoulDidReplaceMe/my-soul"   # decentralized mirror (best-effort)
-#     identity: soul
-# gitlawb_node: "https://node.gitlawb.com"         # default node for gitlawb entries that omit node:
+#   - url: "git@git.self-hosted.example:my-soul.git"   # a self-hosted mirror (best-effort)
 #
 # Legacy single-remote form (still supported; becomes a one-element best-effort list):
-# soul_remote: "gitlawb://did:key:z6MkYourSoulDidReplaceMe/my-soul"
+# soul_remote: "git@github.com:youruser/my-soul.git"
 
 identities:
   operator: "identities/operator"  # signs `dack say`  — make it with `dack keygen --role operator …`
   soul: "identities/soul"          # attributes soul commits; harness-only, NEVER in agent env
   # builder: "identities/builder"  # env-forwardable outward-creation key (optional)
-  # backend: local                 # default: native Ed25519 (no external tools). `gitlawb` = the `gl` CLI.
+  # backend: local                 # native Ed25519 (the only backend; no external tools)
 
 # ── Behavior knobs (all optional; defaults shown) ────────────────────────────────────────────────
 default_entry: perceive                  # state-prompt that `dack say` / the boot ping enter at

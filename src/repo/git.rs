@@ -1,10 +1,9 @@
-//! Plain-git repo-host adapter — the **degraded-mode fallback** and the base
+//! Plain-git repo-host adapter — a single plain remote (GitHub / GitLab / self-hosted), and the base
 //! of the corp variant (`GitHub/GitLab + Claude Code`).
 //!
-//! Fully functional: all operations delegate to the shared [`GitCore`]. Because the actor
-//! bundle is just a git repo, a plain remote (GitHub/GitLab/self-hosted) is a drop-in if
-//! Gitlawb breaks mid-experiment — no state-logic change. Pushes (if a remote is set) use
-//! ordinary `git push`; there is no Gitlawb signing here.
+//! Fully functional: all operations delegate to the shared [`GitCore`]. The actor bundle is just a
+//! git repo, so pushes (if a remote is set) use ordinary `git push`. (For multiple remotes, see
+//! [`super::multi::MultiRemoteRepo`].)
 
 use async_trait::async_trait;
 use std::path::PathBuf;
@@ -66,8 +65,7 @@ impl RepoHost for PlainGitRepo {
     async fn restore_to_head(&self, change: &RepoChange) -> Result<()> {
         self.core.restore_to_head(change).await
     }
-    /// Plain `git push` to the configured remote, or a no-op when none is set (offline /
-    /// degraded mode). No Gitlawb signing here.
+    /// Plain `git push` to the configured remote, or a no-op when none is set (offline / local-only).
     async fn push(&self) -> Result<()> {
         match &self.remote {
             Some(remote) => self.core.push(remote, &[]).await,

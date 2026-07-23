@@ -413,7 +413,7 @@ async fn run(config_path: &str) -> Result<()> {
     // Shares the queue with ingestion (senses write, cognition reads). The runtime spawns
     // the bun bridge per invocation; if it's unreachable, dispatch errors are logged and the
     // loop stays up (logging-not-rollback).
-    // The runtime extensibility point: only openclaude+opengateway is wired; any other engine or
+    // The runtime extensibility point: only openclaude+openai-compatible is wired; any other engine or
     // connector is a clear `NotImplemented` (the config slot exists, the adapter doesn't yet).
     // Shared runtime health registry (the "subconscious"): the broker records per-secret health, the
     // loops record per-stimulus health, the runtime records per-MCP connect health, and Reflect /
@@ -564,7 +564,7 @@ async fn run(config_path: &str) -> Result<()> {
 }
 
 /// Construct the runtime client from `config.runtime` (the engine + connector extensibility point).
-/// Only `openclaude`+`opengateway` is wired; any other engine/connector returns a clear
+/// Only `openclaude`+`openai-compatible` is wired; any other engine/connector returns a clear
 /// `NotImplemented` (the config parses, the adapter just isn't built yet — see `RuntimeConfig`).
 fn build_runtime(
     config: &DackConfig,
@@ -576,7 +576,7 @@ fn build_runtime(
     // (engine is exhaustive today — a future `ClaudeCode` arm lands with its own adapter here.)
     if let Connector::Anthropic { .. } = rt.connector {
         return Err(DackError::NotImplemented(
-            "runtime.connector: anthropic — not wired yet (only opengateway). \
+            "runtime.connector: anthropic — not wired yet (only openai-compatible). \
              The model channel (options.model) is supported; the env/auth wiring is the TODO.",
         ));
     }

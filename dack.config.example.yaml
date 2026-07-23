@@ -19,14 +19,15 @@ soul_repo: "my-soul"
 
 # ── Runtime: how the agent reaches a model ──────────────────────────────────────────────────────
 # `engine` = the agent runtime (only `openclaude` is wired — spawns `bun run bridge.ts`).
-# `connector` = how it reaches models. `opengateway` is any OpenAI-compatible endpoint; it routes the
-#   per-state model via the child's OPENAI_MODEL env and sets CLAUDE_CODE_USE_OPENAI itself.
+# `connector` = how it reaches models. `openai-compatible` targets any OpenAI-compatible endpoint (a
+#   hosted gateway, a provider-direct API, a local vLLM); it routes the per-state model via the child's
+#   OPENAI_MODEL env and sets CLAUDE_CODE_USE_OPENAI itself. (`type: opengateway` still parses, aliased.)
 # `model` = the default model id; tier_policy.<state>.model overrides it per state.
 runtime:
   engine: { type: openclaude, bridge_dir: openclaude-bridge }
   connector:
-    type: opengateway
-    api_url: "https://your-gateway/v1"      # → OPENAI_BASE_URL (omit to take from the daemon env)
+    type: openai-compatible
+    api_url: "https://your-provider/v1"     # → OPENAI_BASE_URL (omit to take from the daemon env)
     api_key: "…"                            # → OPENAI_API_KEY (gitignored config only; omit → env)
   model: "your-default-model-id"
 

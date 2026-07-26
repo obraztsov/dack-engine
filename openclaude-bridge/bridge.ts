@@ -63,14 +63,18 @@ const OUTPUT_INSTRUCTION =
   'When you have finished perceiving and taking any permitted actions, your FINAL message ' +
   'MUST be ONLY a single JSON object (no prose, no markdown fence) with this shape: ' +
   '{"thought": string, ' +
-  '"tag_notes": [{"tag": string, "note": string}]|null, ' +
+  '"tag_notes": [{"tag": string, "note": string, "kind": "digest"|"memory"|null}]|null, ' +
   '"spawn": {"agent": string, "brief": string}|null, ' +
   '"batons": [{"to_prompt": string, "gist": string, "priority": "low"|"normal"|"high"|"urgent"|null}]}. ' +
   '"batons" is your fan-out: ONE element to take a single next step, SEVERAL to do several things at ' +
   'once (each its OWN gist + destination, each gated independently by your trust ceiling), or [] to ' +
   'stop. Each "to_prompt" must be one of the ids in your allowed-transitions context block. Set ' +
   '"spawn" to delegate a job to a worker (only if your orientation lists it as available; the worker ' +
-  'runs detached and returns later), else null. Output nothing after the JSON.'
+  'runs detached and returns later), else null. ' +
+  '"tag_notes" are optional short sticky notes on a conversation tag: prefer "kind": "digest" for ' +
+  'routine observations (the digest folds them into long-term memory, then they retire — so they do not ' +
+  'pile up in your context); use "kind": "memory" (the default when omitted) only for a durable fact ' +
+  'worth keeping in view across cycles. Output nothing after the JSON.'
 
 // PARSE-FAIL recovery: how many times to re-prompt for the JSON when the model emits prose instead.
 // Bounded here AND by the harness's `invoke_timeout_secs` (the whole round-trip shares that budget).

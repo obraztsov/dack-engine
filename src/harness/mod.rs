@@ -765,22 +765,25 @@ impl Harness {
             .then(|| prompt.model.clone())
             .flatten()
             .or_else(|| policy.model.clone());
-        // Captured for the latency log (the `model` binding is moved into the request below).
-        let model_label = model.clone().unwrap_or_else(|| "default".into());
 
         // Built AFTER the resume lookup: a sticky RESUME gets the lean `resume_body`, a fresh run the
         // full body.
         let system_prompt = self.system_prompt_for_prompt(prompt).await;
-        // Untrusted media (Phase 1: Telegram photos) rides ONLY the Perceive world-payload — the
-        // firebreak keeps it off the Act path (downstream gets the digested text gist, never bytes).
-        // Resolve + CONFINE each ingress-supplied filename to the harness media dir; empty for any
-        // stimulus without images.
+        // Images (Phase 1: Telegram photos) ride ONLY a Perceive world-payload — the firebreak keeps them
+        // off the Act path (downstream gets the digested text gist, never bytes) — and ONLY when a vision
+        // model is configured: attaching an image to the default reasoning model fails (xiaomi
+        // `mimo-v2.5-pro` 404s on image input). Resolve + CONFINE each ingress-supplied filename to the
+        // harness media dir; empty for any stimulus without images.
         let media = match step {
-            StepInput::Entry => {
+            StepInput::Entry if self.config.vision_model.is_some() => {
                 crate::media::resolve(&stimulus.payload, &crate::media::dir(&self.config.media_dir))
             }
-            StepInput::Act(_) => Vec::new(),
+            _ => Vec::new(),
         };
+        // An image-bearing Perceive is routed to the VISION model, overriding the per-state/default model
+        // (which can't see images). Non-image cycles keep the resolved model.
+        let model = if media.is_empty() { model } else { self.config.vision_model.clone().or(model) };
+        let model_label = model.clone().unwrap_or_else(|| "default".into());
         let req = InvocationRequest {
             system_prompt,
             spec: spec.clone(),

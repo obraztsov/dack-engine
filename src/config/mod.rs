@@ -649,6 +649,13 @@ pub struct DackConfig {
     /// forever. Bounds disk like the runlog. Default 7.
     #[serde(default = "default_media_retention_days")]
     pub media_retention_days: u64,
+    /// **Vision model** (Phase 1 images): the model id an image-bearing Perceive cycle is routed to,
+    /// overriding the per-state/default model — because the default reasoning model may not accept images
+    /// (xiaomi `mimo-v2.5-pro` 404s on image input; `mimo-v2.5` handles vision). `None` (default) ⇒ images
+    /// are NOT ingested at all (attaching them to a non-vision model would fail); set this to enable image
+    /// perception.
+    #[serde(default)]
+    pub vision_model: Option<String>,
     /// **Load-shedding cap**: the max PENDING queue depth before the OLDEST `Low`-priority
     /// items are evicted (Normal+ is the protected floor, never shed; every eviction is logged).
     /// Protects a busy duck from a runaway low-priority fan-out backlog. `None` = unbounded.

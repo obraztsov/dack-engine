@@ -1367,6 +1367,17 @@ impl Harness {
                         };
                         extra_env.insert("RUNLOG_DB".to_string(), abs.to_string_lossy().into_owned());
                     }
+                    // Every MCP server also sees INGRESS_DB (ABSOLUTE): the telegram `set_chat_attachments`
+                    // tools author per-chat attachment permissions in the ingress store. Same cwd caveat.
+                    {
+                        let p = std::path::PathBuf::from(&self.config.ingress_db);
+                        let abs = if p.is_absolute() {
+                            p
+                        } else {
+                            std::env::current_dir().map(|d| d.join(&p)).unwrap_or(p)
+                        };
+                        extra_env.insert("INGRESS_DB".to_string(), abs.to_string_lossy().into_owned());
+                    }
                     for (var, field) in &server.scope_env {
                         // Reserved field `dedup_key` resolves to the Stimulus's conversation key (not a
                         // payload field) — the platform-agnostic conversation TAG (telegram chat_id /

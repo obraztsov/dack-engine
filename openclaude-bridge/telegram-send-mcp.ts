@@ -30,6 +30,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { Database } from 'bun:sqlite'
 import { z } from 'zod'
+import { openIngressStore, setChatAttachment } from './ingress-store'
 
 type Destinations = {
   named: Record<string, number | string> // symbolic name → chat_id (operator-registered)
@@ -151,6 +152,33 @@ server.registerTool(
       })
     }
     return asText(await tgSend({ chat_id: chat, text }))
+  },
+)
+
+// Per-chat attachment store (harness-injected INGRESS_DB, absolute; shared with the ingress via WAL).
+const ingressStore = process.env.INGRESS_DB ? openIngressStore(process.env.INGRESS_DB) : null
+
+server.registerTool(
+  'set_chat_attachments',
+  {
+    description:
+      `Enable or disable image/photo attachments for a KNOWN contact you can address` +
+      `${NAMES.length ? ` (${NAMES.join(', ')})` : ''}` +
+      `${DESTS.groups.length ? ` or an allowed group chat_id` : ''}` +
+      `${DESTS.allow_known_private ? ` or the numeric chat_id of a user who has messaged you before` : ''}. ` +
+      `Use to proactively let a client send you screenshots (e.g. after they become a paying user). Same ` +
+      `fail-closed allow-list as send — a chat_id you can't justify is refused.`,
+    inputSchema: { to: z.string().min(1), allowed: z.boolean() },
+  },
+  async ({ to, allowed }: { to: string; allowed: boolean }) => {
+    const chat = resolveTarget(to)
+    if (chat === null) {
+      return asText({ ok: false, error: `destination "${to}" not allowed`, allowed_names: NAMES })
+    }
+    if (!ingressStore) return asText({ ok: false, error: 'INGRESS_DB not set — attachment store unavailable' })
+    setChatAttachment(ingressStore, String(chat), allowed)
+    console.error(`[telegram-send] set_chat_attachments chat=${chat} allowed=${allowed}`)
+    return asText({ ok: true, chat_id: chat, allowed })
   },
 )
 

@@ -177,6 +177,7 @@ queue_max_depth: 10000                   # load-shed cap: evict OLDEST low-prio 
 db_path: "dack.sqlite"                   # embedded queue (ephemeral; losing it loses only the queue)
 # media_dir: "media"                     # Phase 1 images: harness-owned dir a channel adapter drops photos into
 # media_retention_days: 7                # delete stored media older than N days (0 = keep forever)
+# ingress_db: "ingress.sqlite"           # telegram-ingress store (per-chat attachment perms); injected as INGRESS_DB into MCP servers
 webhook_addr: "127.0.0.1:8787"           # localhost-only webhook listener
 invoke_timeout_secs: 300                 # budget for one consciousness invocation
 # reflect_invoke_timeout_secs: 900       # optional LONGER budget for Reflect (daily self-mod); omit ⇒ uses the above

@@ -14,6 +14,11 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
+import { openIngressStore, setChatAttachment } from './ingress-store'
+
+// Per-chat attachment store — the harness injects INGRESS_DB (absolute). Absent ⇒ the toggle is
+// unavailable (returns an error); `reply` still works.
+const ingressStore = process.env.INGRESS_DB ? openIngressStore(process.env.INGRESS_DB) : null
 
 async function tgSend(body: Record<string, unknown>): Promise<unknown> {
   const token = process.env.TELEGRAM_BOT_TOKEN
@@ -47,6 +52,25 @@ server.registerTool(
     const replyTo = process.env.TELEGRAM_REPLY_TO
     if (replyTo) body.reply_parameters = { message_id: Number(replyTo) }
     return asText(await tgSend(body))
+  },
+)
+
+server.registerTool(
+  'set_chat_attachments',
+  {
+    description:
+      'Enable or disable image/photo attachments FOR THE CHAT YOU ARE TALKING IN. The destination is ' +
+      'fixed by the harness to the chat that woke you — you provide only the flag, you cannot toggle ' +
+      'anywhere else. Turn ON when a client wants to send screenshots; OFF to stop processing their images.',
+    inputSchema: { allowed: z.boolean() },
+  },
+  async ({ allowed }: { allowed: boolean }) => {
+    const chat = process.env.TELEGRAM_REPLY_CHAT
+    if (!chat) return asText({ ok: false, error: 'no source chat in scope — this cycle was not woken by Telegram' })
+    if (!ingressStore) return asText({ ok: false, error: 'INGRESS_DB not set — attachment store unavailable' })
+    setChatAttachment(ingressStore, chat, allowed)
+    console.error(`[telegram-mcp] set_chat_attachments chat=${chat} allowed=${allowed}`)
+    return asText({ ok: true, chat_id: chat, allowed })
   },
 )
 

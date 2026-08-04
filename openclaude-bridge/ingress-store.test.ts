@@ -1,5 +1,11 @@
 import { test, expect } from 'bun:test'
-import { openIngressStore, attachmentKind, attachmentsAllowed } from './ingress-store'
+import {
+  openIngressStore,
+  attachmentKind,
+  attachmentsAllowed,
+  setChatAttachment,
+  getChatAttachment,
+} from './ingress-store'
 
 test('attachmentKind classifies by intrinsic category (independent of path config)', () => {
   const groups = { '-100': '/telegram/trusted' }
@@ -30,4 +36,15 @@ test('attachmentsAllowed: DM on by default, group off, per-chat override wins', 
 
   // a config default can flip a whole kind (e.g. DMs off globally) for a chat with no override
   expect(attachmentsAllowed(db, { dm: false }, '777', 'dm')).toBe(false)
+})
+
+test('setChatAttachment upserts + getChatAttachment reads (the MCP authoring path)', () => {
+  const db = openIngressStore(':memory:')
+  expect(getChatAttachment(db, '-500')).toBe(null) // no override yet → null (falls back to kind default)
+  setChatAttachment(db, '-500', true) // the duck enables a group (a client)
+  expect(getChatAttachment(db, '-500')).toBe(true)
+  expect(attachmentsAllowed(db, {}, '-500', 'group')).toBe(true) // override beats the group=false default
+  setChatAttachment(db, '-500', false) // and can turn it back off (upsert, not a second row)
+  expect(getChatAttachment(db, '-500')).toBe(false)
+  expect(db.query('SELECT COUNT(*) c FROM chat_attachments WHERE chat_id = ?').get('-500')).toEqual({ c: 1 })
 })

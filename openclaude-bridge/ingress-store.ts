@@ -66,3 +66,24 @@ export function attachmentsAllowed(
   if (row) return !!row.allowed
   return defaults[kind] ?? ATTACH_DEFAULTS[kind]
 }
+
+/** Upsert a per-chat attachment override (the duck's `set_chat_attachments` authoring). */
+export function setChatAttachment(
+  db: Database,
+  chatId: string,
+  allowed: boolean,
+  now: number = Math.floor(Date.now() / 1000),
+): void {
+  db.query(
+    'INSERT INTO chat_attachments (chat_id, allowed, updated_at) VALUES (?, ?, ?) ' +
+      'ON CONFLICT(chat_id) DO UPDATE SET allowed = excluded.allowed, updated_at = excluded.updated_at',
+  ).run(chatId, allowed ? 1 : 0, now)
+}
+
+/** The current per-chat override, or `null` if none is set (falls back to the kind default). */
+export function getChatAttachment(db: Database, chatId: string): boolean | null {
+  const row = db.query('SELECT allowed FROM chat_attachments WHERE chat_id = ?').get(chatId) as
+    | { allowed: number }
+    | null
+  return row ? !!row.allowed : null
+}

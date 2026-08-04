@@ -712,6 +712,12 @@ pub struct DackConfig {
     /// is created on boot. Read-only by the recall MCPs. (v0.2.0)
     #[serde(default = "default_runlog_db")]
     pub runlog_db: String,
+    /// The **ingress SQLite store** path (cwd-relative) — the telegram-ingress adapter's own state
+    /// (per-chat attachment permissions; future ingress state), in `/duck` (a duck's migration/backup
+    /// set). Injected ABSOLUTE as `INGRESS_DB` into every MCP server so the duck's `set_chat_attachments`
+    /// tool can author it (shared with the ingress reader via SQLite WAL). Default `ingress.sqlite`.
+    #[serde(default = "default_ingress_db")]
+    pub ingress_db: String,
     /// Hard-GC ceiling: delete runlog ENTRIES older than this (the multi-GB guard; the surfaced window
     /// is smaller + per-prompt frontmatter). Large by design.
     #[serde(default = "default_runlog_hard_days")]
@@ -934,6 +940,9 @@ fn default_soul_repo() -> String {
 }
 fn default_runlog_db() -> String {
     "runlogs.sqlite".to_string()
+}
+fn default_ingress_db() -> String {
+    "ingress.sqlite".to_string()
 }
 fn default_runlog_hard_days() -> u64 {
     30

@@ -10,10 +10,11 @@ use std::sync::{Arc, RwLock};
 
 use axum::extract::{Request, State};
 use axum::http::{Method, StatusCode};
-use axum::Router;
+use axum::{Json, Router};
 use tokio::sync::mpsc;
 
 use super::WebhookListener;
+use crate::active::{ActiveConversation, ActiveConversations};
 use crate::error::{DackError, Result};
 use crate::sources::FiredTrigger;
 
@@ -22,6 +23,9 @@ struct Inner {
     /// `path` → `def_id`. Replaced wholesale on `set_routes`.
     routes: RwLock<HashMap<String, String>>,
     tx: mpsc::Sender<FiredTrigger>,
+    /// Conversations a cycle is processing right now — read-only here, served over
+    /// `GET /active-conversations` (the Telegram ingress polls it for the typing indicator).
+    active: ActiveConversations,
 }
 
 pub struct AxumWebhookListener {
@@ -34,13 +38,19 @@ const MAX_BODY: usize = 1 << 20;
 
 impl AxumWebhookListener {
     /// Build the listener over a caller-owned `FiredTrigger` channel (shared with the cron
-    /// wheel). Bind/serve happens in [`serve`](Self::serve).
-    pub fn new(addr: SocketAddr, tx: mpsc::Sender<FiredTrigger>) -> Arc<Self> {
+    /// wheel) and a shared [`ActiveConversations`] handle (also written by the consciousness loop).
+    /// Bind/serve happens in [`serve`](Self::serve).
+    pub fn new(
+        addr: SocketAddr,
+        tx: mpsc::Sender<FiredTrigger>,
+        active: ActiveConversations,
+    ) -> Arc<Self> {
         Arc::new(Self {
             addr,
             inner: Arc::new(Inner {
                 routes: RwLock::new(HashMap::new()),
                 tx,
+                active,
             }),
         })
     }
@@ -48,6 +58,9 @@ impl AxumWebhookListener {
     /// Bind localhost and serve until the process ends. Caller owns the task handle.
     pub async fn serve(self: Arc<Self>) -> Result<()> {
         let app = Router::new()
+            // Read-only observability: which conversations are being processed right now. Localhost-only
+            // (same as the POST hooks), read from in-memory state — cheap enough to poll every few seconds.
+            .route("/active-conversations", axum::routing::get(active_handler))
             .fallback(handle)
             .with_state(self.inner.clone());
         let listener = tokio::net::TcpListener::bind(self.addr)
@@ -88,6 +101,19 @@ async fn handle(State(inner): State<Arc<Inner>>, req: Request) -> StatusCode {
     }
 }
 
+/// `GET /active-conversations` → the conversations a cycle is processing right now, from in-memory state.
+/// The Telegram ingress polls this (every ~4s) and sends a `typing` chat action for each active DM.
+async fn active_handler(State(inner): State<Arc<Inner>>) -> Json<ActiveResponse> {
+    Json(ActiveResponse {
+        active: inner.active.snapshot(),
+    })
+}
+
+#[derive(serde::Serialize)]
+struct ActiveResponse {
+    active: Vec<ActiveConversation>,
+}
+
 #[async_trait::async_trait]
 impl WebhookListener for AxumWebhookListener {
     async fn set_routes(&self, routes: &[(String, String)]) -> Result<()> {
@@ -104,7 +130,7 @@ mod tests {
     fn listener() -> (Arc<AxumWebhookListener>, mpsc::Receiver<FiredTrigger>) {
         let (tx, rx) = mpsc::channel(8);
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        (AxumWebhookListener::new(addr, tx), rx)
+        (AxumWebhookListener::new(addr, tx, ActiveConversations::new()), rx)
     }
 
     fn post(path: &str, body: &str) -> Request {
@@ -150,6 +176,29 @@ mod tests {
         let req = Request::builder()
             .method(Method::GET)
             .uri("/hooks/inbox")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(handle(State(l.inner.clone()), req).await, StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn active_conversations_endpoint_reports_in_flight() {
+        let (tx, _rx) = mpsc::channel(8);
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let active = ActiveConversations::new();
+        active.begin("555", "telegram_message", "telegram-op");
+        let l = AxumWebhookListener::new(addr, tx, active.clone());
+
+        // The handler reads the shared registry and renders it.
+        let Json(resp) = active_handler(State(l.inner.clone())).await;
+        assert_eq!(resp.active.len(), 1);
+        assert_eq!(resp.active[0].key, "555");
+        assert_eq!(resp.active[0].type_, "telegram_message");
+
+        // A GET to a webhook path still falls through to 405 (only the exact route is a GET).
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/telegram/pub")
             .body(Body::empty())
             .unwrap();
         assert_eq!(handle(State(l.inner.clone()), req).await, StatusCode::METHOD_NOT_ALLOWED);

@@ -32,6 +32,7 @@
 //! - [`secrets`] / [`runlog`] — harness-owned plumbing stores
 //! - [`harness`]  — the actor-scheduler that wires it all together
 
+pub mod active;
 pub mod bus;
 pub mod cli;
 pub mod config;

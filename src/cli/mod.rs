@@ -389,7 +389,10 @@ async fn run(config_path: &str) -> Result<()> {
         .webhook_addr
         .parse()
         .map_err(|e| DackError::Config(format!("webhook_addr `{}`: {e}", config.webhook_addr)))?;
-    let webhook = AxumWebhookListener::new(addr, tx);
+    // Conversations being processed right now — written by the consciousness loop, read by the webhook
+    // server's `GET /active-conversations` (the Telegram ingress polls it for the typing indicator).
+    let active = crate::active::ActiveConversations::new();
+    let webhook = AxumWebhookListener::new(addr, tx, active.clone());
 
     // Initial schedule + routes from the registry.
     {
@@ -483,8 +486,9 @@ async fn run(config_path: &str) -> Result<()> {
     tokio::spawn({
         let h = harness.clone();
         let sd = shutdown_rx.clone();
+        let active = active.clone();
         async move {
-            if let Err(e) = h.run(sd).await {
+            if let Err(e) = h.run(sd, active).await {
                 tracing::error!("consciousness loop stopped: {e}");
             }
         }

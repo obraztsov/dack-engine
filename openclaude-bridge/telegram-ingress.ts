@@ -68,6 +68,17 @@ type Cfg = {
   attachments?: AttachDefaults
   // The ingress SQLite store path (per-chat attachment overrides + future ingress state). In /duck.
   ingress_db: string
+  // TYPING INDICATOR: poll the harness `GET /active-conversations` and send a Telegram `typing` chat
+  // action for each conversation the duck is PROCESSING right now — so the indicator reflects real work
+  // (it appears only after the coalesce window + queue, when a cycle actually starts), not mere receipt.
+  // Omit ⇒ ON with defaults. `poll_secs` should stay ≤5 (Telegram clears typing after ~5s, so we re-send).
+  // `dms_only` (default true) restricts it to private chats (positive chat_id) where the duck reliably
+  // replies — in groups it's usually a silent guest, so typing would over-promise.
+  typing_indicator?: {
+    enabled?: boolean // default true
+    poll_secs?: number // default 4 (clamped to ≥2)
+    dms_only?: boolean // default true
+  }
   // Voice transcription (Phase 2). SELF-CONTAINED here (own endpoint + key) so it can point at Xiaomi
   // ASR today or an OpenAI Whisper endpoint later, decoupled from the harness chat connector. Omit ⇒
   // voice is not transcribed. `api_key` may also come from env ASR_API_KEY. Transcript flows as text.
@@ -314,6 +325,47 @@ bot.on('message', async (ctx) => {
     console.error('[tg-ingress] forward failed:', e)
   }
 })
+
+/** Poll the harness for conversations being processed right now and keep a Telegram "typing…" indicator
+ *  alive for each active DM. The indicator reflects REAL work: the harness only marks a conversation
+ *  active once its cycle starts (after the coalesce window + queue), and the reply itself clears the
+ *  indicator, so we just re-assert it every few seconds while the cycle runs. Best-effort: a momentarily
+ *  unreachable harness (or an older build without the endpoint) simply skips the tick. */
+function startTypingIndicator(): void {
+  const tc = cfg.typing_indicator ?? {}
+  if (tc.enabled === false) {
+    console.error('[tg-ingress] typing indicator: disabled')
+    return
+  }
+  const pollMs = Math.max(2, tc.poll_secs ?? 4) * 1000
+  const dmsOnly = tc.dms_only !== false // default true
+  const url = cfg.harness_webhook + '/active-conversations'
+  let ticking = false
+  setInterval(async () => {
+    if (ticking) return // don't pile up if the harness is briefly slow
+    ticking = true
+    try {
+      const r = await fetch(url).catch(() => null)
+      if (!r || !r.ok) return
+      const j: any = await r.json().catch(() => null)
+      const list: Array<{ key: string; type: string }> = Array.isArray(j?.active) ? j.active : []
+      const targets = list
+        .filter((c) => c && c.type === 'telegram_message') // our channel only (not twitter/cron keys)
+        .map((c) => Number(c.key))
+        .filter((id) => Number.isFinite(id) && (!dmsOnly || id > 0)) // positive chat_id == a private DM
+      // Fire all concurrently; a chat we can't act in (blocked/left) fails harmlessly and is ignored.
+      await Promise.allSettled(targets.map((id) => bot.api.sendChatAction(id, 'typing')))
+    } catch (e) {
+      console.error('[tg-ingress] typing poll error:', e)
+    } finally {
+      ticking = false
+    }
+  }, pollMs)
+  console.error(
+    `[tg-ingress] typing indicator: ON (poll ${pollMs / 1000}s, ${dmsOnly ? 'DMs only' : 'all chats'}) → ${url}`,
+  )
+}
+startTypingIndicator()
 
 bot.catch((err) => console.error('[tg-ingress] bot error:', err?.error ?? err))
 console.error(`[tg-ingress] long-polling; operator_user_id=${cfg.operator_user_id} → ${cfg.op_path}; trusted groups=${JSON.stringify(cfg.groups)}; else → ${cfg.pub_path}; harness=${cfg.harness_webhook}`)

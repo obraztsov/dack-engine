@@ -121,7 +121,11 @@ impl Harness {
     /// serialization (`busy_keys` + the queue's `next_eligible` claim = Axis-1) and the memory/soul RwLock
     /// (taken in `run_step` = Axis-2). At `max_concurrent_cycles = 1` it is single-flight — one mind, one
     /// wake at a time, byte-identical to the pre-MT loop.
-    pub async fn run(self: Arc<Self>, mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
+    pub async fn run(
+        self: Arc<Self>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+        active: crate::active::ActiveConversations,
+    ) -> Result<()> {
         // Boot reconciliation: requeue any row a crash left stuck in `dispatched`.
         match self.queue.reclaim_orphans().await {
             Ok(0) => {}
@@ -209,9 +213,14 @@ impl Harness {
                 Some(stimulus) => {
                     if let Some(k) = &stimulus.dedup_key {
                         busy_keys.lock().unwrap().insert(k.clone());
+                        // Mirror the in-flight key into the externally-readable registry so the webhook
+                        // server (and the Telegram ingress polling it) can see this conversation is being
+                        // processed RIGHT NOW — the typing-indicator signal, spanning the whole dispatch.
+                        active.begin(k, &stimulus.type_.to_string(), &stimulus.source);
                     }
                     let this = Arc::clone(&self);
                     let bk = Arc::clone(&busy_keys);
+                    let active_w = active.clone();
                     workers.spawn(async move {
                         let key = stimulus.dedup_key.clone();
                         let snap = stimulus.clone();
@@ -249,9 +258,12 @@ impl Harness {
                                 let _ = this.queue.update_status(&snap.id, StimulusStatus::Failed).await;
                             }
                         }
-                        // Free this thread (Axis-1) so its next wake becomes eligible, then the slot.
+                        // Free this thread (Axis-1) so its next wake becomes eligible, then the slot. The
+                        // reply (if any) was already sent inside the dispatch above, so clearing "active"
+                        // here matches when the duck actually stopped working on this conversation.
                         if let Some(k) = key {
                             bk.lock().unwrap().remove(&k);
+                            active_w.end(&k);
                         }
                         drop(permit);
                     });
@@ -3445,7 +3457,7 @@ mod tests {
         let (tx, rx) = tokio::sync::watch::channel(false);
         let run = tokio::spawn({
             let h = harness.clone();
-            async move { h.run(rx).await }
+            async move { h.run(rx, crate::active::ActiveConversations::new()).await }
         });
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         tx.send(true).unwrap();
@@ -3831,7 +3843,7 @@ mod tests {
 
         let (tx, rx) = tokio::sync::watch::channel(false);
         let h = harness.clone();
-        let handle = tokio::spawn(async move { h.run(rx).await });
+        let handle = tokio::spawn(async move { h.run(rx, crate::active::ActiveConversations::new()).await });
 
         // Wait until the reclaimed orphan has been driven through Perceive+Express.
         for _ in 0..100 {

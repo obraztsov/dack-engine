@@ -18,6 +18,7 @@
  */
 import { Bot } from 'grammy'
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
+import { openIngressStore, attachmentKind, attachmentsAllowed, type AttachDefaults } from './ingress-store'
 
 function readFirst(paths: string[]): string | null {
   for (const p of paths) {
@@ -52,6 +53,11 @@ type Cfg = {
   // Harness-owned media dir (Phase 1: photos). Must match the harness `media_dir` (both cwd-relative,
   // same container /duck) so the harness resolves the filename this adapter writes. Default `media`.
   media_dir: string
+  // ATTACHMENT permission defaults by chat kind (operator/trusted/dm/group/pub). Per-chat overrides live
+  // in `ingress.sqlite`. Omit ⇒ the built-in defaults (DM/operator/trusted on, open groups/channels off).
+  attachments?: AttachDefaults
+  // The ingress SQLite store path (per-chat attachment overrides + future ingress state). In /duck.
+  ingress_db: string
 }
 function loadConfig(): Cfg {
   const def: Cfg = {
@@ -61,6 +67,7 @@ function loadConfig(): Cfg {
     pub_path: '/telegram/pub',
     groups: {},
     media_dir: 'media',
+    ingress_db: 'ingress.sqlite',
   }
   const name = process.env.TELEGRAM_INGRESS_CONFIG ?? 'telegram-ingress.config.json'
   const raw = readFirst([name, `openclaude-bridge/${name}`, `../${name}`])
@@ -87,6 +94,8 @@ function routeFor(
 const cfg = loadConfig()
 const token = loadToken()
 const bot = new Bot(token)
+// The ingress's own SQLite store (per-chat attachment permissions; future ingress state). In /duck.
+const store = openIngressStore(cfg.ingress_db)
 
 // Telegram bot download ceiling (~20MB); MiMo also caps an image at 50MB. Oversized → skipped.
 const MAX_MEDIA_BYTES = 20 * 1024 * 1024
@@ -137,10 +146,16 @@ bot.on('message', async (ctx) => {
   const sent_at = m.date
     ? new Date(m.date * 1000).toISOString().replace('T', ' ').replace(/\..+Z$/, ' UTC')
     : null
-  // Phase 1 multimodal: a photo message → download the largest size to the harness media dir. The
-  // caption (if any) is already captured as `text`. Only the filename rides the payload; the harness
-  // confines it + the bridge reads the bytes as an untrusted image content-block.
-  const media = (m as any).photo ? [await downloadPhoto(ctx, m)].filter(Boolean) : []
+  // Phase 1 multimodal: a photo message → download the largest size to the harness media dir, BUT only if
+  // attachments are enabled for this chat (per-chat override in ingress.sqlite, else the config/default by
+  // kind — DM/operator/trusted on, open groups/channels off, so we don't spend vision tokens on public
+  // contacts until the duck enables one). The caption (if any) is already captured as `text`.
+  const wantsPhoto = !!(m as any).photo
+  const kind = attachmentKind(cfg.operator_user_id, cfg.groups, fromId, m.chat.id, m.chat.type)
+  const allowAttach = wantsPhoto && attachmentsAllowed(store, cfg.attachments ?? {}, String(m.chat.id), kind)
+  if (wantsPhoto && !allowAttach)
+    console.error(`[tg-ingress] photo from chat ${m.chat.id} (${kind}) — attachments off, forwarding text only`)
+  const media = allowAttach ? [await downloadPhoto(ctx, m)].filter(Boolean) : []
   const body = {
     chat_id: m.chat.id,
     message_id: m.message_id,

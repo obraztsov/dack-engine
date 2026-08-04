@@ -34,6 +34,7 @@ FROM oven/bun:1
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
        git openssh-client python3 bubblewrap socat ca-certificates \
+       ffmpeg \
   && rm -rf /var/lib/apt/lists/*
 
 # The per-duck volume (soul repo + nested runlog repo) is owned by the HOST user (uid 1000), but the

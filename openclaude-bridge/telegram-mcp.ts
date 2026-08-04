@@ -14,7 +14,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
-import { openIngressStore, setChatAttachment } from './ingress-store'
+import { openIngressStore, setChatAttachment, type MediaType } from './ingress-store'
 
 // Per-chat attachment store — the harness injects INGRESS_DB (absolute). Absent ⇒ the toggle is
 // unavailable (returns an error); `reply` still works.
@@ -59,18 +59,20 @@ server.registerTool(
   'set_chat_attachments',
   {
     description:
-      'Enable or disable image/photo attachments FOR THE CHAT YOU ARE TALKING IN. The destination is ' +
-      'fixed by the harness to the chat that woke you — you provide only the flag, you cannot toggle ' +
-      'anywhere else. Turn ON when a client wants to send screenshots; OFF to stop processing their images.',
-    inputSchema: { allowed: z.boolean() },
+      'Enable or disable attachments FOR THE CHAT YOU ARE TALKING IN. The destination is fixed by the ' +
+      'harness to the chat that woke you — you provide only the flag, you cannot toggle anywhere else. ' +
+      '`media` picks which kind: "image" (screenshots/photos), "voice" (voice notes → transcribed), or ' +
+      '"all" (default, both). Turn ON when a client should send you that media; OFF to stop processing it.',
+    inputSchema: { allowed: z.boolean(), media: z.enum(['image', 'voice', 'all']).optional() },
   },
-  async ({ allowed }: { allowed: boolean }) => {
+  async ({ allowed, media }: { allowed: boolean; media?: 'image' | 'voice' | 'all' }) => {
     const chat = process.env.TELEGRAM_REPLY_CHAT
     if (!chat) return asText({ ok: false, error: 'no source chat in scope — this cycle was not woken by Telegram' })
     if (!ingressStore) return asText({ ok: false, error: 'INGRESS_DB not set — attachment store unavailable' })
-    setChatAttachment(ingressStore, chat, allowed)
-    console.error(`[telegram-mcp] set_chat_attachments chat=${chat} allowed=${allowed}`)
-    return asText({ ok: true, chat_id: chat, allowed })
+    const types: MediaType[] = media === 'image' ? ['image'] : media === 'voice' ? ['voice'] : ['image', 'voice']
+    for (const t of types) setChatAttachment(ingressStore, chat, t, allowed)
+    console.error(`[telegram-mcp] set_chat_attachments chat=${chat} media=${media ?? 'all'} allowed=${allowed}`)
+    return asText({ ok: true, chat_id: chat, media: media ?? 'all', allowed })
   },
 )
 

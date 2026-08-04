@@ -702,10 +702,20 @@ impl Harness {
         // resumes Perceive's session), and only the digested Baton gist crosses. `None` = fresh.
         // Resolved BEFORE block assembly so the blocks are resume-aware (a resume drops the memory the
         // session already carries + sends the runlog as a small diff since its `last_used` watermark).
+        // An IMAGE-bearing Perceive must NOT be sticky. The image content-block would poison the resumable
+        // session: the OpenAI-compat resume RE-SENDS history, so a later text cycle that resumes on a
+        // non-vision model (e.g. mimo-v2.5-pro) 404s on the image → the SDK reports "model not found" and
+        // the whole thread breaks. So such a cycle gets a FRESH, un-stored session (session_key = None ⇒ no
+        // resume AND no store); the firebreak is unchanged — only the digested text gist crosses onward.
+        // (Cheap re-resolve of the payload media here; the actual attach resolves it again below.)
+        let is_media_cycle = matches!(step, StepInput::Entry)
+            && (self.config.runtime.default_vision_model.is_some()
+                || !self.config.runtime.vision_models.is_empty())
+            && !crate::media::resolve(&stimulus.payload, &crate::media::dir(&self.config.media_dir)).is_empty();
         let session_key = prompt
             .session
             .as_ref()
-            .filter(|s| s.sticky)
+            .filter(|s| s.sticky && !is_media_cycle)
             .map(|s| sticky_session_key(&prompt.id, cycle_trust, &s.key, stimulus));
         let resume = match &session_key {
             Some(key) => {

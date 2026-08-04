@@ -505,6 +505,17 @@ pub struct RuntimeConfig {
     /// the `options.model` catalog name. `None` ⇒ whatever the runtime env already provides.
     #[serde(default)]
     pub model: Option<String>,
+    /// **Vision-capable model ids** (Phase 1 images). Model ids that accept image input, so the harness
+    /// can ask "is the model this cycle already selected a vision model?" — if so an image-bearing Perceive
+    /// keeps it (you may run a cheap vision model like `mimo-v2.5` on the whole perceive phase); if not it
+    /// routes to [`default_vision_model`]. Empty ⇒ no model is treated as vision-capable.
+    #[serde(default)]
+    pub vision_models: Vec<String>,
+    /// **Default vision model** (Phase 1 images): where an image-bearing Perceive is routed when its
+    /// selected model is NOT in [`vision_models`]. `None` ⇒ images are NOT ingested unless the selected
+    /// model is itself a vision model (attaching an image to a non-vision model would fail).
+    #[serde(default)]
+    pub default_vision_model: Option<String>,
     /// Extra env var *names* forwarded into the runtime (values from the harness env, never the
     /// YAML). The connector's own creds (above) are applied on top. **Soul key never listed.**
     #[serde(default = "default_runtime_env")]
@@ -649,13 +660,6 @@ pub struct DackConfig {
     /// forever. Bounds disk like the runlog. Default 7.
     #[serde(default = "default_media_retention_days")]
     pub media_retention_days: u64,
-    /// **Vision model** (Phase 1 images): the model id an image-bearing Perceive cycle is routed to,
-    /// overriding the per-state/default model — because the default reasoning model may not accept images
-    /// (xiaomi `mimo-v2.5-pro` 404s on image input; `mimo-v2.5` handles vision). `None` (default) ⇒ images
-    /// are NOT ingested at all (attaching them to a non-vision model would fail); set this to enable image
-    /// perception.
-    #[serde(default)]
-    pub vision_model: Option<String>,
     /// **Load-shedding cap**: the max PENDING queue depth before the OLDEST `Low`-priority
     /// items are evicted (Normal+ is the protected floor, never shed; every eviction is logged).
     /// Protects a busy duck from a runaway low-priority fan-out backlog. `None` = unbounded.

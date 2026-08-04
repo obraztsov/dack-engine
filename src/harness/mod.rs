@@ -770,19 +770,28 @@ impl Harness {
         // full body.
         let system_prompt = self.system_prompt_for_prompt(prompt).await;
         // Images (Phase 1: Telegram photos) ride ONLY a Perceive world-payload — the firebreak keeps them
-        // off the Act path (downstream gets the digested text gist, never bytes) — and ONLY when a vision
-        // model is configured: attaching an image to the default reasoning model fails (xiaomi
-        // `mimo-v2.5-pro` 404s on image input). Resolve + CONFINE each ingress-supplied filename to the
-        // harness media dir; empty for any stimulus without images.
+        // off the Act path (downstream gets the digested text gist, never bytes) — and ONLY when this cycle
+        // can SEE them: either the model it already selected is a vision model (you may run a cheap vision
+        // model like `mimo-v2.5` on the whole perceive phase), or a `default_vision_model` is configured to
+        // route to. The EFFECTIVE model is the resolved per-state model, else the runtime default.
+        let effective_model = model.as_deref().or(self.config.runtime.model.as_deref());
+        let selected_is_vision =
+            effective_model.map_or(false, |m| self.config.runtime.vision_models.iter().any(|v| v == m));
+        let can_see_images = selected_is_vision || self.config.runtime.default_vision_model.is_some();
         let media = match step {
-            StepInput::Entry if self.config.vision_model.is_some() => {
+            StepInput::Entry if can_see_images => {
                 crate::media::resolve(&stimulus.payload, &crate::media::dir(&self.config.media_dir))
             }
             _ => Vec::new(),
         };
-        // An image-bearing Perceive is routed to the VISION model, overriding the per-state/default model
-        // (which can't see images). Non-image cycles keep the resolved model.
-        let model = if media.is_empty() { model } else { self.config.vision_model.clone().or(model) };
+        // Route an image-bearing Perceive to a vision model: keep the selected one if it ALREADY sees
+        // (possibly a cheaper vision model chosen for the whole phase), else route to the default vision
+        // model. Non-image cycles keep the resolved model.
+        let model = if media.is_empty() || selected_is_vision {
+            model
+        } else {
+            self.config.runtime.default_vision_model.clone()
+        };
         let model_label = model.clone().unwrap_or_else(|| "default".into());
         let req = InvocationRequest {
             system_prompt,

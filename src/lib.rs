@@ -41,6 +41,7 @@ pub mod harness;
 pub mod health;
 pub mod identity;
 pub mod logging;
+pub mod media;
 pub mod model;
 pub mod queue;
 pub mod repo;

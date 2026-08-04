@@ -22,6 +22,7 @@
  */
 
 import * as readline from 'node:readline'
+import { readFileSync } from 'node:fs'
 import { tryParseOutput } from './parse'
 
 // The SDK snapshots process.cwd() at MODULE-INIT and uses it for ALL tool/file path resolution
@@ -158,7 +159,8 @@ async function runInvoke(inv: any) {
   if (inv.agents && typeof inv.agents === 'object' && Object.keys(inv.agents).length) options.agents = inv.agents
 
   // First pass: the real invocation — tools live, the wall (canUseTool → Rust) gating every call.
-  let { finalText, sessionId, usage, mcpStatus } = await runQuery(inv.user_prompt, options, inv.model)
+  // `inv.media` (Phase 1: Telegram photos) rides the first turn only; the parse-fail recovery re-prompts text.
+  let { finalText, sessionId, usage, mcpStatus } = await runQuery(inv.user_prompt, options, inv.model, inv.media)
   let parsed = tryParseOutput(finalText, console.error)
 
   // Bounded PARSE-FAIL recovery: ONLY when the model emitted prose instead of the closing JSON
@@ -200,12 +202,38 @@ async function runQuery(
   prompt: string,
   options: any,
   model: string | null,
+  media?: { kind?: string; path: string; mime?: string }[],
 ): Promise<{ finalText: string; sessionId: string | null; usage: any; mcpStatus: { name: string; status: string }[] }> {
   let finalText = ''
   let sessionId: string | null = null
   let usage: any = null
   let mcpStatus: { name: string; status: string }[] = []
-  for await (const m of query({ prompt, options }) as AsyncIterable<any>) {
+  // Multimodal (Phase 1: images). When the harness attached media, send the SDK's STREAMING-INPUT form —
+  // an async-iterable yielding ONE user turn whose content is [text, ...image blocks]. The SDK translates
+  // these Anthropic-style image blocks into OpenAI `image_url` parts on the chat/completions call. With no
+  // media (the common case, and the parse-fail recovery turn) we pass the plain string — path unchanged.
+  const imageBlocks: any[] = []
+  for (const m of media ?? []) {
+    try {
+      imageBlocks.push({
+        type: 'image',
+        source: { type: 'base64', media_type: m.mime || 'image/jpeg', data: readFileSync(m.path).toString('base64') },
+      })
+    } catch (e) {
+      console.error('[bridge:media] read failed, dropping image', m?.path, String(e))
+    }
+  }
+  const input: any = imageBlocks.length
+    ? (async function* () {
+        yield {
+          type: 'user',
+          uuid: globalThis.crypto.randomUUID(),
+          parent_tool_use_id: null,
+          message: { role: 'user', content: [{ type: 'text', text: prompt }, ...imageBlocks] },
+        }
+      })()
+    : prompt
+  for await (const m of query({ prompt: input, options }) as AsyncIterable<any>) {
     // Capture the engine session id (carried on the SDK messages) → returned for sticky resume.
     if (m?.session_id) sessionId = m.session_id
     // Capability connection status from the SDK `init`: log it (operator glance) AND capture it

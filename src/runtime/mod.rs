@@ -20,6 +20,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
+use serde::Serialize;
 
 use crate::error::Result;
 use crate::model::proposal::AgentOutput;
@@ -73,6 +74,30 @@ pub struct ContextBlock {
     pub label: String,
     pub body: String,
     pub trusted: bool,
+}
+
+/// The kind of a non-text media attachment. Phase 1 is images only (Telegram photos / screenshots);
+/// audio is deliberately NOT here — the vendored SDK has no `input_audio` path, so voice is transcribed
+/// to text at the ingress (see the multimodal plan), never carried as a media block.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaKind {
+    Image,
+}
+
+/// An untrusted media attachment riding a world payload (Phase 1: a Telegram photo). The harness stores
+/// the bytes in its OWN media dir and passes only this reference; the bridge reads `path`, base64s it,
+/// and emits an SDK image content-block (which the SDK translates to an OpenAI `image_url` part). The
+/// path is always **harness-confined** to the media dir — the ingress-supplied filename is never trusted
+/// as a full path. Media exists ONLY on the untrusted lane: it rides the `world-payload` at Perceive and
+/// is reachable later only through the raw-recall path — never the trusted self-recall.
+#[derive(Debug, Clone, Serialize)]
+pub struct MediaRef {
+    pub kind: MediaKind,
+    /// Absolute path to the stored file inside the harness media dir (confined; guaranteed to exist).
+    pub path: String,
+    /// MIME type, e.g. `image/jpeg` → the content block's `media_type`.
+    pub mime: String,
 }
 
 /// Everything needed to run one consciousness state.
@@ -133,6 +158,11 @@ pub struct InvocationRequest {
     /// e.g. **Reflect** (`reflect_invoke_timeout_secs`), the daily self-modification cycle, which may
     /// chew through prompts/skills/memory and deserves more than a chat reply's budget.
     pub timeout: Option<std::time::Duration>,
+    /// **Untrusted media attachments** for this turn (Phase 1: Telegram photos on a Perceive). The bridge
+    /// reads each `path`, base64s it, and sends it as an image content-block alongside the rendered text.
+    /// Empty for every state but a Perceive whose stimulus carried media; the firebreak keeps it off the
+    /// Act path (downstream sees only the digested text gist, never bytes).
+    pub media: Vec<MediaRef>,
 }
 
 /// The permission event surfaced by OpenClaude, as it *actually* arrives (grounded

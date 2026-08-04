@@ -138,6 +138,16 @@ impl Harness {
             ),
             Err(err) => tracing::warn!("runlog hard-GC failed: {err}"),
         }
+        // Media store (Phase 1: Telegram photos): ensure the harness-owned dir exists, then GC images
+        // older than `media_retention_days` — predictable, bounded disk like the runlog.
+        {
+            let dir = crate::media::dir(&self.config.media_dir);
+            crate::media::ensure_dir(&dir);
+            let removed = crate::media::gc(&dir, self.config.media_retention_days, chrono::Utc::now().timestamp());
+            if removed > 0 {
+                tracing::info!("media GC: dropped {removed} media file(s) >{}d", self.config.media_retention_days);
+            }
+        }
         // Downtime → character: a restart enqueues a self-tier "back online" wake
         // that Perceives then Expresses (the duck may comment on having been away).
         self.enqueue_back_online().await;
@@ -761,6 +771,16 @@ impl Harness {
         // Built AFTER the resume lookup: a sticky RESUME gets the lean `resume_body`, a fresh run the
         // full body.
         let system_prompt = self.system_prompt_for_prompt(prompt).await;
+        // Untrusted media (Phase 1: Telegram photos) rides ONLY the Perceive world-payload — the
+        // firebreak keeps it off the Act path (downstream gets the digested text gist, never bytes).
+        // Resolve + CONFINE each ingress-supplied filename to the harness media dir; empty for any
+        // stimulus without images.
+        let media = match step {
+            StepInput::Entry => {
+                crate::media::resolve(&stimulus.payload, &crate::media::dir(&self.config.media_dir))
+            }
+            StepInput::Act(_) => Vec::new(),
+        };
         let req = InvocationRequest {
             system_prompt,
             spec: spec.clone(),
@@ -781,6 +801,7 @@ impl Harness {
             // Reflect (the daily self-mod cycle) may run on a longer budget if configured; every other
             // state uses the client default. `None` ⇒ default.
             timeout: self.invoke_timeout_override(prompt.state),
+            media,
         };
         // TRACE: the FULL context fed to the model — system prompt + every assembled block. Off by
         // default (info); flip on with `RUST_LOG=dack::harness=trace` to debug what the model actually
@@ -2127,6 +2148,7 @@ async fn run_worker_detached(
             lead
         }),
         timeout: None, // a worker uses the client default budget.
+        media: Vec::new(), // workers never carry channel media.
     };
     tracing::info!(
         "worker `{}` launched in {} ({})",

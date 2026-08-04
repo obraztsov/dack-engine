@@ -96,6 +96,10 @@ enum ToBridge<'a> {
         /// Sub-agent defs the engine may `Task`-spawn → `options.agents`. Empty for the
         /// duck's states; a worker registers its sub-helpers here.
         agents: &'a std::collections::BTreeMap<String, serde_json::Value>,
+        /// **Untrusted image attachments** for a Perceive turn (Phase 1: Telegram photos). The bridge
+        /// reads each `path`, base64s it, and builds an SDK image content-block. Empty ⇒ the bridge takes
+        /// the plain-string prompt path (unchanged).
+        media: &'a [super::MediaRef],
     },
     Decision {
         tool_use_id: String,
@@ -402,6 +406,7 @@ impl RuntimeClient for OpenClaudeClient {
             resume: req.session.as_ref().map(|s| s.0.as_str()),
             mcp_servers: &req.mcp_servers,
             agents: &req.agents,
+            media: &req.media,
         };
 
         // The whole exchange (send → permission round-trips → result) runs under ONE wall-clock
@@ -605,6 +610,7 @@ mod tests {
             mounts: Vec::new(),
             allowed_tools: None,
             timeout: None,
+            media: Vec::new(),
         }
     }
 
@@ -743,6 +749,7 @@ mod tests {
             mounts,
             allowed_tools: None,
             timeout: None,
+            media: Vec::new(),
         }
     }
 

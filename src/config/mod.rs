@@ -174,6 +174,12 @@ fn default_tag_notes_max() -> usize {
 fn default_runlog_retention_days() -> u64 {
     10
 }
+fn default_media_dir() -> String {
+    "media".into()
+}
+fn default_media_retention_days() -> u64 {
+    7
+}
 
 fn default_reflect_interval() -> i64 {
     86_400 // one day — a sane self-modification cadence; the operator may loosen or `0` to disable.
@@ -633,6 +639,16 @@ pub struct DackConfig {
     /// boot + day-rollover) — bounds the repo and what the recall MCPs can scan. Default 10.
     #[serde(default = "default_runlog_retention_days")]
     pub runlog_retention_days: u64,
+    /// **Harness-owned media store** (Phase 1: Telegram photos). A cwd-relative directory where channel
+    /// adapters drop downloaded image bytes; the harness confines payload-named files to it and the bridge
+    /// reads them as image content-blocks. Never in the soul workdir, so the agent's own `Read` can't
+    /// reach it — images stay on the untrusted lane. Default `media`.
+    #[serde(default = "default_media_dir")]
+    pub media_dir: String,
+    /// **Media retention**: delete stored media older than N days (boot + the runlog GC tick). `0` ⇒ keep
+    /// forever. Bounds disk like the runlog. Default 7.
+    #[serde(default = "default_media_retention_days")]
+    pub media_retention_days: u64,
     /// **Load-shedding cap**: the max PENDING queue depth before the OLDEST `Low`-priority
     /// items are evicted (Normal+ is the protected floor, never shed; every eviction is logged).
     /// Protects a busy duck from a runaway low-priority fan-out backlog. `None` = unbounded.

@@ -30,7 +30,14 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { Database } from 'bun:sqlite'
 import { z } from 'zod'
-import { openIngressStore, setChatAttachment, type MediaType } from './ingress-store'
+import {
+  openIngressStore,
+  setChatAttachment,
+  getReferral,
+  pendingReferrals,
+  markReferralApplied,
+  type MediaType,
+} from './ingress-store'
 
 type Destinations = {
   named: Record<string, number | string> // symbolic name → chat_id (operator-registered)
@@ -181,6 +188,72 @@ server.registerTool(
     for (const t of types) setChatAttachment(ingressStore, String(chat), t, allowed)
     console.error(`[telegram-send] set_chat_attachments chat=${chat} media=${media ?? 'all'} allowed=${allowed}`)
     return asText({ ok: true, chat_id: chat, media: media ?? 'all', allowed })
+  },
+)
+
+// ── Referrals (deep-link `?start=` captures) — the org-trust reward flow ──────────────────────────
+// Reading/marking the duck's own captured referral data is a business action, gated by this server's
+// min_trust:org (a public/stranger cycle never gets these tools). Lookups take a referee's user_id (a
+// positive numeric) or a registered destination NAME — this is a READ of the duck's data, not a send, so
+// it isn't behind the fail-closed send allow-list. Rewarding the referral (moving token) is a separate,
+// separately-gated capability; these tools only surface the data + record that a reward was applied.
+function resolveUserId(user: string): string | null {
+  const t = user.trim()
+  if (Object.prototype.hasOwnProperty.call(DESTS.named, t)) return String(DESTS.named[t])
+  return /^-?\d+$/.test(t) ? t : null
+}
+
+server.registerTool(
+  'list_pending_referrals',
+  {
+    description:
+      'List captured deep-link referrals not yet marked applied — your reward queue, oldest first. Each ' +
+      'is {user_id (the referee who opened your `?start=` link), param (the referrer @username / ref ' +
+      'code they came through), username, created_at, seen_count}. Reward them, then call ' +
+      '`mark_referral_applied` so you never pay one twice.',
+    inputSchema: { limit: z.number().int().min(1).max(500).optional() },
+  },
+  async ({ limit }: { limit?: number }) => {
+    if (!ingressStore) return asText({ ok: false, error: 'INGRESS_DB not set — referral store unavailable' })
+    const rows = pendingReferrals(ingressStore, limit ?? 50)
+    return asText({ ok: true, count: rows.length, referrals: rows })
+  },
+)
+
+server.registerTool(
+  'get_referral',
+  {
+    description:
+      'Look up the deep-link referral for one user by their numeric user_id (or a registered destination ' +
+      'name). Returns {found:false} if that user never arrived through a `?start=` link. Use to ' +
+      're-confirm a specific referral before rewarding it.',
+    inputSchema: { user: z.string().min(1) },
+  },
+  async ({ user }: { user: string }) => {
+    if (!ingressStore) return asText({ ok: false, error: 'INGRESS_DB not set — referral store unavailable' })
+    const uid = resolveUserId(user)
+    if (uid === null) return asText({ ok: false, error: `"${user}" is not a numeric user_id or a known name` })
+    const ref = getReferral(ingressStore, uid)
+    return asText(ref ? { ok: true, found: true, referral: ref } : { ok: true, found: false })
+  },
+)
+
+server.registerTool(
+  'mark_referral_applied',
+  {
+    description:
+      "Mark a referral rewarded so it won't be paid again (idempotent). Pass the referee's numeric " +
+      'user_id (or a known name). Returns {applied:true} if it flipped pending→applied now, or ' +
+      '{applied:false} if there was no pending referral for that user (already applied, or none).',
+    inputSchema: { user: z.string().min(1) },
+  },
+  async ({ user }: { user: string }) => {
+    if (!ingressStore) return asText({ ok: false, error: 'INGRESS_DB not set — referral store unavailable' })
+    const uid = resolveUserId(user)
+    if (uid === null) return asText({ ok: false, error: `"${user}" is not a numeric user_id or a known name` })
+    const applied = markReferralApplied(ingressStore, uid)
+    console.error(`[telegram-send] mark_referral_applied user=${uid} → ${applied}`)
+    return asText({ ok: true, user_id: uid, applied })
   },
 )
 

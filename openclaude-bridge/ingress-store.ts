@@ -3,7 +3,11 @@
  * `dack.sqlite`). Lives in the `/duck` volume so it's part of a duck's migration/backup set. Holds:
  *   - per-chat, PER-MEDIA attachment permissions (`image` and `voice` are gated SEPARATELY, for
  *     granularity — a chat may be allowed screenshots but not voice, or vice-versa);
- *   - per-user/day voice-transcription usage (the ASR abuse cap).
+ *   - per-user/day voice-transcription usage (the ASR abuse cap);
+ *   - captured **deep-link referrals** (`t.me/<bot>?start=<param>` → a `/start <param>` message): the
+ *     `param` (first-touch, e.g. a referrer's @username or a ref code) stored against the referee, so
+ *     the duck can reward referrals in token later — retrievable via the telegram MCPs even if the
+ *     first cycle failed to act on it, and markable `applied` for reward idempotency.
  * It's the shared table the telegram MCP `set_chat_attachments` tool writes to.
  *
  * Uses Bun's built-in `bun:sqlite` (no dependency), WAL mode so the ingress (reader) and an MCP writer
@@ -35,6 +39,12 @@ export function openIngressStore(path: string): Database {
   db.exec(
     'CREATE TABLE IF NOT EXISTS voice_usage ' +
       '(user_id TEXT NOT NULL, day TEXT NOT NULL, seconds INTEGER NOT NULL, PRIMARY KEY (user_id, day))',
+  )
+  db.exec(
+    'CREATE TABLE IF NOT EXISTS referrals ' +
+      '(user_id TEXT PRIMARY KEY, param TEXT NOT NULL, username TEXT, chat_id TEXT NOT NULL, ' +
+      'created_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL, seen_count INTEGER NOT NULL DEFAULT 1, ' +
+      'applied_at INTEGER)',
   )
   return db
 }
@@ -124,4 +134,81 @@ export function voiceWithinCap(
 ): boolean {
   if (limitSecs <= 0) return false // 0 ⇒ voice disabled
   return voiceUsageToday(db, userId, day) + Math.max(0, durationSecs) <= limitSecs
+}
+
+// ── Deep-link referrals (`t.me/<bot>?start=<param>`) ─────────────────────────────────────────────
+// A user who opens the bot through a referral link sends a `/start <param>` message; the ingress
+// captures `param` against that user (the referee). FIRST-TOUCH attribution: the first captured param
+// is immutable (a later /start with a different link does NOT overwrite the referrer) — only the
+// seen-count + last-seen advance. The duck reads these to reward referrals in token, and marks one
+// `applied` once rewarded so it never double-pays across cycles/retries.
+
+/** Extract a Telegram deep-link start parameter from a `/start <param>` message (also `/start@Bot <param>`).
+ *  A `t.me/<bot>?start=<param>` link makes the client send exactly this on first open — trading bots use it
+ *  for referral codes. Returns the param only if present AND within Telegram's deep-link charset
+ *  (`[A-Za-z0-9_-]`, ≤64) — a bare `/start`, a non-start message, or an out-of-charset token yields null
+ *  (the text is untrusted, so we accept only what a real deep link can actually produce). Pure (lives here,
+ *  not in the ingress module, so it's importable without the ingress's bot-start side effects). */
+export function parseStartParam(text: string): string | null {
+  const m = /^\/start(?:@\w+)?(?:\s+(\S+))?/.exec((text ?? '').trim())
+  const p = m?.[1]
+  if (!p) return null
+  return /^[A-Za-z0-9_-]{1,64}$/.test(p) ? p : null
+}
+
+export type Referral = {
+  user_id: string
+  param: string
+  username: string | null
+  chat_id: string
+  created_at: number
+  last_seen_at: number
+  seen_count: number
+  applied_at: number | null
+}
+
+/** Capture a `/start <param>` for `userId` (the referee). First-touch: the ORIGINAL `param`, `username`,
+ *  and `created_at` are preserved on re-`/start`; only `seen_count` + `last_seen_at` advance. Returns the
+ *  stored referral (the first-touch row, so a caller can tell a fresh capture from a repeat via
+ *  `seen_count === 1`). */
+export function recordReferral(
+  db: Database,
+  userId: string,
+  param: string,
+  username: string | null,
+  chatId: string,
+  now: number = Math.floor(Date.now() / 1000),
+): Referral {
+  db.query(
+    'INSERT INTO referrals (user_id, param, username, chat_id, created_at, last_seen_at, seen_count) ' +
+      'VALUES (?, ?, ?, ?, ?, ?, 1) ' +
+      'ON CONFLICT(user_id) DO UPDATE SET last_seen_at = excluded.last_seen_at, seen_count = seen_count + 1',
+  ).run(userId, param, username, chatId, now, now)
+  return getReferral(db, userId) as Referral
+}
+
+/** The referral captured for `userId` (the referee), or `null` if that user never arrived via a link. */
+export function getReferral(db: Database, userId: string): Referral | null {
+  const row = db.query('SELECT * FROM referrals WHERE user_id = ?').get(userId) as Referral | null
+  return row ?? null
+}
+
+/** Referrals not yet marked `applied`, oldest-first (the duck's reward queue). `limit` caps the batch. */
+export function pendingReferrals(db: Database, limit = 50): Referral[] {
+  return db
+    .query('SELECT * FROM referrals WHERE applied_at IS NULL ORDER BY created_at ASC LIMIT ?')
+    .all(Math.max(1, Math.min(500, limit))) as Referral[]
+}
+
+/** Mark `userId`'s referral rewarded (idempotent — only flips a still-pending row). Returns true if it
+ *  transitioned pending→applied this call, false if there was no pending referral to apply. */
+export function markReferralApplied(
+  db: Database,
+  userId: string,
+  now: number = Math.floor(Date.now() / 1000),
+): boolean {
+  const res = db
+    .query('UPDATE referrals SET applied_at = ? WHERE user_id = ? AND applied_at IS NULL')
+    .run(now, userId)
+  return res.changes > 0
 }

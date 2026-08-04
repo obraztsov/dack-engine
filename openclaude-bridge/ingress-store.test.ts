@@ -8,6 +8,11 @@ import {
   voiceUsageToday,
   addVoiceUsage,
   voiceWithinCap,
+  recordReferral,
+  getReferral,
+  pendingReferrals,
+  markReferralApplied,
+  parseStartParam,
 } from './ingress-store'
 
 test('attachmentKind classifies by intrinsic category (independent of path config)', () => {
@@ -64,4 +69,53 @@ test('voice usage cap: accumulates per user/day and enforces the limit', () => {
   expect(voiceWithinCap(db, 'u2', day, 1, 3600)).toBe(true) // a different user is independent
   expect(voiceWithinCap(db, 'u1', '2026-08-05', 1, 3600)).toBe(true) // a new day resets
   expect(voiceWithinCap(db, 'u1', day, 1, 0)).toBe(false) // limit 0 ⇒ voice disabled
+})
+
+test('parseStartParam accepts only a real deep-link param', () => {
+  expect(parseStartParam('/start alice')).toBe('alice')
+  expect(parseStartParam('/start@AgentDackBot ref_42-x')).toBe('ref_42-x') // /start@Bot form
+  expect(parseStartParam('  /start  code123  ')).toBe('code123') // trimmed, extra space
+  expect(parseStartParam('/start')).toBe(null) // bare start, no param
+  expect(parseStartParam('/start ')).toBe(null)
+  expect(parseStartParam('hello there')).toBe(null) // not a start command
+  expect(parseStartParam('/started foo')).toBe(null) // not /start (word boundary via @/space)
+  expect(parseStartParam('/start bad param')).toBe('bad') // first token only
+  expect(parseStartParam('/start has spaces!')).toBe('has') // first token; '!' would fail charset anyway
+  expect(parseStartParam('/start @evil/../x')).toBe(null) // out-of-charset (injection-shaped) → rejected
+  expect(parseStartParam('/start ' + 'a'.repeat(65))).toBe(null) // > 64 chars → rejected
+  expect(parseStartParam('/start ' + 'a'.repeat(64))).toBe('a'.repeat(64)) // exactly 64 ok
+})
+
+test('referrals: first-touch capture, pending queue, idempotent apply', () => {
+  const db = openIngressStore(':memory:')
+  expect(getReferral(db, '111')).toBe(null)
+
+  // first touch records the param + referee username, seen_count 1
+  const r1 = recordReferral(db, '111', 'alice', 'bob', '111', 1000)
+  expect(r1.param).toBe('alice')
+  expect(r1.username).toBe('bob')
+  expect(r1.seen_count).toBe(1)
+  expect(r1.created_at).toBe(1000)
+  expect(r1.applied_at).toBe(null)
+
+  // re-/start with a DIFFERENT link does NOT overwrite the referrer (first-touch); only seen/last advance
+  const r2 = recordReferral(db, '111', 'carol', 'bob', '111', 2000)
+  expect(r2.param).toBe('alice') // preserved
+  expect(r2.created_at).toBe(1000) // preserved
+  expect(r2.seen_count).toBe(2)
+  expect(r2.last_seen_at).toBe(2000)
+
+  // a second referee, captured later → appears after the first in the oldest-first pending queue
+  recordReferral(db, '222', 'dave', 'eve', '222', 1500)
+  const pending = pendingReferrals(db, 50)
+  expect(pending.map((r) => r.user_id)).toEqual(['111', '222']) // created_at 1000 then 1500
+
+  // marking applied is idempotent and drops it from the pending queue
+  expect(markReferralApplied(db, '111', 3000)).toBe(true)
+  expect(markReferralApplied(db, '111', 3001)).toBe(false) // already applied — no double-reward
+  expect(getReferral(db, '111')?.applied_at).toBe(3000)
+  expect(pendingReferrals(db, 50).map((r) => r.user_id)).toEqual(['222'])
+
+  // applying a user with no referral is a no-op false (never throws)
+  expect(markReferralApplied(db, '999', 4000)).toBe(false)
 })

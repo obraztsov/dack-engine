@@ -25,6 +25,8 @@ import {
   voiceUsageToday,
   addVoiceUsage,
   voiceWithinCap,
+  recordReferral,
+  parseStartParam,
   type AttachDefaults,
 } from './ingress-store'
 
@@ -275,6 +277,14 @@ bot.on('message', async (ctx) => {
   // flows downstream as an ordinary (untrusted, channel-tier) text message — no harness change.
   let text = (m as any).text ?? (m as any).caption ?? ''
   if ((m as any).voice) text = await handleVoice(m, kind, fromId)
+  // REFERRAL (deep link): a `t.me/<bot>?start=<param>` link makes the client send `/start <param>` on first
+  // open. Capture `param` against the referee (first-touch, immutable) so the duck can reward referrals in
+  // token even if this first cycle fails — and surface it on the stimulus so the duck sees it immediately.
+  const startParam = parseStartParam((m as any).text ?? '')
+  if (startParam && fromId != null) {
+    const ref = recordReferral(store, String(fromId), startParam, m.from?.username ?? null, String(m.chat.id))
+    console.error(`[tg-ingress] referral param="${startParam}" from ${fromId} (@${m.from?.username ?? '?'}) seen#${ref.seen_count}`)
+  }
   const body = {
     chat_id: m.chat.id,
     message_id: m.message_id,
@@ -283,6 +293,9 @@ bot.on('message', async (ctx) => {
     from_user_id: fromId,
     chat_type: m.chat.type,
     sent_at,
+    // Present only on a referral deep-link open → the duck can act on the ref immediately (else it can
+    // pull it later via the telegram MCP `get_referral`). Absent on every ordinary message (back-compat).
+    ...(startParam ? { start_param: startParam } : {}),
     // The THREAD key = the chat id (NOT per-message). The harness coalesces by this (a chat's
     // messages fold into one debounced wake) and keys the chat's sticky session on it. The
     // per-message id stays in `message_id` above (for reply-targeting + context).

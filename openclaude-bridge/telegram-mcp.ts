@@ -14,7 +14,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
-import { openIngressStore, setChatAttachment, type MediaType } from './ingress-store'
+import { openIngressStore, setChatAttachment, getReferral, type MediaType } from './ingress-store'
 
 // Per-chat attachment store — the harness injects INGRESS_DB (absolute). Absent ⇒ the toggle is
 // unavailable (returns an error); `reply` still works.
@@ -73,6 +73,27 @@ server.registerTool(
     for (const t of types) setChatAttachment(ingressStore, chat, t, allowed)
     console.error(`[telegram-mcp] set_chat_attachments chat=${chat} media=${media ?? 'all'} allowed=${allowed}`)
     return asText({ ok: true, chat_id: chat, media: media ?? 'all', allowed })
+  },
+)
+
+server.registerTool(
+  'get_referral',
+  {
+    description:
+      'Look up the deep-link referral for the person in THIS chat — the `param` from the ' +
+      '`t.me/<bot>?start=<param>` link they opened you with (e.g. a referrer @username or ref code), if ' +
+      'any. Scope is fixed by the harness to the chat that woke you; no arguments. Returns {found:false} ' +
+      'if they did not arrive via a referral link. Use to confirm/re-apply a referral (e.g. if a first ' +
+      'attempt to reward it failed).',
+    inputSchema: {},
+  },
+  async () => {
+    const chat = process.env.TELEGRAM_REPLY_CHAT
+    if (!chat) return asText({ ok: false, error: 'no source chat in scope — this cycle was not woken by Telegram' })
+    if (!ingressStore) return asText({ ok: false, error: 'INGRESS_DB not set — referral store unavailable' })
+    // A private chat's chat_id equals the user_id, so the source chat IS the referee key.
+    const ref = getReferral(ingressStore, chat)
+    return asText(ref ? { ok: true, found: true, referral: ref } : { ok: true, found: false })
   },
 )
 

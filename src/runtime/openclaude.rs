@@ -238,6 +238,7 @@ impl OpenClaudeClient {
     fn worker_env(&self) -> std::collections::BTreeMap<String, String> {
         const KEYS: &[&str] = &[
             "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE", "CLAUDE_CODE_USE_OPENAI",
+            "OPENAI_API_FORMAT", // wire API (chat_completions|responses) — keep workers on the same surface
             "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN",
             "DISABLE_AUTO_COMPACT", // behaviour flag (not a secret) — keep the SDK's compaction off here too
         ];

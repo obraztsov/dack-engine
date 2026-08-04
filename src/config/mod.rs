@@ -445,6 +445,12 @@ pub enum Connector {
         /// gitignored operator config; never in a committed file or the agent context.)
         #[serde(default)]
         api_key: Option<String>,
+        /// Which OpenAI-compat wire API the SDK targets → `OPENAI_API_FORMAT`: `chat_completions`
+        /// (default, `/chat/completions`) or `responses` (`/responses`). An EXPERIMENT toggle — the
+        /// Responses surface treats reasoning as first-class items (potentially better multi-turn
+        /// tool-calling) but is a distinct request/stream path, so default to chat completions.
+        #[serde(default)]
+        api_format: ApiFormat,
     },
     /// Native Anthropic catalog: the model is `options.model`. NOT YET WIRED (`cli::run` rejects it).
     Anthropic {
@@ -453,9 +459,32 @@ pub enum Connector {
     },
 }
 
+/// The OpenAI-compatible wire API the SDK targets. `chat_completions` (`/chat/completions`) is the
+/// classic, battle-tested surface; `responses` (`/responses`) is OpenAI's newer surface, which exposes
+/// reasoning as first-class output items — of interest for multi-turn tool-calling with reasoning models.
+/// Emitted to the bridge as `OPENAI_API_FORMAT`; the SDK honors it for a generic provider (no
+/// `responsesApiModelPrefixes` restriction). Default `chat_completions` — `responses` is an experiment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiFormat {
+    #[default]
+    ChatCompletions,
+    Responses,
+}
+
+impl ApiFormat {
+    /// The `OPENAI_API_FORMAT` value the SDK parses (`parseOpenAICompatibleApiFormat`).
+    pub fn as_env(self) -> &'static str {
+        match self {
+            ApiFormat::ChatCompletions => "chat_completions",
+            ApiFormat::Responses => "responses",
+        }
+    }
+}
+
 impl Default for Connector {
     fn default() -> Self {
-        Connector::OpenaiCompatible { api_url: None, api_key: None }
+        Connector::OpenaiCompatible { api_url: None, api_key: None, api_format: ApiFormat::ChatCompletions }
     }
 }
 
@@ -471,9 +500,14 @@ impl Connector {
     /// cred falls through to whatever the forwarded env supplies. The key never reaches agent context.
     pub fn env_overrides(&self) -> Vec<(String, String)> {
         match self {
-            Connector::OpenaiCompatible { api_url, api_key } => {
+            Connector::OpenaiCompatible { api_url, api_key, api_format } => {
                 // The OpenAI-compat path REQUIRES this flag; the connector owns it (no env reliance).
-                let mut env = vec![("CLAUDE_CODE_USE_OPENAI".to_string(), "1".to_string())];
+                // OPENAI_API_FORMAT is set explicitly (default `chat_completions`) so the wire API is
+                // deterministic — the connector owns it, not ambient env.
+                let mut env = vec![
+                    ("CLAUDE_CODE_USE_OPENAI".to_string(), "1".to_string()),
+                    ("OPENAI_API_FORMAT".to_string(), api_format.as_env().to_string()),
+                ];
                 if let Some(u) = api_url {
                     env.push(("OPENAI_BASE_URL".to_string(), u.clone()));
                 }
@@ -1226,12 +1260,43 @@ secrets:
     #[test]
     fn connector_channel_and_empty_creds_fall_through() {
         // opengateway → OPENAI_MODEL env channel; anthropic → options.model.
-        assert!(Connector::OpenaiCompatible { api_url: None, api_key: None }.model_via_openai_env());
+        assert!(Connector::OpenaiCompatible { api_url: None, api_key: None, api_format: ApiFormat::ChatCompletions }.model_via_openai_env());
         assert!(!Connector::Anthropic { api_key: None }.model_via_openai_env());
-        // With no inline creds, opengateway still sets the required flag but no base-URL/key (those
-        // fall through to the forwarded env).
-        let ov = Connector::OpenaiCompatible { api_url: None, api_key: None }.env_overrides();
-        assert_eq!(ov, vec![("CLAUDE_CODE_USE_OPENAI".to_string(), "1".to_string())]);
+        // With no inline creds, opengateway still sets the required flag + the wire-API format but no
+        // base-URL/key (those fall through to the forwarded env). Default format = chat_completions.
+        let ov = Connector::OpenaiCompatible { api_url: None, api_key: None, api_format: ApiFormat::ChatCompletions }.env_overrides();
+        assert_eq!(
+            ov,
+            vec![
+                ("CLAUDE_CODE_USE_OPENAI".to_string(), "1".to_string()),
+                ("OPENAI_API_FORMAT".to_string(), "chat_completions".to_string()),
+            ]
+        );
+        // The responses toggle flips only OPENAI_API_FORMAT.
+        let ovr = Connector::OpenaiCompatible { api_url: None, api_key: None, api_format: ApiFormat::Responses }.env_overrides();
+        assert!(ovr.contains(&("OPENAI_API_FORMAT".to_string(), "responses".to_string())));
+    }
+
+    #[test]
+    fn api_format_defaults_to_chat_completions_and_parses_responses() {
+        // Omitted ⇒ chat_completions (back-compat: every existing config is unaffected).
+        let cfg = DackConfig::from_yaml(
+            "operator_did: \"did:x\"\nruntime:\n  connector: { type: openai-compatible }\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            cfg.runtime.connector,
+            Connector::OpenaiCompatible { api_format: ApiFormat::ChatCompletions, .. }
+        ));
+        // Explicit responses toggle parses.
+        let cfg2 = DackConfig::from_yaml(
+            "operator_did: \"did:x\"\nruntime:\n  connector: { type: openai-compatible, api_format: responses }\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            cfg2.runtime.connector,
+            Connector::OpenaiCompatible { api_format: ApiFormat::Responses, .. }
+        ));
     }
 
     #[test]

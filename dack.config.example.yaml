@@ -29,6 +29,11 @@ runtime:
     type: openai-compatible
     api_url: "https://your-provider/v1"     # → OPENAI_BASE_URL (omit to take from the daemon env)
     api_key: "…"                            # → OPENAI_API_KEY (gitignored config only; omit → env)
+    # api_format: chat_completions          # → OPENAI_API_FORMAT. Default `chat_completions` (/chat/completions).
+                                            # `responses` targets the newer /responses surface (reasoning as first-
+                                            # class items; may help multi-turn tool-calling). NOTE: with the vendored
+                                            # openclaude SDK + Xiaomi it currently yields EMPTY output (SDK stream-parse
+                                            # mismatch — verified 2026-08-05); keep it off until re-verified per provider.
   model: "your-default-model-id"
   # Multimodal images (Phase 1): `vision_models` = the ids that accept image input. An image-bearing
   # Perceive KEEPS its selected model when that model is already a vision model (so you can run a cheap

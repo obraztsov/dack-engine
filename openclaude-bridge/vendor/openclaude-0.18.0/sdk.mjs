@@ -37615,54 +37615,6 @@ var init_workloadContext = __esm(() => {
   workloadStorage = new AsyncLocalStorage3;
 });
 
-// src/bridge/sessionIdCompat.ts
-var exports_sessionIdCompat = {};
-__export(exports_sessionIdCompat, {
-  toInfraSessionId: () => toInfraSessionId,
-  toCompatSessionId: () => toCompatSessionId,
-  setCseShimGate: () => setCseShimGate
-});
-function setCseShimGate(gate) {
-  _isCseShimEnabled = gate;
-}
-function toCompatSessionId(id) {
-  if (!id.startsWith("cse_"))
-    return id;
-  if (_isCseShimEnabled && !_isCseShimEnabled())
-    return id;
-  return "session_" + id.slice("cse_".length);
-}
-function toInfraSessionId(id) {
-  if (!id.startsWith("session_"))
-    return id;
-  return "cse_" + id.slice("session_".length);
-}
-var _isCseShimEnabled;
-
-// src/constants/product.ts
-function isRemoteSessionStaging(sessionId, ingressUrl) {
-  return sessionId?.includes("_staging_") === true || ingressUrl?.includes("staging") === true;
-}
-function isRemoteSessionLocal(sessionId, ingressUrl) {
-  return sessionId?.includes("_local_") === true || ingressUrl?.includes("localhost") === true;
-}
-function getClaudeAiBaseUrl(sessionId, ingressUrl) {
-  if (isRemoteSessionLocal(sessionId, ingressUrl)) {
-    return CLAUDE_AI_LOCAL_BASE_URL;
-  }
-  if (isRemoteSessionStaging(sessionId, ingressUrl)) {
-    return CLAUDE_AI_STAGING_BASE_URL;
-  }
-  return CLAUDE_AI_BASE_URL;
-}
-function getRemoteSessionUrl(sessionId, ingressUrl) {
-  const { toCompatSessionId: toCompatSessionId2 } = __toCommonJS(exports_sessionIdCompat);
-  const compatId = toCompatSessionId2(sessionId);
-  const baseUrl = getClaudeAiBaseUrl(compatId, ingressUrl);
-  return `${baseUrl}/code/${compatId}`;
-}
-var PRODUCT_DISPLAY_NAME = "OpenClaude", PRODUCT_URL = "https://claude.com/claude-code", CLAUDE_AI_BASE_URL = "https://claude.ai", CLAUDE_AI_STAGING_BASE_URL = "https://claude-ai.staging.ant.dev", CLAUDE_AI_LOCAL_BASE_URL = "http://localhost:4000";
-
 // src/constants/system.ts
 function getCLISyspromptPrefix(options) {
   const apiProvider = getAPIProvider();
@@ -37696,16 +37648,13 @@ function getAttributionHeader(fingerprint) {
   logForDebugging(`attribution header ${header}`);
   return header;
 }
-var DEFAULT_PREFIX, AGENT_SDK_CLAUDE_CODE_PRESET_PREFIX, AGENT_SDK_PREFIX, CLI_SYSPROMPT_PREFIX_VALUES, CLI_SYSPROMPT_PREFIXES;
+var DEFAULT_PREFIX = "", AGENT_SDK_CLAUDE_CODE_PRESET_PREFIX = "", AGENT_SDK_PREFIX = "", CLI_SYSPROMPT_PREFIX_VALUES, CLI_SYSPROMPT_PREFIXES;
 var init_system = __esm(() => {
   init_growthbook();
   init_debug();
   init_envUtils();
   init_providers();
   init_workloadContext();
-  DEFAULT_PREFIX = "";
-  AGENT_SDK_CLAUDE_CODE_PRESET_PREFIX = "";
-  AGENT_SDK_PREFIX = "";
   CLI_SYSPROMPT_PREFIX_VALUES = [
     DEFAULT_PREFIX,
     AGENT_SDK_CLAUDE_CODE_PRESET_PREFIX,
@@ -50095,7 +50044,7 @@ class JSONSchemaGenerator {
               if (val === undefined) {
                 if (this.unrepresentable === "throw") {
                   throw new Error("Literal `undefined` cannot be represented in JSON Schema");
-                } else {}
+                }
               } else if (typeof val === "bigint") {
                 if (this.unrepresentable === "throw") {
                   throw new Error("BigInt literals cannot be represented in JSON Schema");
@@ -77571,7 +77520,7 @@ var require_fetch = __commonJS((exports, module) => {
       request.cache = "no-store";
     }
     const newConnection = forceNewConnection ? "yes" : "no";
-    if (request.mode === "websocket") {} else {}
+    if (request.mode === "websocket") {}
     let requestBody = null;
     if (request.body == null && fetchParams.processRequestEndOfBody) {
       queueMicrotask(() => fetchParams.processRequestEndOfBody());
@@ -81358,7 +81307,7 @@ var require_eventsource = __commonJS((exports, module) => {
 
 // node_modules/undici/index.js
 var require_undici = __commonJS((exports, module) => {
-  var __filename = "/home/runner/work/openclaude/openclaude/node_modules/undici/index.js";
+  var __filename = "/Users/ilia/git/dack-engine/openclaude-0.18.0/node_modules/undici/index.js";
   var Client = require_client();
   var Dispatcher = require_dispatcher();
   var Pool = require_pool();
@@ -94609,7 +94558,7 @@ var require_dist_cjs15 = __commonJS((exports) => {
 
 // node_modules/@aws-sdk/util-user-agent-node/dist-cjs/index.js
 var require_dist_cjs16 = __commonJS((exports) => {
-  var __dirname = "/home/runner/work/openclaude/openclaude/node_modules/@aws-sdk/util-user-agent-node/dist-cjs";
+  var __dirname = "/Users/ilia/git/dack-engine/openclaude-0.18.0/node_modules/@aws-sdk/util-user-agent-node/dist-cjs";
   var node_os = __require("node:os");
   var node_process = __require("node:process");
   var config2 = require_config();
@@ -109355,7 +109304,7 @@ var init_metadata = __esm(() => {
       isClaudeAiAuth: isClaudeAISubscriber(),
       version: "0.18.0",
       versionBase: getVersionBase(),
-      buildTime: "2026-06-10T05:56:10.819Z",
+      buildTime: "2026-08-05T00:34:35.878Z",
       deploymentEnvironment: env2.detectDeploymentEnvironment(),
       ...isEnvTruthy(process.env.GITHUB_ACTIONS) && {
         githubEventName: process.env.GITHUB_EVENT_NAME,
@@ -116720,6 +116669,54 @@ var init_frontmatterParser = __esm(() => {
   FRONTMATTER_REGEX = /^---\s*\n([\s\S]*?)---\s*\n?/;
   FRONTMATTER_SHELLS = ["bash", "powershell"];
 });
+
+// src/bridge/sessionIdCompat.ts
+var exports_sessionIdCompat = {};
+__export(exports_sessionIdCompat, {
+  toInfraSessionId: () => toInfraSessionId,
+  toCompatSessionId: () => toCompatSessionId,
+  setCseShimGate: () => setCseShimGate
+});
+function setCseShimGate(gate) {
+  _isCseShimEnabled = gate;
+}
+function toCompatSessionId(id) {
+  if (!id.startsWith("cse_"))
+    return id;
+  if (_isCseShimEnabled && !_isCseShimEnabled())
+    return id;
+  return "session_" + id.slice("cse_".length);
+}
+function toInfraSessionId(id) {
+  if (!id.startsWith("session_"))
+    return id;
+  return "cse_" + id.slice("session_".length);
+}
+var _isCseShimEnabled;
+
+// src/constants/product.ts
+function isRemoteSessionStaging(sessionId, ingressUrl) {
+  return sessionId?.includes("_staging_") === true || ingressUrl?.includes("staging") === true;
+}
+function isRemoteSessionLocal(sessionId, ingressUrl) {
+  return sessionId?.includes("_local_") === true || ingressUrl?.includes("localhost") === true;
+}
+function getClaudeAiBaseUrl(sessionId, ingressUrl) {
+  if (isRemoteSessionLocal(sessionId, ingressUrl)) {
+    return CLAUDE_AI_LOCAL_BASE_URL;
+  }
+  if (isRemoteSessionStaging(sessionId, ingressUrl)) {
+    return CLAUDE_AI_STAGING_BASE_URL;
+  }
+  return CLAUDE_AI_BASE_URL;
+}
+function getRemoteSessionUrl(sessionId, ingressUrl) {
+  const { toCompatSessionId: toCompatSessionId2 } = __toCommonJS(exports_sessionIdCompat);
+  const compatId = toCompatSessionId2(sessionId);
+  const baseUrl = getClaudeAiBaseUrl(compatId, ingressUrl);
+  return `${baseUrl}/code/${compatId}`;
+}
+var PRODUCT_DISPLAY_NAME = "OpenClaude", PRODUCT_URL = "https://claude.com/claude-code", CLAUDE_AI_BASE_URL = "https://claude.ai", CLAUDE_AI_STAGING_BASE_URL = "https://claude-ai.staging.ant.dev", CLAUDE_AI_LOCAL_BASE_URL = "http://localhost:4000";
 
 // src/constants/apiLimits.ts
 var API_IMAGE_MAX_BASE64_SIZE, IMAGE_TARGET_RAW_SIZE, IMAGE_MAX_WIDTH = 1568, IMAGE_MAX_HEIGHT = 1568, PDF_TARGET_RAW_SIZE, API_PDF_MAX_PAGES = 100, PDF_EXTRACT_SIZE_THRESHOLD, PDF_MAX_EXTRACT_SIZE, PDF_MAX_PAGES_PER_READ = 20, PDF_AT_MENTION_INLINE_THRESHOLD = 10, API_MAX_MEDIA_PER_REQUEST = 100;
@@ -135066,19 +135063,16 @@ var init_limits = __esm(() => {
 });
 
 // sdk-missing-stub:./UI.js
-var noop102 = () => null, getToolUseSummary, renderToolResultMessage, renderToolUseErrorMessage, renderToolUseMessage, userFacingName, renderToolUseTag, renderToolUseProgressMessage, renderToolUseQueuedMessage, renderToolUseRejectedMessage, isResultTruncated, BackgroundHint, renderCreateResultMessage, renderCreateToolUseMessage, renderDeleteResultMessage, renderDeleteToolUseMessage, renderListResultMessage, renderListToolUseMessage, renderGroupedAgentToolUse, userFacingNameBackgroundColor;
+var noop102 = () => null, getToolUseSummary, renderToolResultMessage, renderToolUseErrorMessage, renderToolUseMessage, renderToolUseRejectedMessage, renderToolUseProgressMessage, isResultTruncated, userFacingName, renderCreateResultMessage, renderCreateToolUseMessage, renderDeleteResultMessage, renderDeleteToolUseMessage, renderListResultMessage, renderListToolUseMessage, renderGroupedAgentToolUse, renderToolUseTag, userFacingNameBackgroundColor, renderToolUseQueuedMessage, BackgroundHint;
 var init_UI = __esm(() => {
   getToolUseSummary = noop102;
   renderToolResultMessage = noop102;
   renderToolUseErrorMessage = noop102;
   renderToolUseMessage = noop102;
-  userFacingName = noop102;
-  renderToolUseTag = noop102;
-  renderToolUseProgressMessage = noop102;
-  renderToolUseQueuedMessage = noop102;
   renderToolUseRejectedMessage = noop102;
+  renderToolUseProgressMessage = noop102;
   isResultTruncated = noop102;
-  BackgroundHint = noop102;
+  userFacingName = noop102;
   renderCreateResultMessage = noop102;
   renderCreateToolUseMessage = noop102;
   renderDeleteResultMessage = noop102;
@@ -135086,7 +135080,10 @@ var init_UI = __esm(() => {
   renderListResultMessage = noop102;
   renderListToolUseMessage = noop102;
   renderGroupedAgentToolUse = noop102;
+  renderToolUseTag = noop102;
   userFacingNameBackgroundColor = noop102;
+  renderToolUseQueuedMessage = noop102;
+  BackgroundHint = noop102;
 });
 
 // src/tools/FileReadTool/FileReadTool.ts
@@ -165080,10 +165077,10 @@ var init_ConfigurableShortcutHint = __esm(() => {
 });
 
 // sdk-missing-stub:src/components/CtrlOToExpand.js
-var noop108 = () => null, SubAgentProvider, CtrlOToExpand;
+var noop108 = () => null, CtrlOToExpand, SubAgentProvider;
 var init_CtrlOToExpand2 = __esm(() => {
-  SubAgentProvider = noop108;
   CtrlOToExpand = noop108;
+  SubAgentProvider = noop108;
 });
 
 // sdk-missing-stub:src/components/design-system/Byline.js
@@ -165129,10 +165126,10 @@ var init_MessageResponse = __esm(() => {
 var init_ToolUseLoader = () => {};
 
 // sdk-missing-stub:../../ink.js
-var noop114 = () => null, Text, Box;
+var noop114 = () => null, Box, Text;
 var init_ink = __esm(() => {
-  Text = noop114;
   Box = noop114;
+  Text = noop114;
 });
 
 // sdk-jsx-stub:react/jsx-dev-runtime
@@ -194457,7 +194454,7 @@ var require_dbcs_codec = __commonJS((exports) => {
           if (resCode !== undefined) {
             dbcsCode = resCode;
             nextChar = uCode;
-          } else {}
+          }
         }
         seqObj = undefined;
       } else if (uCode >= 0) {
@@ -194518,7 +194515,7 @@ var require_dbcs_codec = __commonJS((exports) => {
           newBuf[j++] = dbcsCode >> 8;
           newBuf[j++] = dbcsCode & 255;
         }
-      } else {}
+      }
       this.seqObj = undefined;
     }
     if (this.leadSurrogate !== -1) {
@@ -217023,10 +217020,7 @@ function markForSnip(shortIds, messages) {
   return [...matched];
 }
 function isSnipRuntimeEnabled() {
-  return false; // DACK PATCH 2026-07-16: snip is wall-denied for the duck (it deleted its own grounding
-  // and confabulated a fake project in a Reflect). Returning false also kills the context-pressure NUDGE
-  // (getContextEfficiencyAttachment) that pushed the model toward snip and that it misread as "user kept
-  // interrupting". Re-apply on SDK upgrade. See memory openclaude-runtime-gotchas.
+  return true;
 }
 function estimateTokens(msg) {
   const content = msg?.message?.content ?? msg?.content ?? "";
@@ -229674,7 +229668,7 @@ function getAnthropicEnvMetadata() {
 function getBuildAgeMinutes() {
   if (false)
     ;
-  const buildTime = new Date("2026-06-10T05:56:10.819Z").getTime();
+  const buildTime = new Date("2026-08-05T00:34:35.878Z").getTime();
   if (isNaN(buildTime))
     return;
   return Math.floor((Date.now() - buildTime) / 60000);
@@ -238655,11 +238649,6 @@ async function* readSseEvents(response, signal) {
 `).map((line) => line.trim()).filter(Boolean);
       if (lines.length === 0)
         continue;
-      // PATCHED (DACK): SSE-spec-compliant field parsing. The space after the colon is OPTIONAL
-      // (WHATWG EventSource strips ONE leading U+0020), so `data:x` ≡ `data: x`. Upstream required the
-      // space (`"event: "`/`"data: "`), so a compliant provider that frames `event:x`/`data:{...}` — e.g.
-      // Xiaomi's /responses stream — had EVERY frame dropped → empty text + output_tokens:0. Match
-      // colon-only and strip one optional leading space.
       const eventLine = lines.find((line) => line.startsWith("event:"));
       const dataLines = lines.filter((line) => line.startsWith("data:"));
       if (!eventLine || dataLines.length === 0)
@@ -279521,4 +279510,4 @@ export {
   AbortError
 };
 
-//# debugId=61F6ECEC61B3C79164756E2164756E21
+//# debugId=0E88D6BBC3EE757164756E2164756E21

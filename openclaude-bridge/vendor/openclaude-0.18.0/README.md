@@ -1,19 +1,21 @@
-Vendored + patched @gitlawb/openclaude 0.18.0 sdk.mjs.
+Vendored openclaude 0.18.0 `sdk.mjs` — now **BUILT FROM the DACK fork source**, not hand-patched.
 
-PATCH 1 (identity prefix): emptied the 3 CLI identity-prefix literals ("You are OpenClaude...") so the
-system prompt is ONLY our SOUL.md (no coding-agent framing). filter(Boolean) drops the now-empty strings.
+The fork (private repo under `obraztsov`; local checkout at repo-root `/openclaude-0.18.0`, gitignored) =
+upstream @gitlawb/openclaude 0.18.0 + our patches. See the fork's `PATCHES.md`:
 
-PATCH 2 (SSE spec compliance, 2026-08-05): `readSseEvents` (the /responses + codex stream reader)
-required a space after the colon (`startsWith("event: ")`/`"data: "`). The space is OPTIONAL per the
-WHATWG EventSource spec (one leading U+0020 is stripped), so a compliant provider that frames
-`event:x`/`data:{...}` — e.g. Xiaomi's `/responses` — had EVERY frame dropped → empty assistant text +
-`output_tokens:0`. Changed to match colon-only and strip one optional leading space
-(`slice(6/5).replace(/^ /,"")`). Backward-compatible with spaced framing (OpenAI/Codex). This is what
-makes `runtime.connector.api_format: responses` usable on Xiaomi. Upstream bug (untested vs no-space SSE).
+- **PATCH 1** (`src/constants/system.ts`): the 3 coding-agent identity prefixes → `''` (the model's system
+  prompt is ONLY our SOUL.md — no "You are OpenClaude, a coding agent…" framing).
+- **PATCH 2** (`src/services/api/codexShim.ts` `readSseEvents`): SSE-spec-compliant field parsing — the
+  space after the SSE colon is OPTIONAL, so match `event:`/`data:` colon-only and strip one leading space.
+  Fixes empty output on providers that frame `event:x`/`data:{...}` without the space (Xiaomi `/responses`).
 
-NOT patched here: OpenAI-shim penalty passthrough (needs a source build — deferred). Two remaining
-/responses-stream gaps left as-is (Xiaomi doesn't hit them — it emits `output_text.delta`): text is
-accumulated only from `response.output_text.delta` (never reconstructed from the terminal
-`response.completed` payload), and `response.output_text.done`/`content_part.done` are unhandled.
+REBUILD + RE-VENDOR: in the fork, `bun install && bun run build` → `dist/sdk.mjs`; copy it here; then
+validate through the bridge (A/B chat + responses via the scratch probes) BEFORE committing. Bundler
+module-ordering is nondeterministic (~150 lines differ run-to-run vs the previous bundle) — validate
+FUNCTIONALLY, not by diff.
 
-Pin: 0.18.0. Do NOT npm-upgrade the bridge import past this without re-vendoring (re-apply BOTH patches).
+NOT patched: OpenAI-shim penalty passthrough; two minor `/responses`-stream gaps (Xiaomi unaffected — see
+the fork `PATCHES.md`).
+
+Pin: 0.18.0 (0.21 added inference-reseller ads + deeper gitlawb/opengateway coupling, no functional gain).
+Do NOT npm-upgrade the bridge import — rebuild from the fork instead.

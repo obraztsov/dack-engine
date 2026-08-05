@@ -702,6 +702,16 @@ impl Harness {
                 }
             }
         }
+        // DEFERRAL (duck-loop only): which assembled servers carry `expand: deferred` — their tools are
+        // announced via `find_tools` instead of sent inline, so a large surface (cove/rootAI, 100+ tools)
+        // doesn't bloat every prompt. A pure function of the resolved server names ∩ config: inline soul
+        // servers aren't in the registry, so they're never deferred. The OpenClaude bridge ignores this
+        // field (all tools inline); only the duck-loop bridge honors it.
+        let mcp_deferred: Vec<String> = mcp_servers
+            .keys()
+            .filter(|n| self.config.mcp_server(n).map(|s| s.expand.is_deferred()).unwrap_or(false))
+            .cloned()
+            .collect();
         let recorder = self.wall_for(spec.clone(), inline_read, cycle_trust);
         // Offer ONLY the transitions the current trust ceiling permits — the agent never sees a hop
         // it couldn't take (taint model). A step that then touches a lower-trust capability may drop
@@ -824,6 +834,7 @@ impl Harness {
             workdir: Some(self.soul_root()),
             secret_env,
             mcp_servers,
+            mcp_deferred,
             model,
             // The duck's consciousness states register no sub-agents (no `Task` target — sync
             // sub-helpers exist only inside a worker). Workers set this in `run_worker_detached`.
@@ -1433,6 +1444,8 @@ impl Harness {
                         transport: McpTransport::Http { url: url.clone() },
                         auth: None,
                         tier: CapabilityTier::Read,
+                        // A soul-inlined MCP is small and un-deferrable — it's always sent inline.
+                        expand: crate::config::McpExpand::Inline,
                         tools: Vec::new(),
                         banned_tools: Vec::new(),
                         // Inline = 3rd-party; it taints `public` at access time (it isn't in the
@@ -2173,6 +2186,7 @@ async fn run_worker_detached(
         workdir: Some(workspace.clone()),
         secret_env: BTreeMap::new(),
         mcp_servers: BTreeMap::new(),
+        mcp_deferred: Vec::new(), // a worker carries no MCP caps → nothing to defer.
         model,
         agents,
         isolate: isolated,
@@ -3878,6 +3892,7 @@ mod tests {
             transport: McpTransport::Http { url: "https://cove/api/mcp".into() },
             auth: Some(McpAuth { secret: "cove_read".into(), key: None, header: None, scheme: None, env: None }),
             tier: CapabilityTier::Read,
+            expand: crate::config::McpExpand::Inline,
             tools: vec![],
             banned_tools: vec![],
             trust: TrustTier::self_(),
@@ -3905,6 +3920,7 @@ mod tests {
                 env: None,
             }),
             tier: CapabilityTier::Read,
+            expand: crate::config::McpExpand::Inline,
             tools: vec![],
             banned_tools: vec![],
             trust: TrustTier::public(),
@@ -3941,6 +3957,7 @@ mod tests {
             },
             auth: Some(McpAuth { secret: "x".into(), key: None, header: None, scheme: None, env: Some("X_BEARER_TOKEN".into()) }),
             tier: CapabilityTier::Post,
+            expand: crate::config::McpExpand::Inline,
             tools: vec![],
             banned_tools: vec![],
             trust: TrustTier::public(),

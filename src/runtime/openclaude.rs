@@ -93,6 +93,9 @@ enum ToBridge<'a> {
         resume: Option<&'a str>,
         /// Resolved MCP capability servers (SDK-shaped, tokens injected) → `options.mcpServers`.
         mcp_servers: &'a std::collections::BTreeMap<String, serde_json::Value>,
+        /// **Deferred server names** (subset of `mcp_servers`): their tools are announced via `find_tools`
+        /// rather than sent inline. Honored only by the duck-loop bridge; the OpenClaude bridge ignores it.
+        mcp_deferred: &'a [String],
         /// Sub-agent defs the engine may `Task`-spawn → `options.agents`. Empty for the
         /// duck's states; a worker registers its sub-helpers here.
         agents: &'a std::collections::BTreeMap<String, serde_json::Value>,
@@ -406,6 +409,7 @@ impl RuntimeClient for OpenClaudeClient {
             // Sticky-session resume: the engine session id the harness wants to continue (if any).
             resume: req.session.as_ref().map(|s| s.0.as_str()),
             mcp_servers: &req.mcp_servers,
+            mcp_deferred: &req.mcp_deferred,
             agents: &req.agents,
             media: &req.media,
         };
@@ -523,6 +527,49 @@ mod tests {
         }
     }
 
+    /// The wire contract for deferral: `mcp_deferred` must serialize as that exact snake_case key (the
+    /// duck-loop bridge reads `inv.mcp_deferred`) and stay a plain string array. Empty ⇒ still present
+    /// as `[]` (the openclaude bridge just ignores it → all tools inline).
+    #[test]
+    fn invoke_serializes_mcp_deferred_as_snake_case_array() {
+        let servers = std::collections::BTreeMap::new();
+        let agents = std::collections::BTreeMap::new();
+        let deferred = vec!["cove".to_string(), "rootai".to_string()];
+        let invoke = ToBridge::Invoke {
+            system_prompt: "s",
+            user_prompt: "u".into(),
+            disallowed_tools: vec![],
+            allowed_tools: None,
+            model: None,
+            cwd: None,
+            resume: None,
+            mcp_servers: &servers,
+            mcp_deferred: &deferred,
+            agents: &agents,
+            media: &[],
+        };
+        let v = serde_json::to_value(&invoke).unwrap();
+        assert_eq!(v["kind"], "invoke");
+        assert_eq!(v["mcp_deferred"], serde_json::json!(["cove", "rootai"]));
+
+        // Empty stays present as [] (the field the bridge reads is always there).
+        let empty: Vec<String> = vec![];
+        let invoke2 = ToBridge::Invoke {
+            system_prompt: "s",
+            user_prompt: "u".into(),
+            disallowed_tools: vec![],
+            allowed_tools: None,
+            model: None,
+            cwd: None,
+            resume: None,
+            mcp_servers: &servers,
+            mcp_deferred: &empty,
+            agents: &agents,
+            media: &[],
+        };
+        assert_eq!(serde_json::to_value(&invoke2).unwrap()["mcp_deferred"], serde_json::json!([]));
+    }
+
     /// The model-routing split (8.7 + the gateway fix): on a gateway the resolved model must go to
     /// the `OPENAI_MODEL` env (NOT `options.model`, which the SDK rejects); on the catalog, reverse.
     #[test]
@@ -605,6 +652,7 @@ mod tests {
             workdir: None,
             secret_env: Default::default(),
             mcp_servers: Default::default(),
+            mcp_deferred: Vec::new(),
             model: None,
             agents: Default::default(),
             isolate: false,
@@ -744,6 +792,7 @@ mod tests {
             workdir: Some(PathBuf::from(workdir)),
             secret_env: Default::default(),
             mcp_servers: Default::default(),
+            mcp_deferred: Vec::new(),
             model: None,
             agents: Default::default(),
             isolate,

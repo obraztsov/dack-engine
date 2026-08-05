@@ -335,9 +335,37 @@ pub struct McpAuth {
 
 /// An operator-declared MCP **capability server**. The registry is OPERATOR authority:
 /// adding cove.trade, the next tool, … is a config entry — never a harness/bridge code change.
+/// Whether a server's tools reach the model **inline** (full schemas, up front) or **deferred**
+/// (announced name+description via a `find_tools` search tool; full schema loaded only once the model
+/// discovers it). Deferral keeps a large surface out of every prompt: the model searches, then the tool
+/// becomes inline + callable. Honored only by the duck-loop runtime; the OpenClaude runtime ignores it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum McpExpand {
+    /// Send this server's tools inline (full schemas up front). The default — no behavior change.
+    #[default]
+    Inline,
+    /// Defer this server's tools: announce name+desc via `find_tools`, load the full schema on discovery.
+    Deferred,
+}
+
+impl McpExpand {
+    /// True iff this server's tools should be held behind `find_tools`.
+    pub fn is_deferred(self) -> bool {
+        matches!(self, McpExpand::Deferred)
+    }
+}
+
 /// `tier` + the wall gate what its tools may do and which state reaches them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpServerConfig {
+    /// **Tool-surface expansion** (see [`McpExpand`]): `inline` (default) sends this server's tools up
+    /// front; `deferred` holds them behind a `find_tools` search so a huge surface (cove + rootAI can be
+    /// 100+ tools combined) doesn't bloat every prompt. **Runtime-gated** — honored only by the duck-loop
+    /// runtime's client-side tool-search; the OpenClaude runtime ignores it (all tools inline, as today).
+    /// A dack-engine config field, NEVER sent to the server → fully backward-compatible.
+    #[serde(default)]
+    pub expand: McpExpand,
     /// Server name → tool prefix `mcp__<name>__`. The wall classifies by this prefix + `tier`.
     pub name: String,
     pub transport: McpTransport,
@@ -1195,6 +1223,28 @@ secrets:
         // Soul key is a reference, never forwarded.
         assert!(cfg.secrets.contains_key("soul_did_key"));
         assert!(!cfg.forwarded_env.contains(&"SOUL_DID_KEY".to_string()));
+    }
+
+    #[test]
+    fn mcp_expand_parses_deferred_and_defaults_inline() {
+        let cfg = DackConfig::from_yaml(
+            "operator_did: \"did:x\"\n\
+             mcp_servers:\n\
+             \x20 - name: cove\n\
+             \x20   transport: { type: http, url: \"https://cove/api/mcp\" }\n\
+             \x20   tier: read\n\
+             \x20   expand: deferred\n\
+             \x20 - name: telegram\n\
+             \x20   transport: { type: stdio, command: bun, args: [\"run\", \"t.ts\"] }\n\
+             \x20   tier: post\n",
+        )
+        .expect("config with expand parses");
+        // Explicit `expand: deferred` is picked up.
+        assert!(cfg.mcp_server("cove").unwrap().expand.is_deferred(), "cove is deferred");
+        // Omitting `expand` defaults to inline (backward-compatible).
+        let tg = cfg.mcp_server("telegram").unwrap();
+        assert_eq!(tg.expand, McpExpand::Inline, "no expand → inline");
+        assert!(!tg.expand.is_deferred());
     }
 
     #[test]

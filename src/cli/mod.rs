@@ -585,10 +585,12 @@ fn build_runtime(
     config: &DackConfig,
     health: Arc<crate::health::HealthRegistry>,
 ) -> Result<Arc<dyn RuntimeClient>> {
-    use crate::config::{Connector, RuntimeEngine};
+    use crate::config::Connector;
     let rt = &config.runtime;
-    let RuntimeEngine::Openclaude { bridge_dir } = &rt.engine;
-    // (engine is exhaustive today — a future `ClaudeCode` arm lands with its own adapter here.)
+    // Both engines (`openclaude` / `duck-loop`) use the SAME generic bun-bridge client — only the bridge
+    // script behind `bridge_dir` differs (the OpenClaude SDK vs our `runAgent`); same NDJSON protocol +
+    // connector env. So engine selection is just which dir the client runs `bun run bridge.ts` in.
+    let bridge_dir = rt.engine.bridge_dir();
     if let Connector::Anthropic { .. } = rt.connector {
         return Err(DackError::NotImplemented(
             "runtime.connector: anthropic — not wired yet (only openai-compatible). \

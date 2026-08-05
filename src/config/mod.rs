@@ -408,6 +408,14 @@ pub enum RuntimeEngine {
         #[serde(default = "default_bridge_dir")]
         bridge_dir: String,
     },
+    /// DACK's OWN agent-loop runtime (`duck-loop/`) — a bun bridge speaking the SAME NDJSON protocol
+    /// (invoke/permission/decision/result) but driving our `runAgent` instead of the OpenClaude SDK. It
+    /// reads the same connector env (`OPENAI_BASE_URL/KEY/MODEL`), so no other wiring differs. `dir` holds
+    /// `bridge.ts` (spawned as `bun run bridge.ts` with cwd = `dir`).
+    DuckLoop {
+        #[serde(default = "default_duck_loop_dir")]
+        dir: String,
+    },
 }
 
 impl Default for RuntimeEngine {
@@ -417,10 +425,12 @@ impl Default for RuntimeEngine {
 }
 
 impl RuntimeEngine {
-    /// The bridge project dir (openclaude). A no-op match today; the place a future engine slots in.
+    /// The bridge project dir — the cwd the client runs `bun run bridge.ts` in. Same shape for both
+    /// engines (the client is a generic NDJSON bridge; only the bridge script behind it differs).
     pub fn bridge_dir(&self) -> &str {
         match self {
             RuntimeEngine::Openclaude { bridge_dir } => bridge_dir,
+            RuntimeEngine::DuckLoop { dir } => dir,
         }
     }
 }
@@ -993,6 +1003,10 @@ fn default_webhook_addr() -> String {
 fn default_bridge_dir() -> String {
     "openclaude-bridge".to_string()
 }
+
+fn default_duck_loop_dir() -> String {
+    "duck-loop".to_string()
+}
 fn default_invoke_timeout_secs() -> u64 {
     300
 }
@@ -1297,6 +1311,21 @@ secrets:
             cfg2.runtime.connector,
             Connector::OpenaiCompatible { api_format: ApiFormat::Responses, .. }
         ));
+    }
+
+    #[test]
+    fn duck_loop_engine_parses_and_selects_its_dir() {
+        // default engine = openclaude
+        let d = DackConfig::from_yaml("operator_did: \"did:x\"\n").unwrap();
+        assert!(matches!(d.runtime.engine, RuntimeEngine::Openclaude { .. }));
+        assert_eq!(d.runtime.engine.bridge_dir(), "openclaude-bridge");
+        // opt into our own runtime
+        let c = DackConfig::from_yaml(
+            "operator_did: \"did:x\"\nruntime:\n  engine: { type: duck-loop }\n",
+        )
+        .unwrap();
+        assert!(matches!(c.runtime.engine, RuntimeEngine::DuckLoop { .. }));
+        assert_eq!(c.runtime.engine.bridge_dir(), "duck-loop"); // the cwd the client runs `bun run bridge.ts` in
     }
 
     #[test]

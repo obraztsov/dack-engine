@@ -25,6 +25,9 @@ soul_repo: "my-soul"
 # `model` = the default model id; tier_policy.<state>.model overrides it per state.
 runtime:
   engine: { type: openclaude, bridge_dir: openclaude-bridge }
+  # engine: { type: duck-loop }          # EXPERIMENTAL — DACK's OWN agent-loop runtime (duck-loop/) in place
+                                          # of the OpenClaude SDK. Same NDJSON protocol + same connector env;
+                                          # text cycles work today, MCP tools + the wall are WIP (M5).
   connector:
     type: openai-compatible
     api_url: "https://your-provider/v1"     # → OPENAI_BASE_URL (omit to take from the daemon env)

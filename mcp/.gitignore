@@ -1,0 +1,3 @@
+node_modules/
+# Per-duck local dev config (semantically state, like the openclaude-bridge one was — untracked).
+telegram-ingress.config.json

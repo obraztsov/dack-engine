@@ -8,8 +8,8 @@
 #   docker run -d --name <duck> --restart unless-stopped --cpus 2 --memory 3g \
 #     -v /srv/ducks/<duck>:/duck dack/duck:latest
 #
-# REBUILD after any change to src/ (harness) or openclaude-bridge/recall-mcp (bridge/MCP) — both are
-# baked in, not bind-mounted (host node_modules/binary are the wrong arch/OS).
+# REBUILD after any change to src/ (harness), openclaude-bridge (the runtime bridge), mcp/, or recall-mcp
+# (the MCP servers + ingress) — all are baked in, not bind-mounted (host node_modules/binary = wrong arch/OS).
 
 # ── Stage 1: build the Rust harness. Bundled SQLite compiles C, so we need a toolchain — bookworm's
 #    rust image already ships gcc; no other system libs (deps are pure-Rust, verified). ──
@@ -61,6 +61,14 @@ WORKDIR /app/recall-mcp
 COPY recall-mcp/package.json recall-mcp/bun.lock ./
 RUN bun install --frozen-lockfile
 COPY recall-mcp/src ./src
+
+# Our base capability servers + telegram ingress (runtime-agnostic; spawned per config at /app/mcp/*.ts).
+# Own bun project — the SDK's transitive @modelcontextprotocol/sdk + zod are now DIRECT deps here.
+WORKDIR /app/mcp
+COPY mcp/package.json mcp/bun.lock ./
+RUN bun install --frozen-lockfile
+COPY mcp/*.ts ./
+# (telegram-ingress.config.json is NOT baked — it's per-duck state, read from /duck at runtime.)
 
 # The trusted secrets providers (python, stdlib-only). No per-duck state — the tokens they read/write
 # live in the mounted /duck/secrets/.

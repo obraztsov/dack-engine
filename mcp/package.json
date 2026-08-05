@@ -1,0 +1,15 @@
+{
+  "name": "mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "DACK's base capability servers + telegram ingress — runtime-agnostic stdio MCP servers (telegram reply/send, twitter) + the telegram ingress module + its SQLite store. Separate from any runtime bridge (openclaude-bridge / duck-loop); spawned per config. recall lives in recall-mcp/.",
+  "scripts": {
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "grammy": "^1.44.0",
+    "zod": "^3.25.0"
+  }
+}

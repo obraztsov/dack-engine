@@ -101,7 +101,7 @@ function loadConfig(): Cfg {
     ingress_db: 'ingress.sqlite',
   }
   const name = process.env.TELEGRAM_INGRESS_CONFIG ?? 'telegram-ingress.config.json'
-  const raw = readFirst([name, `openclaude-bridge/${name}`, `../${name}`])
+  const raw = readFirst([name, `mcp/${name}`, `../${name}`])
   return raw ? { ...def, ...JSON.parse(raw) } : def
 }
 

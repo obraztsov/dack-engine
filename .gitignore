@@ -1,6 +1,7 @@
 # openclaude directory, separate repo
 /openclaude-0.18.0
-/openclaude-0.21.0
+# duck-loop directory, separate repo
+/duck-loop
 
 # agent soul + its live SQLite runlog store, not tracked in this repo
 /soul-template

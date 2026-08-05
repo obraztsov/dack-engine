@@ -73,12 +73,12 @@ trust_tiers:
 # locked into the server's env. `auth.secret` names a secrets_providers entry. See docs/capabilities.md.
 mcp_servers:
   - name: twitter
-    transport: { type: stdio, command: bun, args: [run, openclaude-bridge/twitter-mcp.ts] }
+    transport: { type: stdio, command: bun, args: [run, mcp/twitter-mcp.ts] }
     auth: { secret: x, env: X_BEARER_TOKEN }
     tier: post
     trust: public
   # - name: telegram                              # destination-locked reply (open to any tier)
-  #   transport: { type: stdio, command: bun, args: [run, openclaude-bridge/telegram-mcp.ts] }
+  #   transport: { type: stdio, command: bun, args: [run, mcp/telegram-mcp.ts] }
   #   auth: { secret: telegram_bot, env: TELEGRAM_BOT_TOKEN }
   #   tier: post
   #   scope_env: { TELEGRAM_REPLY_CHAT: chat_id, TELEGRAM_REPLY_TO: message_id }
@@ -132,7 +132,7 @@ secrets:
 # shutdown. It normalizes a channel protocol into a webhook POST. See docs/channels.md.
 # modules:
 #   - name: telegram-ingress
-#     command: [bun, run, openclaude-bridge/telegram-ingress.ts]
+#     command: [bun, run, mcp/telegram-ingress.ts]
 #     secrets: [telegram_bot]
 #     env: { TELEGRAM_INGRESS_CONFIG: telegram-ingress.config.json }
 

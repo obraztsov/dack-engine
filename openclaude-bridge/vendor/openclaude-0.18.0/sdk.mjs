@@ -238655,12 +238655,17 @@ async function* readSseEvents(response, signal) {
 `).map((line) => line.trim()).filter(Boolean);
       if (lines.length === 0)
         continue;
-      const eventLine = lines.find((line) => line.startsWith("event: "));
-      const dataLines = lines.filter((line) => line.startsWith("data: "));
+      // PATCHED (DACK): SSE-spec-compliant field parsing. The space after the colon is OPTIONAL
+      // (WHATWG EventSource strips ONE leading U+0020), so `data:x` ≡ `data: x`. Upstream required the
+      // space (`"event: "`/`"data: "`), so a compliant provider that frames `event:x`/`data:{...}` — e.g.
+      // Xiaomi's /responses stream — had EVERY frame dropped → empty text + output_tokens:0. Match
+      // colon-only and strip one optional leading space.
+      const eventLine = lines.find((line) => line.startsWith("event:"));
+      const dataLines = lines.filter((line) => line.startsWith("data:"));
       if (!eventLine || dataLines.length === 0)
         continue;
-      const event = eventLine.slice(7).trim();
-      const rawData = dataLines.map((line) => line.slice(6)).join(`
+      const event = eventLine.slice(6).replace(/^ /, "").trim();
+      const rawData = dataLines.map((line) => line.slice(5).replace(/^ /, "")).join(`
 `);
       if (rawData === "[DONE]")
         continue;

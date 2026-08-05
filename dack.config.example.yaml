@@ -31,9 +31,9 @@ runtime:
     api_key: "…"                            # → OPENAI_API_KEY (gitignored config only; omit → env)
     # api_format: chat_completions          # → OPENAI_API_FORMAT. Default `chat_completions` (/chat/completions).
                                             # `responses` targets the newer /responses surface (reasoning as first-
-                                            # class items; may help multi-turn tool-calling). NOTE: with the vendored
-                                            # openclaude SDK + Xiaomi it currently yields EMPTY output (SDK stream-parse
-                                            # mismatch — verified 2026-08-05); keep it off until re-verified per provider.
+                                            # class items; may help multi-turn tool-calling). Works on Xiaomi as of the
+                                            # vendored-SDK SSE patch (2026-08-05); still an experiment — single-turn
+                                            # quality is neutral, so validate on a throwaway before enabling per provider.
   model: "your-default-model-id"
   # Multimodal images (Phase 1): `vision_models` = the ids that accept image input. An image-bearing
   # Perceive KEEPS its selected model when that model is already a vision model (so you can run a cheap

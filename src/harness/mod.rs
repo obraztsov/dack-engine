@@ -1277,7 +1277,7 @@ impl Harness {
         if let Some(soul) = self.identity.did(IdentityRole::Soul) {
             signers.push(soul.clone());
         }
-        responder = responder.with_skills(self.soul_root().join("skills"), signers);
+        responder = responder.with_skills(self.soul_root().join("skills"), signers, Some(self.broker.clone()));
         responder.read_tools = p.read;
         // Long-term memory (`memory/`) is gated to `memory_write_min_trust` (org+): a lower-trust cycle
         // may not write it (the wall enforces; the digest consolidates instead).

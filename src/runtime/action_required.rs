@@ -15,12 +15,14 @@
 //! memory-append; Settle allows its registered settle-tier tools; everything else denied.
 
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
 use super::classify::classify_tool;
 use super::{ActionDecision, ActionRequest, ActionResponder};
 use crate::config::CapabilityPrefix;
+use crate::secrets::providers::SecretsBroker;
 use crate::state::{ConsciousnessState, StateSpec, ToolClass};
 
 /// One responder per invocation, bound to the running state's spec. Holding the spec
@@ -60,6 +62,10 @@ pub struct StatePolicyResponder {
     /// enabled and every `RunSkillCommand` is denied. Set by the harness from the soul repo + identities.
     pub skills_root: Option<PathBuf>,
     pub trusted_signers: Vec<crate::identity::Did>,
+    /// The secrets broker — used to MATERIALIZE a skill command's declared `secret` into the approved
+    /// exec's `env` at call time (lazy: only when the command actually runs), so the credential reaches the
+    /// skill process, never the model. `None` ⇒ a secret-bearing skill command is denied (no way to supply it).
+    pub broker: Option<Arc<SecretsBroker>>,
     /// `(tool, input)` fingerprints of OUTWARD actions (Post / SettleTx) that ran this invocation —
     /// tracked so [`acted_outward`](Self::acted_outward) can gate the timeout-retry path (never re-run
     /// a wake that already posted/traded → no double-post on a re-run). Duplicates are NOT blocked: a
@@ -84,6 +90,7 @@ impl StatePolicyResponder {
             protected_paths: Vec::new(),
             skills_root: None,
             trusted_signers: Vec::new(),
+            broker: None,
             outward_seen: Default::default(),
         }
     }
@@ -105,6 +112,7 @@ impl StatePolicyResponder {
             protected_paths: Vec::new(),
             skills_root: None,
             trusted_signers: Vec::new(),
+            broker: None,
             outward_seen: Default::default(),
         }
     }
@@ -117,10 +125,17 @@ impl StatePolicyResponder {
     }
 
     /// Enable executable skills: the `<soul>/skills` root + the DIDs (operator + soul) whose signature
-    /// authorizes a manifest. Without this, every `RunSkillCommand` is denied.
-    pub fn with_skills(mut self, skills_root: impl Into<PathBuf>, trusted_signers: Vec<crate::identity::Did>) -> Self {
+    /// authorizes a manifest + the broker that materializes a command's declared secret. Without this, every
+    /// `RunSkillCommand` is denied.
+    pub fn with_skills(
+        mut self,
+        skills_root: impl Into<PathBuf>,
+        trusted_signers: Vec<crate::identity::Did>,
+        broker: Option<Arc<SecretsBroker>>,
+    ) -> Self {
         self.skills_root = Some(skills_root.into());
         self.trusted_signers = trusted_signers;
+        self.broker = broker;
         self
     }
 
@@ -129,7 +144,7 @@ impl StatePolicyResponder {
     /// capability (so a `post` command runs only in Express, `settle` only in Settle — reachable only by an
     /// uncontaminated cycle), honor dry-run, then return the harness-built argv for the bridge to execve.
     /// Every failure is a Deny with a reason the model can act on.
-    fn decide_skill(&self, req: &ActionRequest) -> ActionDecision {
+    async fn decide_skill(&self, req: &ActionRequest) -> ActionDecision {
         let Some(skills_root) = &self.skills_root else {
             return ActionDecision::Deny("executable skills are not enabled for this deployment".into());
         };
@@ -157,7 +172,7 @@ impl StatePolicyResponder {
         }
 
         let trusted: Vec<&crate::identity::Did> = self.trusted_signers.iter().collect();
-        let authz = match crate::skills::authorize(skills_root, skill, command, &args, &trusted) {
+        let mut authz = match crate::skills::authorize(skills_root, skill, command, &args, &trusted) {
             Ok(a) => a,
             Err(e) => return ActionDecision::Deny(format!("skill `{skill}/{command}` denied: {e}")),
         };
@@ -185,6 +200,19 @@ impl StatePolicyResponder {
                 "dry-run test mode: skill `{skill}/{command}` was recorded but intentionally NOT executed. \
                  This is expected — not a failure. Do not retry; treat it as done and continue."
             ));
+        }
+
+        // Materialize the command's declared secret via the broker (lazy — only now that it's approved) into
+        // the exec's `env`, so the bridge injects it into the skill process. The value never touches the model
+        // context. A missing broker or a materialization failure denies the call (fail-closed).
+        if let Some(secret) = authz.exec.secret.clone() {
+            let Some(broker) = &self.broker else {
+                return ActionDecision::Deny(format!("skill `{skill}/{command}` needs secret `{secret}` but no secrets broker is configured"));
+            };
+            match broker.env_for(&[secret.clone()]).await {
+                Ok(env) => authz.exec.env = env,
+                Err(e) => return ActionDecision::Deny(format!("skill `{skill}/{command}`: secret `{secret}` unavailable: {e}")),
+            }
         }
 
         // Record an outward skill action (post/settle) so `acted_outward()` guards the timeout-retry path.
@@ -269,7 +297,7 @@ impl ActionResponder for StatePolicyResponder {
         // (0a) `RunSkillCommand` is special: its class comes from the SIGNED manifest, not its name, so it's
         // gated on its own path (verify signature → tier → scope → build argv), returning the approved argv.
         if req.tool == crate::skills::RUN_SKILL_COMMAND {
-            return self.decide_skill(req);
+            return self.decide_skill(req).await;
         }
 
         // (0) Derive the class + target path from the raw (tool, input) event. Unknown
@@ -733,16 +761,25 @@ commands:
         req("RunSkillCommand", json!({ "skill": skill, "command": command, "args": args }))
     }
 
+    /// A broker that materializes the `buzz_key` provider → `BUZZ_PRIVATE_KEY` from a test env var.
+    fn test_broker() -> Arc<SecretsBroker> {
+        std::env::set_var("BUZZ_PRIVATE_KEY", "nsec-test-secret");
+        Arc::new(SecretsBroker::new_test(vec![Arc::new(
+            crate::secrets::providers::StaticEnvProvider::new("buzz_key", vec!["BUZZ_PRIVATE_KEY".into()]),
+        )]))
+    }
+
     #[tokio::test]
     async fn skill_read_command_runs_in_perceive_and_builds_argv() {
         let (root, op_did) = signed_buzz_pack();
-        let r = responder(ConsciousnessState::Perceive).with_skills(&root, vec![op_did]);
+        let r = responder(ConsciousnessState::Perceive).with_skills(&root, vec![op_did], None);
         match r.decide(&skill_req("buzz", "feed", json!({ "limit": "10" }))).await {
             ActionDecision::AllowExec(spec) => {
                 assert_eq!(spec.argv, vec![
                     format!("{}/buzz/bin/buzz", root.display()), "feed".into(), "read".into(), "--limit".into(), "10".into()
                 ]);
                 assert!(spec.secret.is_none());
+                assert!(spec.env.is_empty()); // a no-secret command needs no injected env
             }
             other => panic!("expected AllowExec, got {other:?}"),
         }
@@ -753,22 +790,29 @@ commands:
     async fn skill_post_command_denied_in_perceive_allowed_in_express() {
         let (root, op_did) = signed_buzz_pack();
         // Perceive: a `post`-tier skill command is out of scope (the taint gate — reachable only in Express).
-        let p = responder(ConsciousnessState::Perceive).with_skills(&root, vec![op_did.clone()]);
+        let p = responder(ConsciousnessState::Perceive).with_skills(&root, vec![op_did.clone()], Some(test_broker()));
         assert!(matches!(
             p.decide(&skill_req("buzz", "publish_note", json!({ "text": "gm" }))).await,
             ActionDecision::Deny(d) if d.contains("not in") && d.contains("Perceive")
         ));
-        // Express: allowed, with the secret name carried for the bridge to inject.
-        let e = responder(ConsciousnessState::Express).with_skills(&root, vec![op_did]);
+        // Express: allowed, and the declared secret is MATERIALIZED into `env` for the bridge to inject.
+        let e = responder(ConsciousnessState::Express).with_skills(&root, vec![op_did.clone()], Some(test_broker()));
         match e.decide(&skill_req("buzz", "publish_note", json!({ "text": "gm frens" }))).await {
             ActionDecision::AllowExec(spec) => {
                 assert_eq!(spec.argv.last().unwrap(), "gm frens");
                 assert_eq!(spec.secret.as_deref(), Some("buzz_key"));
+                assert_eq!(spec.env.get("BUZZ_PRIVATE_KEY").map(String::as_str), Some("nsec-test-secret")); // materialized
                 assert!(spec.network);
                 assert!(e.acted_outward(), "an allowed post-tier skill flips acted_outward");
             }
             other => panic!("expected AllowExec in Express, got {other:?}"),
         }
+        // A post command WITHOUT a broker is denied (no way to supply its secret).
+        let no_broker = responder(ConsciousnessState::Express).with_skills(&root, vec![op_did], None);
+        assert!(matches!(
+            no_broker.decide(&skill_req("buzz", "publish_note", json!({ "text": "hi" }))).await,
+            ActionDecision::Deny(d) if d.contains("no secrets broker")
+        ));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -779,7 +823,7 @@ commands:
         use crate::identity::ed25519::ed25519_pub_to_did;
         use ed25519_dalek::SigningKey;
         let stranger = ed25519_pub_to_did(SigningKey::from_bytes(&[7u8; 32]).verifying_key().to_bytes());
-        let r = responder(ConsciousnessState::Perceive).with_skills(&root, vec![stranger]);
+        let r = responder(ConsciousnessState::Perceive).with_skills(&root, vec![stranger], None);
         assert!(matches!(
             r.decide(&skill_req("buzz", "feed", json!({ "limit": "10" }))).await,
             ActionDecision::Deny(d) if d.contains("denied")
@@ -790,7 +834,7 @@ commands:
     #[tokio::test]
     async fn skill_bad_args_and_traversal_are_denied() {
         let (root, op_did) = signed_buzz_pack();
-        let r = responder(ConsciousnessState::Perceive).with_skills(&root, vec![op_did]);
+        let r = responder(ConsciousnessState::Perceive).with_skills(&root, vec![op_did], None);
         // off-enum value → deny
         assert!(matches!(
             r.decide(&skill_req("buzz", "feed", json!({ "limit": "999" }))).await,

@@ -32,9 +32,13 @@ pub const RUN_SKILL_COMMAND: &str = "RunSkillCommand";
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SkillExec {
     pub argv: Vec<String>,
-    /// Secrets-provider `name` whose value the bridge injects into the child env (never the model context).
+    /// Secrets-provider `name` this command declared (informational; the materialized value rides `env`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<String>,
+    /// The MATERIALIZED secret env the harness injects into the child (`{ENV_NAME: value}`) — filled by the
+    /// wall from the broker on approve; the model never sees it. Empty when the command declares no secret.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
     /// Whether the sandboxed child gets network egress.
     pub network: bool,
 }
@@ -74,7 +78,8 @@ pub fn authorize(
     Ok(SkillAuthz {
         tier: cmd.tier,
         trust: cmd.trust.clone(),
-        exec: SkillExec { argv, secret: cmd.secret.clone(), network: cmd.network },
+        // `env` is filled by the wall from the broker (the responder has it, `authorize` doesn't).
+        exec: SkillExec { argv, secret: cmd.secret.clone(), env: BTreeMap::new(), network: cmd.network },
     })
 }
 

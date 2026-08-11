@@ -91,6 +91,27 @@ pub enum Command {
         #[arg(long)]
         to: Option<String>,
     },
+    /// Executable-skill authoring. `dack skill sign` produces the detached signature that GATES a skill's
+    /// commands for `RunSkillCommand` — an unsigned/tampered/wrong-signer manifest is prose-only.
+    Skill {
+        #[command(subcommand)]
+        cmd: SkillCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SkillCmd {
+    /// Sign `<dir>/skill.manifest.yaml` with an identity → writes the detached `<…>.sig` (the execute-gate).
+    /// The daemon later executes the skill's commands only if this signature verifies against the operator
+    /// or soul DID. Re-run after any manifest edit (an edit invalidates the old signature).
+    Sign {
+        /// Skill directory that holds `skill.manifest.yaml` (e.g. `my-soul/skills/buzz`).
+        #[arg(long)]
+        dir: String,
+        /// Signer role: `operator` (default) or `soul`.
+        #[arg(long, default_value = "operator")]
+        role: String,
+    },
 }
 
 /// Dispatch a parsed CLI command. `run`/`status`/`log` are the daemon + read surfaces; `say`/
@@ -118,6 +139,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         Command::Reconcile => reconcile(&cli.config).await,
         Command::Keygen { role, dir } => keygen(&role, &dir),
         Command::MigrateRunlogs { from, to } => migrate_runlogs(&cli.config, from, to).await,
+        Command::Skill { cmd } => skill_cmd(&cli.config, cmd).await,
     }
 }
 
@@ -231,6 +253,54 @@ async fn say(config_path: &str, instruction: String) -> Result<()> {
     SqliteQueue::open(&config.db_path)?.enqueue(stim).await?;
     println!("dack: operator instruction enqueued (signed; the daemon verifies on dispatch).");
     Ok(())
+}
+
+/// `dack skill sign` — sign a skill manifest so the daemon will EXECUTE its commands. The detached
+/// signature over the manifest bytes is the execute-gate (an unsigned/tampered/wrong-signer manifest stays
+/// prose-only). Parses + structurally validates the manifest first, so we never sign a malformed pack.
+async fn skill_cmd(config_path: &str, cmd: SkillCmd) -> Result<()> {
+    match cmd {
+        SkillCmd::Sign { dir, role } => {
+            let config = DackConfig::load(config_path)?;
+            let identity = build_identity(&config).await?;
+            let id_role = match role.as_str() {
+                "operator" => IdentityRole::Operator,
+                "soul" => IdentityRole::Soul,
+                other => {
+                    return Err(DackError::Config(format!(
+                        "dack skill sign --role must be `operator` or `soul`, got `{other}`"
+                    )))
+                }
+            };
+            if identity.did(id_role).is_none() {
+                return Err(DackError::Config(format!(
+                    "dack skill sign: no {role} identity dir (identities.{role}) — cannot sign"
+                )));
+            }
+            let skill_dir = std::path::PathBuf::from(&dir);
+            let mpath = crate::skills::manifest_path(&skill_dir);
+            let bytes = std::fs::read(&mpath)
+                .map_err(|e| DackError::Config(format!("read {}: {e}", mpath.display())))?;
+            // Validate BEFORE signing — a signature over a malformed manifest is worse than useless.
+            let manifest = crate::skills::SkillManifest::parse(&bytes)?;
+
+            let sig = identity.sign(id_role, &bytes).await?;
+            let spath = crate::skills::sig_path(&skill_dir);
+            std::fs::write(&spath, &sig.0)
+                .map_err(|e| DackError::Config(format!("write {}: {e}", spath.display())))?;
+            let did = identity.did(id_role).map(|d| d.0.as_str()).unwrap_or("?");
+            println!(
+                "dack: signed skill `{}` ({} command{}) as {role} → {}",
+                manifest.name,
+                manifest.commands.len(),
+                if manifest.commands.len() == 1 { "" } else { "s" },
+                spath.display()
+            );
+            println!("  signer DID: {did}");
+            println!("  the daemon will execute its commands only while this signature matches the manifest bytes.");
+            Ok(())
+        }
+    }
 }
 
 /// `dack pause` / `dack resume` — the soft kill-switch. A shared flag in the queue

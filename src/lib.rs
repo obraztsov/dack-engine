@@ -51,6 +51,7 @@ pub mod runtime;
 pub mod sandbox;
 pub mod secrets;
 pub mod sensor;
+pub mod skills;
 pub mod sources;
 pub mod state;
 pub mod state_prompt;

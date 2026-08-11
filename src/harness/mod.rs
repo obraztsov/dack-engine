@@ -1271,6 +1271,13 @@ impl Harness {
         p.read.extend(extra_read);
         let mut responder =
             StatePolicyResponder::with_capabilities(spec, p.post, p.settle).with_repo_root(self.soul_root());
+        // Executable skills: the wall verifies a `RunSkillCommand` manifest against the operator + soul DIDs
+        // (either may sign a pack), rooted at `<soul>/skills`. A pack signed by neither is prose-only.
+        let mut signers = vec![Did(self.config.operator_did.clone())];
+        if let Some(soul) = self.identity.did(IdentityRole::Soul) {
+            signers.push(soul.clone());
+        }
+        responder = responder.with_skills(self.soul_root().join("skills"), signers);
         responder.read_tools = p.read;
         // Long-term memory (`memory/`) is gated to `memory_write_min_trust` (org+): a lower-trust cycle
         // may not write it (the wall enforces; the digest consolidates instead).
@@ -2702,6 +2709,11 @@ impl ActionResponder for RecordingResponder {
         let rendered = match &decision {
             ActionDecision::Allow => "allow".to_string(),
             ActionDecision::Deny(why) => format!("deny: {why}"),
+            // Record the PROGRAM that was approved (argv[0]) — the audit shows which skill binary ran —
+            // without dumping the full argv (which may carry a note/message the runlog captures via `input`).
+            ActionDecision::AllowExec(spec) => {
+                format!("allow-exec: {}", spec.argv.first().map(String::as_str).unwrap_or("?"))
+            }
         };
         // Capture a compact input so the runlog shows the ACTION (e.g. the reply text), not just
         // the tool name — the audit trail of what the duck actually did. Truncated.

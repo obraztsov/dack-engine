@@ -108,6 +108,11 @@ enum ToBridge<'a> {
         tool_use_id: String,
         allow: bool,
         message: Option<String>,
+        /// Present ONLY for an approved `RunSkillCommand`: the harness-built argv (+ secret name + network
+        /// flag) the bridge spawns via execve. `None` for every ordinary allow/deny (the openclaude bridge
+        /// ignores the field entirely — it has no skill-exec path).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        exec: Option<crate::skills::SkillExec>,
     },
 }
 
@@ -445,9 +450,10 @@ impl RuntimeClient for OpenClaudeClient {
                                 input,
                             })
                             .await;
-                        let (allow, message) = match decision {
-                            ActionDecision::Allow => (true, None),
-                            ActionDecision::Deny(why) => (false, Some(why)),
+                        let (allow, message, exec) = match decision {
+                            ActionDecision::Allow => (true, None, None),
+                            ActionDecision::Deny(why) => (false, Some(why), None),
+                            ActionDecision::AllowExec(spec) => (true, None, Some(spec)),
                         };
                         write_line(
                             &mut stdin,
@@ -455,6 +461,7 @@ impl RuntimeClient for OpenClaudeClient {
                                 tool_use_id,
                                 allow,
                                 message,
+                                exec,
                             },
                         )
                         .await?;

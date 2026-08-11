@@ -193,6 +193,10 @@ pub struct ActionRequest {
 pub enum ActionDecision {
     Allow,
     Deny(String),
+    /// Allow a `RunSkillCommand`: the wall verified the manifest signature, gated the command's tier against
+    /// this state, and validated + built the exact argv. The bridge spawns it via execve (NO shell), with the
+    /// named secret injected into the child env. The model never sees the argv or the secret.
+    AllowExec(crate::skills::SkillExec),
 }
 
 /// The wall seam. Implemented by [`action_required::StatePolicyResponder`].

@@ -55,6 +55,11 @@ pub struct StatePolicyResponder {
     /// back-compat). Set by the harness from `config.protected_memory_paths`; a plain file matches exactly,
     /// a `dir/` also matches anything beneath it.
     pub protected_paths: Vec<String>,
+    /// Executable skills: the `<soul>/skills` root + the DIDs whose signature authorizes a manifest
+    /// (operator + soul). A `RunSkillCommand` is verified against these; `None`/empty ⇒ skills are not
+    /// enabled and every `RunSkillCommand` is denied. Set by the harness from the soul repo + identities.
+    pub skills_root: Option<PathBuf>,
+    pub trusted_signers: Vec<crate::identity::Did>,
     /// `(tool, input)` fingerprints of OUTWARD actions (Post / SettleTx) that ran this invocation —
     /// tracked so [`acted_outward`](Self::acted_outward) can gate the timeout-retry path (never re-run
     /// a wake that already posted/traded → no double-post on a re-run). Duplicates are NOT blocked: a
@@ -77,6 +82,8 @@ impl StatePolicyResponder {
             dry_run_block: Vec::new(),
             long_term_writable: true,
             protected_paths: Vec::new(),
+            skills_root: None,
+            trusted_signers: Vec::new(),
             outward_seen: Default::default(),
         }
     }
@@ -96,6 +103,8 @@ impl StatePolicyResponder {
             dry_run_block: Vec::new(),
             long_term_writable: true,
             protected_paths: Vec::new(),
+            skills_root: None,
+            trusted_signers: Vec::new(),
             outward_seen: Default::default(),
         }
     }
@@ -105,6 +114,85 @@ impl StatePolicyResponder {
     pub fn with_repo_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.repo_root = Some(root.into());
         self
+    }
+
+    /// Enable executable skills: the `<soul>/skills` root + the DIDs (operator + soul) whose signature
+    /// authorizes a manifest. Without this, every `RunSkillCommand` is denied.
+    pub fn with_skills(mut self, skills_root: impl Into<PathBuf>, trusted_signers: Vec<crate::identity::Did>) -> Self {
+        self.skills_root = Some(skills_root.into());
+        self.trusted_signers = trusted_signers;
+        self
+    }
+
+    /// Gate + build a `RunSkillCommand { skill, command, args }`: verify the manifest signature (the
+    /// execute-gate), map the command's tier to a [`ToolClass`] and apply the SAME state-scope gate as any
+    /// capability (so a `post` command runs only in Express, `settle` only in Settle — reachable only by an
+    /// uncontaminated cycle), honor dry-run, then return the harness-built argv for the bridge to execve.
+    /// Every failure is a Deny with a reason the model can act on.
+    fn decide_skill(&self, req: &ActionRequest) -> ActionDecision {
+        let Some(skills_root) = &self.skills_root else {
+            return ActionDecision::Deny("executable skills are not enabled for this deployment".into());
+        };
+        if self.trusted_signers.is_empty() {
+            return ActionDecision::Deny("no trusted signer (operator/soul DID) configured — cannot authorize a skill".into());
+        }
+        // Parse the structured input: { skill, command, args: { name: value, … } }.
+        let skill = req.input.get("skill").and_then(|v| v.as_str()).unwrap_or("");
+        let command = req.input.get("command").and_then(|v| v.as_str()).unwrap_or("");
+        if skill.is_empty() || command.is_empty() {
+            return ActionDecision::Deny("RunSkillCommand needs `skill` and `command`".into());
+        }
+        let mut args = std::collections::BTreeMap::new();
+        if let Some(obj) = req.input.get("args").and_then(|v| v.as_object()) {
+            for (k, v) in obj {
+                // Coerce scalars to string; reject a non-scalar arg (objects/arrays aren't valid argv values).
+                let s = match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Number(n) => n.to_string(),
+                    serde_json::Value::Bool(b) => b.to_string(),
+                    _ => return ActionDecision::Deny(format!("RunSkillCommand arg `{k}` must be a scalar")),
+                };
+                args.insert(k.clone(), s);
+            }
+        }
+
+        let trusted: Vec<&crate::identity::Did> = self.trusted_signers.iter().collect();
+        let authz = match crate::skills::authorize(skills_root, skill, command, &args, &trusted) {
+            Ok(a) => a,
+            Err(e) => return ActionDecision::Deny(format!("skill `{skill}/{command}` denied: {e}")),
+        };
+
+        // The command's tier → a ToolClass, gated by the SAME per-state scope as any capability. This is the
+        // taint gate: a `post` command needs Express (reachable only within the cycle's taint ceiling), a
+        // `settle` command needs Settle (an uncontaminated cycle).
+        let class = match authz.tier {
+            crate::config::CapabilityTier::Read => ToolClass::Read,
+            crate::config::CapabilityTier::Post => ToolClass::Post,
+            crate::config::CapabilityTier::Settle => ToolClass::SettleTx,
+        };
+        if !self.spec.tool_scope.allows(class) {
+            return ActionDecision::Deny(format!(
+                "skill command `{skill}/{command}` is tier {:?} (class {class:?}) — not in {:?} scope",
+                authz.tier, self.spec.state
+            ));
+        }
+
+        // Dry-run: block by a synthetic id `RunSkillCommand:<skill>/<command>` so an operator can hold a
+        // specific command (e.g. a real post) while letting reads through.
+        let dry_id = format!("RunSkillCommand:{skill}/{command}");
+        if self.dry_run_block.iter().any(|p| dry_id.starts_with(p.as_str())) {
+            return ActionDecision::Deny(format!(
+                "dry-run test mode: skill `{skill}/{command}` was recorded but intentionally NOT executed. \
+                 This is expected — not a failure. Do not retry; treat it as done and continue."
+            ));
+        }
+
+        // Record an outward skill action (post/settle) so `acted_outward()` guards the timeout-retry path.
+        if matches!(class, ToolClass::Post | ToolClass::SettleTx) {
+            self.outward_seen.lock().unwrap().insert(format!("skill\u{1}{}", authz.exec.argv.join("\u{1}")));
+        }
+
+        ActionDecision::AllowExec(authz.exec)
     }
 
     /// Did this invocation ALLOW any OUTWARD action (Post / SettleTx)? Reads the dedup set, which is
@@ -178,6 +266,12 @@ impl StatePolicyResponder {
 #[async_trait]
 impl ActionResponder for StatePolicyResponder {
     async fn decide(&self, req: &ActionRequest) -> ActionDecision {
+        // (0a) `RunSkillCommand` is special: its class comes from the SIGNED manifest, not its name, so it's
+        // gated on its own path (verify signature → tier → scope → build argv), returning the approved argv.
+        if req.tool == crate::skills::RUN_SKILL_COMMAND {
+            return self.decide_skill(req);
+        }
+
         // (0) Derive the class + target path from the raw (tool, input) event. Unknown
         //     tools classify as `Other` → default-denied by the scope check.
         let (class, target_path) = classify_tool(
@@ -598,6 +692,130 @@ mod tests {
             r.decide(&req("mcp__twitter__reply", json!({"text": "yo", "in_reply_to_tweet_id": "1"})))
                 .await,
             ActionDecision::Allow
+        ));
+    }
+
+    // ── RunSkillCommand: signed-manifest gating at the wall ──────────────────────────────────────
+
+    /// Write a signed buzz pack (feed=read, publish_note=post) into a temp skills root and return
+    /// `(skills_root, operator_did)`.
+    fn signed_buzz_pack() -> (PathBuf, crate::identity::Did) {
+        use crate::identity::ed25519::{ed25519_pub_to_did, encode_signature};
+        use ed25519_dalek::{Signer, SigningKey};
+        let op = SigningKey::from_bytes(&[3u8; 32]);
+        let op_did = ed25519_pub_to_did(op.verifying_key().to_bytes());
+        let root = std::env::temp_dir().join(format!("dack-wall-skill-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("buzz");
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = r#"
+name: buzz
+commands:
+  - id: feed
+    tier: read
+    trust: public
+    argv: ["${SKILL_DIR}/bin/buzz", "feed", "read", "--limit", "{limit}"]
+    args: { limit: { type: enum, values: ["10","25"] } }
+  - id: publish_note
+    tier: post
+    trust: self
+    argv: ["${SKILL_DIR}/bin/buzz", "social", "publish", "note", "{text}"]
+    args: { text: { type: string, pattern: "^.{1,280}$" } }
+    secret: buzz_key
+    network: true
+"#;
+        std::fs::write(dir.join("skill.manifest.yaml"), manifest).unwrap();
+        std::fs::write(dir.join("skill.manifest.yaml.sig"), encode_signature(op.sign(manifest.as_bytes()).to_bytes())).unwrap();
+        (root, op_did)
+    }
+
+    fn skill_req(skill: &str, command: &str, args: serde_json::Value) -> ActionRequest {
+        req("RunSkillCommand", json!({ "skill": skill, "command": command, "args": args }))
+    }
+
+    #[tokio::test]
+    async fn skill_read_command_runs_in_perceive_and_builds_argv() {
+        let (root, op_did) = signed_buzz_pack();
+        let r = responder(ConsciousnessState::Perceive).with_skills(&root, vec![op_did]);
+        match r.decide(&skill_req("buzz", "feed", json!({ "limit": "10" }))).await {
+            ActionDecision::AllowExec(spec) => {
+                assert_eq!(spec.argv, vec![
+                    format!("{}/buzz/bin/buzz", root.display()), "feed".into(), "read".into(), "--limit".into(), "10".into()
+                ]);
+                assert!(spec.secret.is_none());
+            }
+            other => panic!("expected AllowExec, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn skill_post_command_denied_in_perceive_allowed_in_express() {
+        let (root, op_did) = signed_buzz_pack();
+        // Perceive: a `post`-tier skill command is out of scope (the taint gate — reachable only in Express).
+        let p = responder(ConsciousnessState::Perceive).with_skills(&root, vec![op_did.clone()]);
+        assert!(matches!(
+            p.decide(&skill_req("buzz", "publish_note", json!({ "text": "gm" }))).await,
+            ActionDecision::Deny(d) if d.contains("not in") && d.contains("Perceive")
+        ));
+        // Express: allowed, with the secret name carried for the bridge to inject.
+        let e = responder(ConsciousnessState::Express).with_skills(&root, vec![op_did]);
+        match e.decide(&skill_req("buzz", "publish_note", json!({ "text": "gm frens" }))).await {
+            ActionDecision::AllowExec(spec) => {
+                assert_eq!(spec.argv.last().unwrap(), "gm frens");
+                assert_eq!(spec.secret.as_deref(), Some("buzz_key"));
+                assert!(spec.network);
+                assert!(e.acted_outward(), "an allowed post-tier skill flips acted_outward");
+            }
+            other => panic!("expected AllowExec in Express, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn skill_denied_when_signature_missing_or_untrusted() {
+        let (root, _op_did) = signed_buzz_pack();
+        // A STRANGER DID as the only trusted signer → the operator-signed pack fails to verify → denied.
+        use crate::identity::ed25519::ed25519_pub_to_did;
+        use ed25519_dalek::SigningKey;
+        let stranger = ed25519_pub_to_did(SigningKey::from_bytes(&[7u8; 32]).verifying_key().to_bytes());
+        let r = responder(ConsciousnessState::Perceive).with_skills(&root, vec![stranger]);
+        assert!(matches!(
+            r.decide(&skill_req("buzz", "feed", json!({ "limit": "10" }))).await,
+            ActionDecision::Deny(d) if d.contains("denied")
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn skill_bad_args_and_traversal_are_denied() {
+        let (root, op_did) = signed_buzz_pack();
+        let r = responder(ConsciousnessState::Perceive).with_skills(&root, vec![op_did]);
+        // off-enum value → deny
+        assert!(matches!(
+            r.decide(&skill_req("buzz", "feed", json!({ "limit": "999" }))).await,
+            ActionDecision::Deny(_)
+        ));
+        // unknown command → deny
+        assert!(matches!(
+            r.decide(&skill_req("buzz", "nope", json!({}))).await,
+            ActionDecision::Deny(_)
+        ));
+        // skill-name traversal → deny (can't escape the skills root)
+        assert!(matches!(
+            r.decide(&skill_req("../../etc", "feed", json!({ "limit": "10" }))).await,
+            ActionDecision::Deny(_)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn skill_denied_when_skills_not_enabled() {
+        // No with_skills() → RunSkillCommand is denied outright.
+        let r = responder(ConsciousnessState::Express);
+        assert!(matches!(
+            r.decide(&skill_req("buzz", "feed", json!({ "limit": "10" }))).await,
+            ActionDecision::Deny(d) if d.contains("not enabled")
         ));
     }
 

@@ -22,6 +22,61 @@ use crate::identity::{Did, Signature};
 pub const MANIFEST_FILE: &str = "skill.manifest.yaml";
 /// The `${SKILL_DIR}` token in an argv template → the skill's absolute (or guest) dir at build time.
 pub const SKILL_DIR_TOKEN: &str = "${SKILL_DIR}";
+/// The structured tool the duck calls to run a vetted skill command (input `{skill, command, args}`). Not
+/// a shell — the harness verifies + builds the argv and the bridge execve's it.
+pub const RUN_SKILL_COMMAND: &str = "RunSkillCommand";
+
+/// The harness-approved execution of a skill command — the wall's output on allow, for the bridge to spawn
+/// via execve. Built ONLY after signature-verify + arg-validation (tier-gating is applied by the wall on the
+/// [`SkillAuthz::tier`] separately). `argv[0]` is the program; the rest are inert argv elements.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SkillExec {
+    pub argv: Vec<String>,
+    /// Secrets-provider `name` whose value the bridge injects into the child env (never the model context).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
+    /// Whether the sandboxed child gets network egress.
+    pub network: bool,
+}
+
+/// A verified, arg-checked skill call: the command's capability tier + taint label (for the wall to gate on)
+/// plus the built [`SkillExec`]. Produced by [`authorize`] only after the manifest signature verifies.
+#[derive(Debug, Clone)]
+pub struct SkillAuthz {
+    pub tier: CapabilityTier,
+    pub trust: TrustTier,
+    pub exec: SkillExec,
+}
+
+/// Authorize a `RunSkillCommand { skill, command, args }` against the SIGNED pack: verify the manifest
+/// signature (the execute-gate), look up the command, validate the typed args, and build the argv. Returns
+/// the command's tier/trust (for the wall to gate by state × taint) + the exec. Any failure — traversal,
+/// bad signature, unknown command, bad arg — is an `Err` the wall turns into a Deny. Does NOT itself gate by
+/// state/taint; that's the caller's job with the returned `tier`.
+pub fn authorize(
+    skills_root: &Path,
+    skill: &str,
+    command: &str,
+    args: &BTreeMap<String, String>,
+    trusted: &[&Did],
+) -> Result<SkillAuthz> {
+    // The skill name comes from the MODEL (untrusted). Confine it to a single dir component — no traversal,
+    // no separators — so it can only name a dir directly under `skills_root`.
+    if skill.is_empty() || skill.contains('/') || skill.contains('\\') || skill.contains("..") {
+        return Err(DackError::Config(format!("invalid skill name `{skill}`")));
+    }
+    let skill_dir = skills_root.join(skill);
+    let manifest = load_signed(&skill_dir, trusted)?; // ← the execute-gate (unsigned/tampered/wrong-signer ⇒ Err)
+    let cmd = manifest
+        .command(command)
+        .ok_or_else(|| DackError::Config(format!("skill `{skill}` has no command `{command}`")))?;
+    let argv = cmd.build_argv(&skill_dir.to_string_lossy(), args)?;
+    Ok(SkillAuthz {
+        tier: cmd.tier,
+        trust: cmd.trust.clone(),
+        exec: SkillExec { argv, secret: cmd.secret.clone(), network: cmd.network },
+    })
+}
 
 /// A skill's signed capability manifest. The `name` is part of the SIGNED bytes so a manifest can't be
 /// lifted into another skill's dir and still verify for a different capability set.
@@ -122,6 +177,64 @@ impl SkillManifest {
 
     pub fn command(&self, id: &str) -> Option<&SkillCommand> {
         self.commands.iter().find(|c| c.id == id)
+    }
+}
+
+impl ArgSchema {
+    /// Validate a provided arg VALUE against its schema. `Enum` = exact membership; `String` = the value
+    /// must FULLY match the (anchor-agnostic) regex. Args become separate argv elements (execve, not
+    /// `sh -c`), so this is semantic validation — shell metacharacters are already inert bytes.
+    pub fn validate(&self, name: &str, value: &str) -> Result<()> {
+        match self {
+            ArgSchema::Enum { values } => {
+                if values.iter().any(|v| v == value) {
+                    Ok(())
+                } else {
+                    Err(DackError::Config(format!("arg `{name}`: `{value}` not one of {values:?}")))
+                }
+            }
+            ArgSchema::String { pattern } => {
+                let re = regex::Regex::new(pattern)
+                    .map_err(|e| DackError::Config(format!("arg `{name}`: bad pattern `{pattern}`: {e}")))?;
+                // Require a match that spans the WHOLE value (robust regardless of the author's ^/$),
+                // so a partial match can't smuggle extra content past a `{1,280}`-style bound.
+                match re.find(value) {
+                    Some(m) if m.start() == 0 && m.end() == value.len() => Ok(()),
+                    _ => Err(DackError::Config(format!("arg `{name}`: `{value}` does not match /{pattern}/"))),
+                }
+            }
+        }
+    }
+}
+
+impl SkillCommand {
+    /// Validate the provided args against this command's schema and BUILD the concrete argv: every declared
+    /// arg must be present (no missing, no extra), each value must validate, then `${SKILL_DIR}` → `skill_dir`
+    /// and each `{hole}` → its validated value. The result is spawned via execve — never a shell — so the
+    /// values are inert argv elements. `skill_dir` is the absolute (or guest) path substituted for the token.
+    pub fn build_argv(&self, skill_dir: &str, args: &BTreeMap<String, String>) -> Result<Vec<String>> {
+        // Exactly the declared args, no more, no less.
+        for k in args.keys() {
+            if !self.args.contains_key(k) {
+                return Err(DackError::Config(format!("command `{}`: unexpected arg `{k}`", self.id)));
+            }
+        }
+        for (name, schema) in &self.args {
+            let value = args
+                .get(name)
+                .ok_or_else(|| DackError::Config(format!("command `{}`: missing arg `{name}`", self.id)))?;
+            schema.validate(name, value)?;
+        }
+        // Substitute into every argv element. `${SKILL_DIR}` first, then each `{hole}`.
+        let mut out = Vec::with_capacity(self.argv.len());
+        for el in &self.argv {
+            let mut s = el.replace(SKILL_DIR_TOKEN, skill_dir);
+            for (name, value) in args {
+                s = s.replace(&format!("{{{name}}}"), value);
+            }
+            out.push(s);
+        }
+        Ok(out)
     }
 }
 
@@ -251,6 +364,49 @@ commands:
         let bad = "name: x\ncommands:\n  - id: c\n    tier: read\n    trust: self\n    argv: [\"p\"]\n    args:\n      unused: { type: enum, values: [\"a\"] }\n";
         let err = SkillManifest::parse(bad.as_bytes()).unwrap_err().to_string();
         assert!(err.contains("never used in argv"), "{err}");
+    }
+
+    #[test]
+    fn build_argv_validates_and_substitutes() {
+        let m = SkillManifest::parse(MANIFEST.as_bytes()).unwrap();
+        let feed = m.command("feed").unwrap();
+        let mut args = BTreeMap::new();
+        args.insert("limit".to_string(), "25".to_string());
+        let argv = feed.build_argv("/soul/skills/buzz", &args).unwrap();
+        assert_eq!(argv, vec!["/soul/skills/buzz/bin/buzz", "feed", "read", "--limit", "25"]);
+
+        // Enum rejects an off-list value.
+        let mut bad = BTreeMap::new();
+        bad.insert("limit".to_string(), "999".to_string());
+        assert!(feed.build_argv("/x", &bad).unwrap_err().to_string().contains("not one of"));
+
+        // Missing / extra args are rejected.
+        assert!(feed.build_argv("/x", &BTreeMap::new()).unwrap_err().to_string().contains("missing arg"));
+        let mut extra = args.clone();
+        extra.insert("bogus".to_string(), "1".to_string());
+        assert!(feed.build_argv("/x", &extra).unwrap_err().to_string().contains("unexpected arg"));
+    }
+
+    #[test]
+    fn build_argv_string_pattern_full_match_and_injection_is_inert() {
+        let m = SkillManifest::parse(MANIFEST.as_bytes()).unwrap();
+        let post = m.command("post").unwrap();
+        // A normal note validates + lands as ONE argv element (execve, not shell → metachars inert).
+        let mut args = BTreeMap::new();
+        args.insert("text".to_string(), "gm; rm -rf / $(whoami) `id`".to_string());
+        let argv = post.build_argv("/s", &args).unwrap();
+        assert_eq!(argv.last().unwrap(), "gm; rm -rf / $(whoami) `id`"); // inert — one element, no shell
+        assert_eq!(argv[0], "/s/bin/buzz");
+
+        // A 281-char note fails the `^.{1,280}$` bound (partial match can't sneak past — whole-span check).
+        let mut too_long = BTreeMap::new();
+        too_long.insert("text".to_string(), "x".repeat(281));
+        assert!(post.build_argv("/s", &too_long).unwrap_err().to_string().contains("does not match"));
+
+        // A newline-bearing value can't satisfy `^.{1,280}$` (`.` excludes \n) — no multiline smuggling.
+        let mut nl = BTreeMap::new();
+        nl.insert("text".to_string(), "line1\nline2".to_string());
+        assert!(post.build_argv("/s", &nl).is_err());
     }
 
     #[test]

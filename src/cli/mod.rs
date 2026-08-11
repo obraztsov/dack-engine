@@ -723,6 +723,20 @@ fn bridge_env(config: &DackConfig) -> HashMap<String, String> {
     // break our token accounting + the firebreak's context guarantee — or nag the model toward the
     // wall-denied `snip` tool (wasted cycles). openclaude honors `DISABLE_AUTO_COMPACT`.
     env.insert("DISABLE_AUTO_COMPACT".to_string(), "1".to_string());
+    // duck-loop persists its OWN sticky-session transcripts in a local SQLite (it owns context; the runlogs
+    // stay portable). Point it at a path co-located with the queue db (already gitignored, in the /duck
+    // volume), made ABSOLUTE so the bridge resolves it regardless of its own cwd. Only the duck-loop engine
+    // reads DUCK_SESSION_DB; the openclaude bridge ignores it. Absent ⇒ the bridge runs sessions off.
+    if matches!(config.runtime.engine, crate::config::RuntimeEngine::DuckLoop { .. }) {
+        let db = std::path::PathBuf::from(&config.db_path);
+        let db_abs = if db.is_absolute() {
+            db
+        } else {
+            std::env::current_dir().map(|d| d.join(&db)).unwrap_or(db)
+        };
+        let session_db = db_abs.with_file_name("duck-loop-sessions.sqlite");
+        env.insert("DUCK_SESSION_DB".to_string(), session_db.to_string_lossy().into_owned());
+    }
     env
 }
 
@@ -769,5 +783,34 @@ async fn status(config_path: &str) -> Result<()> {
         Err(_) => println!("\nhealth: no snapshot yet (is the daemon running?)"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::DackConfig;
+
+    /// The duck-loop engine gets a `DUCK_SESSION_DB` co-located with `db_path` (its own sticky-session
+    /// store); the openclaude engine never does. Live-proven end-to-end (harness→bridge→SQLite→resume),
+    /// this guards the wiring against a silent regression.
+    #[test]
+    fn bridge_env_sets_duck_session_db_only_for_duck_loop() {
+        let openclaude = DackConfig::from_yaml("operator_did: \"did:x\"\ndb_path: \"state/dack.sqlite\"\n").unwrap();
+        assert!(
+            !bridge_env(&openclaude).contains_key("DUCK_SESSION_DB"),
+            "openclaude engine must not enable duck-loop sessions"
+        );
+
+        let duck_loop = DackConfig::from_yaml(
+            "operator_did: \"did:x\"\ndb_path: \"state/dack.sqlite\"\nruntime:\n  engine: { type: duck-loop }\n",
+        )
+        .unwrap();
+        let env = bridge_env(&duck_loop);
+        let session_db = env.get("DUCK_SESSION_DB").expect("duck-loop engine enables sessions");
+        // Absolute + co-located with the queue db (same dir, sibling filename).
+        assert!(std::path::Path::new(session_db).is_absolute(), "session db path must be absolute: {session_db}");
+        assert!(session_db.ends_with("duck-loop-sessions.sqlite"), "unexpected session db name: {session_db}");
+        assert!(session_db.contains("state/"), "session db should sit beside db_path: {session_db}");
+    }
 }
 

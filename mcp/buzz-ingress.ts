@@ -114,8 +114,21 @@ function eventById(id: string): Ev | null {
   return e && e.id ? (e as Ev) : null
 }
 
-type SpineEv = { id: string; from: string; content: string; created_at: number }
-const compactEv = (e: Ev): SpineEv => ({ id: e.id, from: e.pubkey, content: e.content, created_at: e.created_at })
+// Author names (kind:0 profiles), cached — so the duck reads "Hermes said …", not a hex pubkey (important
+// for multi-agent coordination). A nameless/unknown author falls back to a short pubkey.
+const nameCache = new Map<string, string>()
+function resolveName(pubkey: string): string {
+  const hit = nameCache.get(pubkey)
+  if (hit !== undefined) return hit
+  const r = buzz(['users', 'get', '--pubkey', pubkey])
+  const prof = Array.isArray(r) ? r[0] : r
+  const name = (prof && (prof.display_name || prof.name)) || pubkey.slice(0, 8)
+  nameCache.set(pubkey, name)
+  return name
+}
+
+type SpineEv = { id: string; from: string; from_name: string; content: string; created_at: number }
+const compactEv = (e: Ev): SpineEv => ({ id: e.id, from: e.pubkey, from_name: resolveName(e.pubkey), content: e.content, created_at: e.created_at })
 
 /** Reconstruct the ancestor SPINE — root → … → parent → trigger, oldest→newest. Mode A: walk the NIP-10
  *  `reply` e-tag hop-by-hop (each hop = one ancestor, so the MIDDLE threading points are kept), fetching one
@@ -184,7 +197,7 @@ async function post(ch: { id: string; name?: string }, ev: Ev, kind: 'mention' |
     trigger: kind,
     event_id: ev.id,
     root,
-    from: { pubkey: ev.pubkey },
+    from: { pubkey: ev.pubkey, name: resolveName(ev.pubkey) },
     content: ev.content,
     // The ancestor spine (root → … → trigger); `truncated` ⇒ a deeper middle the duck can `thread_get`.
     spine,

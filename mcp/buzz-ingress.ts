@@ -39,6 +39,7 @@ interface Config {
   default_trust: string
   dm_default_trust: string
   channels: ChannelCfg[]
+  thread_context: { max_ancestors: number; full_thread_max: number }
 }
 
 const DEFAULTS: Config = {
@@ -55,6 +56,7 @@ const DEFAULTS: Config = {
   default_trust: 'public',
   dm_default_trust: 'public',
   channels: [],
+  thread_context: { max_ancestors: 8, full_thread_max: 40 },
 }
 
 function loadConfig(): Config {
@@ -105,6 +107,44 @@ function rootOf(ev: Ev): string {
   return refs.find((r) => r.marker === 'root')?.id ?? refs.find((r) => r.marker === 'reply')?.id ?? ev.id
 }
 
+/** A single kind:9 event by id (Mode-A hop). */
+function eventById(id: string): Ev | null {
+  const r = buzz(['social', 'event', '--event', id])
+  const e = Array.isArray(r) ? r[0] : r
+  return e && e.id ? (e as Ev) : null
+}
+
+type SpineEv = { id: string; from: string; content: string; created_at: number }
+const compactEv = (e: Ev): SpineEv => ({ id: e.id, from: e.pubkey, content: e.content, created_at: e.created_at })
+
+/** Reconstruct the ancestor SPINE — root → … → parent → trigger, oldest→newest. Mode A: walk the NIP-10
+ *  `reply` e-tag hop-by-hop (each hop = one ancestor, so the MIDDLE threading points are kept), fetching one
+ *  event per hop, bounded by `max_ancestors`. `truncated` = the thread is deeper than we walked (the duck can
+ *  `thread_get` the root for the rest). A root event → a one-element spine. */
+function buildSpine(ev: Ev): { spine: SpineEv[]; truncated: boolean; root: string } {
+  const chain: Ev[] = [ev]
+  let cur = ev
+  let truncated = false
+  for (;;) {
+    const refs = eRefs(cur)
+    // immediate parent = the `reply`-marked e-tag (buzz marks them); fall back to the last unmarked e-tag.
+    const reply = refs.find((r) => r.marker === 'reply') ?? (refs.length && refs.every((r) => !r.marker) ? refs[refs.length - 1] : undefined)
+    if (!reply) break // cur is the thread root
+    if (chain.length > cfg.thread_context.max_ancestors) {
+      truncated = true
+      break
+    }
+    const parent = eventById(reply.id)
+    if (!parent) {
+      truncated = true
+      break
+    }
+    chain.unshift(parent)
+    cur = parent
+  }
+  return { spine: chain.map(compactEv), truncated, root: rootOf(ev) }
+}
+
 // ── cursor + own-id state ──────────────────────────────────────────────────────────────────────────
 
 let cursor: Record<string, number> = existsSync(cfg.cursor_file) ? JSON.parse(readFileSync(cfg.cursor_file, 'utf8')) : {}
@@ -138,7 +178,7 @@ function discover(): void {
 
 async function post(ch: { id: string; name?: string }, ev: Ev, kind: 'mention' | 'reply_to_own'): Promise<void> {
   const tier = tierFor(ch)
-  const root = rootOf(ev)
+  const { spine, truncated, root } = buildSpine(ev)
   const body = {
     channel: { id: ch.id, name: ch.name ?? null },
     trigger: kind,
@@ -146,7 +186,13 @@ async function post(ch: { id: string; name?: string }, ev: Ev, kind: 'mention' |
     root,
     from: { pubkey: ev.pubkey },
     content: ev.content,
-    reply_to: ev.id, // the event to reply to
+    // The ancestor spine (root → … → trigger); `truncated` ⇒ a deeper middle the duck can `thread_get`.
+    spine,
+    truncated,
+    // ADAPTER-AGNOSTIC reply routing — a trusted ref the harness injects into the reply skill (P1b), so the
+    // duck never has to (or gets to) pick the target from the untrusted payload. Slack/Discord adapters fill
+    // the same shape: `conversation` = where to reply, `in_reply_to` = the message to thread under.
+    reply_refs: { conversation: ch.id, in_reply_to: ev.id },
     created_at: ev.created_at,
     // Per-thread key: coalescing + sticky session fold a thread's activity into one wake.
     dedup_key: `buzz:${root}`,
@@ -209,7 +255,12 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((e) => {
-  log('fatal:', e)
-  process.exit(1)
-})
+// Import for tests without starting the loop.
+if (import.meta.main) {
+  main().catch((e) => {
+    log('fatal:', e)
+    process.exit(1)
+  })
+}
+
+export { buildSpine, eventById, rootOf, tierFor, type Ev }

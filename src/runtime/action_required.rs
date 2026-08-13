@@ -62,6 +62,10 @@ pub struct StatePolicyResponder {
     /// enabled and every `RunSkillCommand` is denied. Set by the harness from the soul repo + identities.
     pub skills_root: Option<PathBuf>,
     pub trusted_signers: Vec<crate::identity::Did>,
+    /// The trusted reply-SCOPE for this invocation (top-level stimulus/baton scalars: `conversation`,
+    /// `in_reply_to`, …) — a skill command's `ref` args are filled from here, NEVER the model. Empty for a
+    /// non-reply cycle. Set by the harness (`wall_for`) per invocation.
+    pub reply_scope: std::collections::BTreeMap<String, String>,
     /// The secrets broker — used to MATERIALIZE a skill command's declared `secret` into the approved
     /// exec's `env` at call time (lazy: only when the command actually runs), so the credential reaches the
     /// skill process, never the model. `None` ⇒ a secret-bearing skill command is denied (no way to supply it).
@@ -90,6 +94,7 @@ impl StatePolicyResponder {
             protected_paths: Vec::new(),
             skills_root: None,
             trusted_signers: Vec::new(),
+            reply_scope: Default::default(),
             broker: None,
             outward_seen: Default::default(),
         }
@@ -112,6 +117,7 @@ impl StatePolicyResponder {
             protected_paths: Vec::new(),
             skills_root: None,
             trusted_signers: Vec::new(),
+            reply_scope: Default::default(),
             broker: None,
             outward_seen: Default::default(),
         }
@@ -172,7 +178,7 @@ impl StatePolicyResponder {
         }
 
         let trusted: Vec<&crate::identity::Did> = self.trusted_signers.iter().collect();
-        let mut authz = match crate::skills::authorize(skills_root, skill, command, &args, &trusted) {
+        let mut authz = match crate::skills::authorize(skills_root, skill, command, &args, &trusted, &self.reply_scope) {
             Ok(a) => a,
             Err(e) => return ActionDecision::Deny(format!("skill `{skill}/{command}` denied: {e}")),
         };

@@ -189,10 +189,12 @@ async function post(ch: { id: string; name?: string }, ev: Ev, kind: 'mention' |
     // The ancestor spine (root → … → trigger); `truncated` ⇒ a deeper middle the duck can `thread_get`.
     spine,
     truncated,
-    // ADAPTER-AGNOSTIC reply routing — a trusted ref the harness injects into the reply skill (P1b), so the
-    // duck never has to (or gets to) pick the target from the untrusted payload. Slack/Discord adapters fill
-    // the same shape: `conversation` = where to reply, `in_reply_to` = the message to thread under.
-    reply_refs: { conversation: ch.id, in_reply_to: ev.id },
+    // ADAPTER-AGNOSTIC reply routing as TOP-LEVEL scalars — the harness's reply-scope reads top-level
+    // scalar fields (same source as scope_env) and injects them into a reply skill's `ref` args, so the duck
+    // writes only the content and the harness destination-locks the target. Slack/Discord adapters fill the
+    // same two: `conversation` = where to reply, `in_reply_to` = the message to thread under.
+    conversation: ch.id,
+    in_reply_to: ev.id,
     created_at: ev.created_at,
     // Per-thread key: coalescing + sticky session fold a thread's activity into one wake.
     dedup_key: `buzz:${root}`,

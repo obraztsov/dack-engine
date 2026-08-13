@@ -63,6 +63,7 @@ pub fn authorize(
     command: &str,
     args: &BTreeMap<String, String>,
     trusted: &[&Did],
+    scope: &BTreeMap<String, String>,
 ) -> Result<SkillAuthz> {
     // The skill name comes from the MODEL (untrusted). Confine it to a single dir component — no traversal,
     // no separators — so it can only name a dir directly under `skills_root`.
@@ -74,7 +75,7 @@ pub fn authorize(
     let cmd = manifest
         .command(command)
         .ok_or_else(|| DackError::Config(format!("skill `{skill}` has no command `{command}`")))?;
-    let argv = cmd.build_argv(&skill_dir.to_string_lossy(), args)?;
+    let argv = cmd.build_argv(&skill_dir.to_string_lossy(), args, scope)?;
     Ok(SkillAuthz {
         tier: cmd.tier,
         trust: cmd.trust.clone(),
@@ -130,6 +131,14 @@ pub enum ArgSchema {
     },
     Enum {
         values: Vec<String>,
+    },
+    /// Filled by the HARNESS from the stimulus reply-SCOPE (a trusted routing scalar the ingress adapter put
+    /// on the payload — e.g. `conversation`, `in_reply_to` — carried env-only across the firebreak), NOT the
+    /// model. The model may NOT supply a `ref` arg (rejected if it tries). This is how a reply is
+    /// destination-locked: the duck writes only the content; the harness routes it. Adapter-agnostic (buzz /
+    /// slack / discord all populate the same scope scalars).
+    Ref {
+        from: String,
     },
 }
 
@@ -208,6 +217,8 @@ impl ArgSchema {
                     _ => Err(DackError::Config(format!("arg `{name}`: `{value}` does not match /{pattern}/"))),
                 }
             }
+            // A `ref` arg is filled by the harness (build_argv), never validated against model input.
+            ArgSchema::Ref { .. } => Ok(()),
         }
     }
 }
@@ -217,24 +228,36 @@ impl SkillCommand {
     /// arg must be present (no missing, no extra), each value must validate, then `${SKILL_DIR}` → `skill_dir`
     /// and each `{hole}` → its validated value. The result is spawned via execve — never a shell — so the
     /// values are inert argv elements. `skill_dir` is the absolute (or guest) path substituted for the token.
-    pub fn build_argv(&self, skill_dir: &str, args: &BTreeMap<String, String>) -> Result<Vec<String>> {
-        // Exactly the declared args, no more, no less.
-        for k in args.keys() {
-            if !self.args.contains_key(k) {
-                return Err(DackError::Config(format!("command `{}`: unexpected arg `{k}`", self.id)));
+    pub fn build_argv(&self, skill_dir: &str, model_args: &BTreeMap<String, String>, scope: &BTreeMap<String, String>) -> Result<Vec<String>> {
+        // The model may supply only NON-ref declared args (a `ref` arg is harness-routed).
+        for k in model_args.keys() {
+            match self.args.get(k) {
+                None => return Err(DackError::Config(format!("command `{}`: unexpected arg `{k}`", self.id))),
+                Some(ArgSchema::Ref { .. }) => return Err(DackError::Config(format!("command `{}`: arg `{k}` is harness-routed and may not be supplied by the model", self.id))),
+                _ => {}
             }
         }
+        // Resolve every declared arg: `ref` from the trusted reply-scope, others from the (validated) model.
+        let mut values: BTreeMap<String, String> = BTreeMap::new();
         for (name, schema) in &self.args {
-            let value = args
-                .get(name)
-                .ok_or_else(|| DackError::Config(format!("command `{}`: missing arg `{name}`", self.id)))?;
-            schema.validate(name, value)?;
+            let value = match schema {
+                ArgSchema::Ref { from } => scope
+                    .get(from)
+                    .cloned()
+                    .ok_or_else(|| DackError::Config(format!("command `{}`: reply-scope has no `{from}` for arg `{name}`", self.id)))?,
+                _ => {
+                    let v = model_args.get(name).ok_or_else(|| DackError::Config(format!("command `{}`: missing arg `{name}`", self.id)))?;
+                    schema.validate(name, v)?;
+                    v.clone()
+                }
+            };
+            values.insert(name.clone(), value);
         }
         // Substitute into every argv element. `${SKILL_DIR}` first, then each `{hole}`.
         let mut out = Vec::with_capacity(self.argv.len());
         for el in &self.argv {
             let mut s = el.replace(SKILL_DIR_TOKEN, skill_dir);
-            for (name, value) in args {
+            for (name, value) in &values {
                 s = s.replace(&format!("{{{name}}}"), value);
             }
             out.push(s);
@@ -377,19 +400,19 @@ commands:
         let feed = m.command("feed").unwrap();
         let mut args = BTreeMap::new();
         args.insert("limit".to_string(), "25".to_string());
-        let argv = feed.build_argv("/soul/skills/buzz", &args).unwrap();
+        let argv = feed.build_argv("/soul/skills/buzz", &args, &BTreeMap::new()).unwrap();
         assert_eq!(argv, vec!["/soul/skills/buzz/bin/buzz", "feed", "read", "--limit", "25"]);
 
         // Enum rejects an off-list value.
         let mut bad = BTreeMap::new();
         bad.insert("limit".to_string(), "999".to_string());
-        assert!(feed.build_argv("/x", &bad).unwrap_err().to_string().contains("not one of"));
+        assert!(feed.build_argv("/x", &bad, &BTreeMap::new()).unwrap_err().to_string().contains("not one of"));
 
         // Missing / extra args are rejected.
-        assert!(feed.build_argv("/x", &BTreeMap::new()).unwrap_err().to_string().contains("missing arg"));
+        assert!(feed.build_argv("/x", &BTreeMap::new(), &BTreeMap::new()).unwrap_err().to_string().contains("missing arg"));
         let mut extra = args.clone();
         extra.insert("bogus".to_string(), "1".to_string());
-        assert!(feed.build_argv("/x", &extra).unwrap_err().to_string().contains("unexpected arg"));
+        assert!(feed.build_argv("/x", &extra, &BTreeMap::new()).unwrap_err().to_string().contains("unexpected arg"));
     }
 
     #[test]
@@ -399,19 +422,52 @@ commands:
         // A normal note validates + lands as ONE argv element (execve, not shell → metachars inert).
         let mut args = BTreeMap::new();
         args.insert("text".to_string(), "gm; rm -rf / $(whoami) `id`".to_string());
-        let argv = post.build_argv("/s", &args).unwrap();
+        let argv = post.build_argv("/s", &args, &BTreeMap::new()).unwrap();
         assert_eq!(argv.last().unwrap(), "gm; rm -rf / $(whoami) `id`"); // inert — one element, no shell
         assert_eq!(argv[0], "/s/bin/buzz");
 
         // A 281-char note fails the `^.{1,280}$` bound (partial match can't sneak past — whole-span check).
         let mut too_long = BTreeMap::new();
         too_long.insert("text".to_string(), "x".repeat(281));
-        assert!(post.build_argv("/s", &too_long).unwrap_err().to_string().contains("does not match"));
+        assert!(post.build_argv("/s", &too_long, &BTreeMap::new()).unwrap_err().to_string().contains("does not match"));
 
         // A newline-bearing value can't satisfy `^.{1,280}$` (`.` excludes \n) — no multiline smuggling.
         let mut nl = BTreeMap::new();
         nl.insert("text".to_string(), "line1\nline2".to_string());
-        assert!(post.build_argv("/s", &nl).is_err());
+        assert!(post.build_argv("/s", &nl, &BTreeMap::new()).is_err());
+    }
+
+    #[test]
+    fn ref_args_are_filled_from_scope_and_the_model_cannot_supply_them() {
+        let manifest = r#"
+name: buzz
+commands:
+  - id: reply
+    tier: post
+    trust: self
+    argv: ["p", "--channel", "{channel}", "--content", "{text}", "--reply-to", "{in_reply_to}"]
+    args:
+      channel: { type: ref, from: conversation }
+      in_reply_to: { type: ref, from: in_reply_to }
+      text: { type: string, pattern: "^.{1,100}$" }
+"#;
+        let cmd = SkillManifest::parse(manifest.as_bytes()).unwrap().command("reply").unwrap().clone();
+        let mut scope = BTreeMap::new();
+        scope.insert("conversation".into(), "chan-1".to_string());
+        scope.insert("in_reply_to".into(), "evt-9".to_string());
+        let mut model = BTreeMap::new();
+        model.insert("text".into(), "hi there".to_string());
+        // ref args filled from scope; model supplies only `text`.
+        assert_eq!(
+            cmd.build_argv("/s", &model, &scope).unwrap(),
+            vec!["p", "--channel", "chan-1", "--content", "hi there", "--reply-to", "evt-9"]
+        );
+        // The model may NOT set a ref arg (destination-lock — no hijacking the reply target).
+        let mut hijack = model.clone();
+        hijack.insert("channel".into(), "attacker-channel".to_string());
+        assert!(cmd.build_argv("/s", &hijack, &scope).unwrap_err().to_string().contains("harness-routed"));
+        // No scope ⇒ deny (fail-closed).
+        assert!(cmd.build_argv("/s", &model, &BTreeMap::new()).unwrap_err().to_string().contains("reply-scope has no"));
     }
 
     #[test]

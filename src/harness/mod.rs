@@ -712,7 +712,10 @@ impl Harness {
             .filter(|n| self.config.mcp_server(n).map(|s| s.expand.is_deferred()).unwrap_or(false))
             .cloned()
             .collect();
-        let recorder = self.wall_for(spec.clone(), inline_read, cycle_trust);
+        // The trusted reply-scope (origin conversation/thread scalars) for skill `ref` args — the baton's
+        // selected scope overlaid on the stimulus payload, same source `scope_env` reads.
+        let reply_scope = reply_scope_map(scope_override, &stimulus.payload);
+        let recorder = self.wall_for(spec.clone(), inline_read, cycle_trust, reply_scope);
         // Offer ONLY the transitions the current trust ceiling permits — the agent never sees a hop
         // it couldn't take (taint model). A step that then touches a lower-trust capability may drop
         // even an offered hop (enforced post-step in `dispatch`).
@@ -1265,6 +1268,7 @@ impl Harness {
         spec: StateSpec,
         extra_read: Vec<CapabilityPrefix>,
         cycle_trust: &TrustTier,
+        reply_scope: std::collections::BTreeMap<String, String>,
     ) -> Arc<RecordingResponder> {
         // The wall classifies from the FULL capability map (registry tiers + explicit lists).
         let mut p = self.config.capability_prefixes();
@@ -1278,6 +1282,8 @@ impl Harness {
             signers.push(soul.clone());
         }
         responder = responder.with_skills(self.soul_root().join("skills"), signers, Some(self.broker.clone()));
+        // Trusted reply-scope for skill `ref` args (destination-lock a reply to the origin conversation/thread).
+        responder.reply_scope = reply_scope;
         responder.read_tools = p.read;
         // Long-term memory (`memory/`) is gated to `memory_write_min_trust` (org+): a lower-trust cycle
         // may not write it (the wall enforces; the digest consolidates instead).
@@ -2015,6 +2021,34 @@ const BATON_CONTINUATION_TYPE: &str = "baton-continuation";
 /// fields `scope_env` reads), WITHOUT the bulky `items` batch array. Used as a deferred baton's scope
 /// fallback so it threads to the same "latest" destination an in-wake reply would. `None` if the payload
 /// isn't an object. Env-only (never rendered to the model), same trust class as a `scope_override` item.
+/// Build the trusted reply-SCOPE map for skill `ref` args: the top-level SCALAR fields of the baton's
+/// selected scope (if any) overlaid on the stimulus payload's scalars, stringified. Env-only, never
+/// model-rendered — the same class + source as `scope_env` / the telegram destination-lock. Adapter-agnostic:
+/// a buzz/slack/discord ingress puts `conversation`/`in_reply_to` on the payload; a `ref` arg reads them,
+/// so the duck writes only the reply text and the harness routes it to the origin thread.
+fn reply_scope_map(scope_override: Option<&serde_json::Value>, payload: &serde_json::Value) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut take = |v: &serde_json::Value| {
+        if let Some(obj) = v.as_object() {
+            for (k, val) in obj {
+                if val.is_array() || val.is_object() || val.is_null() {
+                    continue;
+                }
+                let s = match val {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                out.entry(k.clone()).or_insert(s);
+            }
+        }
+    };
+    if let Some(sc) = scope_override {
+        take(sc); // the selected in-batch item wins (matches `scope_env`)
+    }
+    take(payload);
+    out
+}
+
 fn origin_reply_scope(payload: &serde_json::Value) -> Option<serde_json::Value> {
     let obj = payload.as_object()?;
     let scalars: serde_json::Map<String, serde_json::Value> = obj

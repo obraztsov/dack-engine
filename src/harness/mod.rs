@@ -1282,6 +1282,9 @@ impl Harness {
             signers.push(soul.clone());
         }
         responder = responder.with_skills(self.soul_root().join("skills"), signers, Some(self.broker.clone()));
+        // A `produces: media` skill command (e.g. buzz `media_get`) writes its fetched image into the SAME
+        // harness-owned media dir the incoming-media store uses; the bridge reads it back into a vision block.
+        responder = responder.with_media_dir(crate::media::dir(&self.config.media_dir));
         // Trusted reply-scope for skill `ref` args (destination-lock a reply to the origin conversation/thread).
         responder.reply_scope = reply_scope;
         responder.read_tools = p.read;

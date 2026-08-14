@@ -46,3 +46,6 @@ openclaude-bridge/telegram-ingress.config.json
 
 # Private design docs (PRD/architecture/build-plan) — local only, never public
 docs/internal/
+
+# runtime media store (harness-owned; also created here when a dev run uses cwd-relative media_dir)
+/media/

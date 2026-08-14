@@ -673,6 +673,12 @@ fn build_runtime(
     for (k, v) in rt.connector.env_overrides() {
         env.insert(k, v);
     }
+    // Vision route: a `produces: media` skill (buzz `media_get`) injects a fetched image mid-loop, so the
+    // duck-loop bridge — not the harness — must switch models when a turn carries an image. Forward the
+    // configured vision model so the bridge routes image-bearing calls to it (cognition stays on the default).
+    if let Some(vm) = &rt.default_vision_model {
+        env.insert("OPENAI_VISION_MODEL".to_string(), vm.clone());
+    }
     let client = OpenClaudeClient::bun_bridge(
         bridge_dir,
         env,

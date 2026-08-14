@@ -22,6 +22,10 @@ use crate::identity::{Did, Signature};
 pub const MANIFEST_FILE: &str = "skill.manifest.yaml";
 /// The `${SKILL_DIR}` token in an argv template → the skill's absolute (or guest) dir at build time.
 pub const SKILL_DIR_TOKEN: &str = "${SKILL_DIR}";
+/// The `${MEDIA_OUT}` token in a `produces: media` command's argv → the HARNESS-fixed output path under the
+/// media dir (the model never chooses it). Resolved by [`authorize`], recorded on [`SkillExec::produced_media`]
+/// so the bridge reads exactly that file back and turns it into a vision block. Symmetric with `${SKILL_DIR}`.
+pub const MEDIA_OUT_TOKEN: &str = "${MEDIA_OUT}";
 /// The structured tool the duck calls to run a vetted skill command (input `{skill, command, args}`). Not
 /// a shell — the harness verifies + builds the argv and the bridge execve's it.
 pub const RUN_SKILL_COMMAND: &str = "RunSkillCommand";
@@ -41,6 +45,19 @@ pub struct SkillExec {
     pub env: BTreeMap<String, String>,
     /// Whether the sandboxed child gets network egress.
     pub network: bool,
+    /// For a `produces: media` command: the HARNESS-fixed absolute output path the child writes (the resolved
+    /// `${MEDIA_OUT}`). The bridge reads exactly this file back on a successful exec and turns it into a vision
+    /// block — the model never names it. `None` for a normal (text-output) command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub produced_media: Option<String>,
+}
+
+/// What a command's successful run yields, beyond text. `media` ⇒ it writes an image to `${MEDIA_OUT}` which
+/// the bridge reads back into a vision block (see [`SkillExec::produced_media`]). Absent ⇒ plain text output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Produces {
+    Media,
 }
 
 /// A verified, arg-checked skill call: the command's capability tier + taint label (for the wall to gate on)
@@ -64,6 +81,7 @@ pub fn authorize(
     args: &BTreeMap<String, String>,
     trusted: &[&Did],
     scope: &BTreeMap<String, String>,
+    media_dir: Option<&Path>,
 ) -> Result<SkillAuthz> {
     // The skill name comes from the MODEL (untrusted). Confine it to a single dir component — no traversal,
     // no separators — so it can only name a dir directly under `skills_root`.
@@ -75,13 +93,55 @@ pub fn authorize(
     let cmd = manifest
         .command(command)
         .ok_or_else(|| DackError::Config(format!("skill `{skill}` has no command `{command}`")))?;
-    let argv = cmd.build_argv(&skill_dir.to_string_lossy(), args, scope)?;
+    let mut argv = cmd.build_argv(&skill_dir.to_string_lossy(), args, scope)?;
+
+    // A `produces: media` command writes an image to `${MEDIA_OUT}`. The harness — NOT the model — fixes that
+    // path under the media dir: a basename-sanitized cache name derived from the (pattern-validated) `ref` arg,
+    // so repeat fetches of the same id reuse one file and nothing escapes the dir. Record it for the bridge.
+    let produced_media = if cmd.produces == Some(Produces::Media) {
+        let dir = media_dir.ok_or_else(|| {
+            DackError::Config(format!("skill `{skill}/{command}` produces media but no media dir is configured"))
+        })?;
+        let out = dir.join(sanitize_media_name(args.get("ref").map(String::as_str).unwrap_or("")));
+        let out_s = out.to_string_lossy().into_owned();
+        let mut replaced = false;
+        for el in argv.iter_mut() {
+            if el == MEDIA_OUT_TOKEN {
+                *el = out_s.clone();
+                replaced = true;
+            }
+        }
+        if !replaced {
+            return Err(DackError::Config(format!(
+                "skill `{skill}/{command}` is `produces: media` but its argv has no {MEDIA_OUT_TOKEN} token"
+            )));
+        }
+        Some(out_s)
+    } else {
+        None
+    };
+
     Ok(SkillAuthz {
         tier: cmd.tier,
         trust: cmd.trust.clone(),
         // `env` is filled by the wall from the broker (the responder has it, `authorize` doesn't).
-        exec: SkillExec { argv, secret: cmd.secret.clone(), env: BTreeMap::new(), network: cmd.network },
+        exec: SkillExec { argv, secret: cmd.secret.clone(), env: BTreeMap::new(), network: cmd.network, produced_media },
     })
+}
+
+/// A safe cache FILENAME for a media-producing command's output: the **basename** of the (already
+/// pattern-validated) media `ref`, restricted to `[0-9A-Za-z._-]`, length-capped, no leading/trailing dots
+/// (no hidden files, no `..`). Basename + charset filter means no path traversal even if a manifest's `ref`
+/// pattern were loose. Empty ⇒ a fixed fallback.
+fn sanitize_media_name(raw: &str) -> String {
+    let base = Path::new(raw).file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let cleaned: String = base
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        .take(96)
+        .collect();
+    let cleaned = cleaned.trim_matches('.');
+    if cleaned.is_empty() { "media.bin".to_string() } else { cleaned.to_string() }
 }
 
 /// A skill's signed capability manifest. The `name` is part of the SIGNED bytes so a manifest can't be
@@ -118,6 +178,10 @@ pub struct SkillCommand {
     /// Whether the sandboxed process gets network egress (a relay/API command needs it; a local op doesn't).
     #[serde(default)]
     pub network: bool,
+    /// What the command yields. `Some(Media)` ⇒ it writes an image to the `${MEDIA_OUT}` argv token (which the
+    /// harness fixes to a media-dir path) and the bridge reads it back into a vision block. Absent ⇒ text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub produces: Option<Produces>,
 }
 
 /// The type of a typed hole. `String` matches an anchored regex (validated in the wall phase); `Enum` is a
@@ -183,6 +247,34 @@ impl SkillManifest {
                         "skill `{}` cmd `{}`: `args.{k}` is declared but never used in argv",
                         self.name, c.id
                     )));
+                }
+            }
+            // `produces: media` ⟺ the argv carries the `${MEDIA_OUT}` token (the harness-fixed output path) and
+            // a `ref` arg (the media id → cache filename). Keeps the two in lockstep so a media command can't
+            // silently lose its output target, and a stray token can't appear on a text command.
+            let has_media_token = c.argv.iter().any(|el| el.contains(MEDIA_OUT_TOKEN));
+            match c.produces {
+                Some(Produces::Media) => {
+                    if !has_media_token {
+                        return Err(DackError::Config(format!(
+                            "skill `{}` cmd `{}`: `produces: media` requires the {MEDIA_OUT_TOKEN} argv token",
+                            self.name, c.id
+                        )));
+                    }
+                    if !c.args.contains_key("ref") {
+                        return Err(DackError::Config(format!(
+                            "skill `{}` cmd `{}`: `produces: media` requires a `ref` arg (the media id → cache filename)",
+                            self.name, c.id
+                        )));
+                    }
+                }
+                None => {
+                    if has_media_token {
+                        return Err(DackError::Config(format!(
+                            "skill `{}` cmd `{}`: uses {MEDIA_OUT_TOKEN} but is not `produces: media`",
+                            self.name, c.id
+                        )));
+                    }
                 }
             }
         }
@@ -468,6 +560,82 @@ commands:
         assert!(cmd.build_argv("/s", &hijack, &scope).unwrap_err().to_string().contains("harness-routed"));
         // No scope ⇒ deny (fail-closed).
         assert!(cmd.build_argv("/s", &model, &BTreeMap::new()).unwrap_err().to_string().contains("reply-scope has no"));
+    }
+
+    #[test]
+    fn media_command_parse_validates_token_and_ref() {
+        let ok = r#"
+name: buzz
+commands:
+  - id: media_get
+    tier: read
+    trust: public
+    argv: ["${SKILL_DIR}/bin/buzz", "media", "get", "{ref}", "-o", "${MEDIA_OUT}"]
+    args:
+      ref: { type: string, pattern: "^[0-9a-f]{64}\\.(png|jpg)$" }
+    produces: media
+"#;
+        assert_eq!(SkillManifest::parse(ok.as_bytes()).unwrap().command("media_get").unwrap().produces, Some(Produces::Media));
+
+        // produces: media but the argv lacks ${MEDIA_OUT} → reject.
+        let no_tok = ok.replace(", \"-o\", \"${MEDIA_OUT}\"", "");
+        assert!(SkillManifest::parse(no_tok.as_bytes()).unwrap_err().to_string().contains("MEDIA_OUT"));
+
+        // ${MEDIA_OUT} present but not `produces: media` → reject (no stray output sink).
+        let stray = ok.replace("    produces: media\n", "");
+        assert!(SkillManifest::parse(stray.as_bytes()).unwrap_err().to_string().contains("not `produces: media`"));
+
+        // produces: media without a `ref` arg → reject (need the cache-name source).
+        let no_ref = "name: buzz\ncommands:\n  - id: g\n    tier: read\n    trust: public\n    argv: [\"p\", \"{limit}\", \"-o\", \"${MEDIA_OUT}\"]\n    args:\n      limit: { type: enum, values: [\"1\"] }\n    produces: media\n";
+        assert!(SkillManifest::parse(no_ref.as_bytes()).unwrap_err().to_string().contains("requires a `ref` arg"));
+    }
+
+    #[test]
+    fn sanitize_media_name_is_basename_only_and_charset_filtered() {
+        assert_eq!(sanitize_media_name("3bda987db27d46c34c4f13884bbc579e4f982646056b5524d5726425d8a97d73.png"), "3bda987db27d46c34c4f13884bbc579e4f982646056b5524d5726425d8a97d73.png");
+        assert_eq!(sanitize_media_name("../../etc/passwd"), "passwd"); // basename drops the traversal
+        assert_eq!(sanitize_media_name("../.."), "media.bin"); // trims to nothing → fallback
+        assert_eq!(sanitize_media_name(""), "media.bin");
+        assert!(!sanitize_media_name("a/b/c;rm -rf.png").contains(';')); // charset-filtered
+    }
+
+    #[test]
+    fn authorize_media_command_fixes_output_path_and_records_it() {
+        let op = SigningKey::from_bytes(&[3u8; 32]);
+        let op_did = ed25519_pub_to_did(op.verifying_key().to_bytes());
+        let trusted: Vec<&Did> = vec![&op_did];
+        let base = std::env::temp_dir().join(format!("dack-skillmedia-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let d = base.join("buzz");
+        let manifest = r#"
+name: buzz
+commands:
+  - id: media_get
+    tier: read
+    trust: public
+    argv: ["${SKILL_DIR}/bin/buzz", "media", "get", "{ref}", "-o", "${MEDIA_OUT}"]
+    args:
+      ref: { type: string, pattern: "^[0-9a-f]{64}(\\.thumb)?\\.(png|jpe?g|gif|webp)$" }
+    produces: media
+    secret: buzz_key
+    network: true
+"#;
+        write_skill(&d, manifest, Some(&op));
+        let media = base.join("media");
+        let sha = "3bda987db27d46c34c4f13884bbc579e4f982646056b5524d5726425d8a97d73.png";
+        let mut args = BTreeMap::new();
+        args.insert("ref".to_string(), sha.to_string());
+
+        let authz = authorize(&base, "buzz", "media_get", &args, &trusted, &BTreeMap::new(), Some(media.as_path())).unwrap();
+        let out = media.join(sha).to_string_lossy().into_owned();
+        // ${MEDIA_OUT} resolved to <media>/<sha>, recorded for the bridge; the token is gone; model never named it.
+        assert!(authz.exec.argv.contains(&out), "argv carries the fixed -o path: {:?}", authz.exec.argv);
+        assert_eq!(authz.exec.produced_media.as_deref(), Some(out.as_str()));
+        assert!(!authz.exec.argv.iter().any(|a| a.contains(MEDIA_OUT_TOKEN)));
+
+        // No media dir ⇒ deny (fail-closed).
+        assert!(authorize(&base, "buzz", "media_get", &args, &trusted, &BTreeMap::new(), None).unwrap_err().to_string().contains("no media dir"));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

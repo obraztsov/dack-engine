@@ -70,6 +70,10 @@ pub struct StatePolicyResponder {
     /// exec's `env` at call time (lazy: only when the command actually runs), so the credential reaches the
     /// skill process, never the model. `None` ⇒ a secret-bearing skill command is denied (no way to supply it).
     pub broker: Option<Arc<SecretsBroker>>,
+    /// The harness-owned media dir — where a `produces: media` skill command writes its fetched image (the
+    /// resolved `${MEDIA_OUT}`). `None` ⇒ a media-producing command is denied (nowhere safe to write). Set by
+    /// the harness from `config.media_dir`; shared with the incoming-media store so the bridge reads it back.
+    pub media_dir: Option<PathBuf>,
     /// `(tool, input)` fingerprints of OUTWARD actions (Post / SettleTx) that ran this invocation —
     /// tracked so [`acted_outward`](Self::acted_outward) can gate the timeout-retry path (never re-run
     /// a wake that already posted/traded → no double-post on a re-run). Duplicates are NOT blocked: a
@@ -96,6 +100,7 @@ impl StatePolicyResponder {
             trusted_signers: Vec::new(),
             reply_scope: Default::default(),
             broker: None,
+            media_dir: None,
             outward_seen: Default::default(),
         }
     }
@@ -119,6 +124,7 @@ impl StatePolicyResponder {
             trusted_signers: Vec::new(),
             reply_scope: Default::default(),
             broker: None,
+            media_dir: None,
             outward_seen: Default::default(),
         }
     }
@@ -142,6 +148,13 @@ impl StatePolicyResponder {
         self.skills_root = Some(skills_root.into());
         self.trusted_signers = trusted_signers;
         self.broker = broker;
+        self
+    }
+
+    /// Bind the harness-owned media dir so a `produces: media` skill command can write its fetched image
+    /// somewhere the bridge reads back (the resolved `${MEDIA_OUT}`). Without it, a media command is denied.
+    pub fn with_media_dir(mut self, media_dir: impl Into<PathBuf>) -> Self {
+        self.media_dir = Some(media_dir.into());
         self
     }
 
@@ -178,7 +191,7 @@ impl StatePolicyResponder {
         }
 
         let trusted: Vec<&crate::identity::Did> = self.trusted_signers.iter().collect();
-        let mut authz = match crate::skills::authorize(skills_root, skill, command, &args, &trusted, &self.reply_scope) {
+        let mut authz = match crate::skills::authorize(skills_root, skill, command, &args, &trusted, &self.reply_scope, self.media_dir.as_deref()) {
             Ok(a) => a,
             Err(e) => return ActionDecision::Deny(format!("skill `{skill}/{command}` denied: {e}")),
         };

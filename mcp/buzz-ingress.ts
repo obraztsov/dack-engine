@@ -16,7 +16,8 @@
  * BUZZ_PRIVATE_KEY is injected by the module's `buzz_key` secret; never logged.
  */
 
-import { readFileSync, writeFileSync, existsSync } from 'node:fs'
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
+import { join, isAbsolute, resolve as resolvePath } from 'node:path'
 
 // ── config ───────────────────────────────────────────────────────────────────────────────────────
 
@@ -40,6 +41,13 @@ interface Config {
   dm_default_trust: string
   channels: ChannelCfg[]
   thread_context: { max_ancestors: number; full_thread_max: number }
+  // P2 media prefetch: passively fetch a small thumb (or the full image) of an attachment into the harness
+  // media dir, so the duck SEES it on wake with no fetch. `off` (default) = awareness-only; the duck still
+  // pulls full-res on demand via the `media_get` skill. `media_dir` MUST match the engine's `media_dir` (it's
+  // where the harness resolves + confines media from); an absolute path is safest (the module's cwd may vary).
+  media_prefetch: 'off' | 'thumb' | 'full'
+  media_dir: string
+  media_max_per_message: number
 }
 
 const DEFAULTS: Config = {
@@ -57,6 +65,9 @@ const DEFAULTS: Config = {
   dm_default_trust: 'public',
   channels: [],
   thread_context: { max_ancestors: 8, full_thread_max: 40 },
+  media_prefetch: 'off',
+  media_dir: 'media',
+  media_max_per_message: 6,
 }
 
 function loadConfig(): Config {
@@ -94,6 +105,46 @@ function buzz(args: string[]): any {
   } catch {
     return null
   }
+}
+
+/** Fetch a media object (Blossom signed-GET) to a FILE — a side-effect exec, NOT the JSON `buzz()` path.
+ *  `ref` is a `sha256[.ext]` segment (bare sha, or `<sha>.thumb.jpg`). Returns true on a clean write. */
+function buzzMediaGet(ref: string, outPath: string): boolean {
+  const env: Record<string, string> = {}
+  for (const k of ['PATH', 'HOME', 'LANG']) if (process.env[k] !== undefined) env[k] = process.env[k]!
+  env.BUZZ_PRIVATE_KEY = process.env.BUZZ_PRIVATE_KEY!
+  const proc = Bun.spawnSync([cfg.buzz_bin, '--relay', cfg.relay, 'media', 'get', ref, '-o', outPath], { env, stdout: 'ignore', stderr: 'pipe' })
+  if (proc.exitCode !== 0) {
+    log('media get', ref.slice(0, 12), 'failed:', proc.stderr.toString().slice(0, 160))
+    return false
+  }
+  return true
+}
+
+const mediaDirAbs = () => (isAbsolute(cfg.media_dir) ? cfg.media_dir : resolvePath(process.cwd(), cfg.media_dir))
+
+/** P2 passive awareness: prefetch a thumb (or full image) of each attachment into the harness media dir and
+ *  return `payload.media` entries the engine's media store confines + carries onto the goal turn (so the duck
+ *  SEES it on wake). Cached by filename (sha-named) — a repeat is a no-op. `off` ⇒ nothing (on-demand only). */
+function prefetchMedia(attachments: MediaMeta[]): Array<{ kind: 'image'; file: string; mime: string }> {
+  if (cfg.media_prefetch === 'off' || attachments.length === 0) return []
+  const dir = mediaDirAbs()
+  try {
+    mkdirSync(dir, { recursive: true })
+  } catch {
+    /* harness ensures it at boot; ignore */
+  }
+  const out: Array<{ kind: 'image'; file: string; mime: string }> = []
+  for (const a of attachments.slice(0, cfg.media_max_per_message)) {
+    if (!a.sha) continue
+    const useThumb = cfg.media_prefetch === 'thumb' && a.has_thumb
+    const file = useThumb ? `${a.sha}.thumb.jpg` : a.sha // basename (hex sha) → safe; engine re-confines it
+    const mime = useThumb ? 'image/jpeg' : a.mime
+    if (!mime.startsWith('image/')) continue // the engine's media store only carries images
+    const outPath = join(dir, file)
+    if (existsSync(outPath) || buzzMediaGet(file, outPath)) out.push({ kind: 'image', file, mime })
+  }
+  return out
 }
 
 // ── event helpers ───────────────────────────────────────────────────────────────────────────────
@@ -222,7 +273,8 @@ function discover(): void {
 async function post(ch: { id: string; name?: string }, ev: Ev, kind: 'mention' | 'reply_to_own'): Promise<void> {
   const tier = tierFor(ch)
   const { spine, truncated, root } = buildSpine(ev)
-  const attachments = parseImeta(ev) // P0: media awareness — metadata only (bytes are Blossom-gated, fetched in P1)
+  const attachments = parseImeta(ev) // P0: media awareness — metadata for every attachment (all images)
+  const media = prefetchMedia(attachments) // P2: passively fetched thumb(s)/image(s) the duck SEES on wake
   const body = {
     channel: { id: ch.id, name: ch.name ?? null },
     trigger: kind,
@@ -233,6 +285,9 @@ async function post(ch: { id: string; name?: string }, ev: Ev, kind: 'mention' |
     // Media the trigger message carries (imeta): the duck perceives it exists (mime/dim/size/filename). Only
     // present when the message has attachments, so non-media wakes are byte-for-byte unchanged.
     ...(attachments.length ? { attachments } : {}),
+    // P2: prefetched image files (thumbs) on disk in the harness media dir — the engine confines + carries
+    // these onto the Perceive goal turn so the duck SEES them. Absent unless `media_prefetch` is enabled.
+    ...(media.length ? { media } : {}),
     // The ancestor spine (root → … → trigger); `truncated` ⇒ a deeper middle the duck can `thread_get`.
     spine,
     truncated,
@@ -312,4 +367,4 @@ if (import.meta.main) {
   })
 }
 
-export { buildSpine, eventById, rootOf, tierFor, parseImeta, type Ev }
+export { buildSpine, eventById, rootOf, tierFor, parseImeta, prefetchMedia, type Ev }

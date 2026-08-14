@@ -130,6 +130,36 @@ function resolveName(pubkey: string): string {
 type SpineEv = { id: string; from: string; from_name: string; content: string; created_at: number }
 const compactEv = (e: Ev): SpineEv => ({ id: e.id, from: e.pubkey, from_name: resolveName(e.pubkey), content: e.content, created_at: e.created_at })
 
+// Media attachments (NIP-92 `imeta` tags). Each imeta tag is ["imeta", "url <U>", "m <mime>", "x <sha256>",
+// "size <bytes>", "dim <WxH>", "thumb <U>", "filename <name>", …] — space-separated `key value` fields (only
+// the value may contain spaces, e.g. a filename → split on the FIRST space). P0 surfaces METADATA ONLY (the
+// duck's awareness that media exists); no bytes move here. The bytes live behind Blossom auth — fetching them
+// (`buzz media get`, a signed GET) and turning them into a vision block is P1. `sha` (the `x` hash) is the
+// stable ref P1's `media_get` will pull. Capped like the harness's MAX_MEDIA_PER_STIMULUS.
+type MediaMeta = { sha: string | null; mime: string; dim: string | null; size: number | null; filename: string | null; has_thumb: boolean }
+function parseImeta(ev: Ev): MediaMeta[] {
+  const out: MediaMeta[] = []
+  for (const t of ev.tags ?? []) {
+    if (t[0] !== 'imeta') continue
+    const kv: Record<string, string> = {}
+    for (const field of t.slice(1)) {
+      const sp = typeof field === 'string' ? field.indexOf(' ') : -1
+      if (sp > 0) kv[field.slice(0, sp)] = field.slice(sp + 1)
+    }
+    if (!kv.url && !kv.x) continue // not a media imeta
+    out.push({
+      sha: kv.x ?? null,
+      mime: kv.m ?? 'application/octet-stream',
+      dim: kv.dim ?? null,
+      size: kv.size ? Number(kv.size) : null,
+      filename: kv.filename ?? null,
+      has_thumb: !!kv.thumb,
+    })
+    if (out.length >= 6) break
+  }
+  return out
+}
+
 /** Reconstruct the ancestor SPINE — root → … → parent → trigger, oldest→newest. Mode A: walk the NIP-10
  *  `reply` e-tag hop-by-hop (each hop = one ancestor, so the MIDDLE threading points are kept), fetching one
  *  event per hop, bounded by `max_ancestors`. `truncated` = the thread is deeper than we walked (the duck can
@@ -192,6 +222,7 @@ function discover(): void {
 async function post(ch: { id: string; name?: string }, ev: Ev, kind: 'mention' | 'reply_to_own'): Promise<void> {
   const tier = tierFor(ch)
   const { spine, truncated, root } = buildSpine(ev)
+  const attachments = parseImeta(ev) // P0: media awareness — metadata only (bytes are Blossom-gated, fetched in P1)
   const body = {
     channel: { id: ch.id, name: ch.name ?? null },
     trigger: kind,
@@ -199,6 +230,9 @@ async function post(ch: { id: string; name?: string }, ev: Ev, kind: 'mention' |
     root,
     from: { pubkey: ev.pubkey, name: resolveName(ev.pubkey) },
     content: ev.content,
+    // Media the trigger message carries (imeta): the duck perceives it exists (mime/dim/size/filename). Only
+    // present when the message has attachments, so non-media wakes are byte-for-byte unchanged.
+    ...(attachments.length ? { attachments } : {}),
     // The ancestor spine (root → … → trigger); `truncated` ⇒ a deeper middle the duck can `thread_get`.
     spine,
     truncated,
@@ -278,4 +312,4 @@ if (import.meta.main) {
   })
 }
 
-export { buildSpine, eventById, rootOf, tierFor, type Ev }
+export { buildSpine, eventById, rootOf, tierFor, parseImeta, type Ev }

@@ -142,7 +142,12 @@ function prefetchMedia(attachments: MediaMeta[]): Array<{ kind: 'image'; file: s
     const mime = useThumb ? 'image/jpeg' : a.mime
     if (!mime.startsWith('image/')) continue // the engine's media store only carries images
     const outPath = join(dir, file)
-    if (existsSync(outPath) || buzzMediaGet(file, outPath)) out.push({ kind: 'image', file, mime })
+    if (existsSync(outPath)) {
+      out.push({ kind: 'image', file, mime }) // cache hit — no refetch
+    } else if (buzzMediaGet(file, outPath)) {
+      out.push({ kind: 'image', file, mime })
+      log('prefetched', useThumb ? 'thumb' : 'image', `${file.slice(0, 12)}… (${mime}) → media dir`)
+    }
   }
   return out
 }
@@ -178,8 +183,18 @@ function resolveName(pubkey: string): string {
   return name
 }
 
-type SpineEv = { id: string; from: string; from_name: string; content: string; created_at: number }
-const compactEv = (e: Ev): SpineEv => ({ id: e.id, from: e.pubkey, from_name: resolveName(e.pubkey), content: e.content, created_at: e.created_at })
+type SpineEv = { id: string; from: string; from_name: string; content: string; created_at: number; attachments?: MediaMeta[] }
+const compactEv = (e: Ev): SpineEv => {
+  const attachments = parseImeta(e) // P3: an ancestor's images are fetchable too (media_get by sha)
+  return {
+    id: e.id,
+    from: e.pubkey,
+    from_name: resolveName(e.pubkey),
+    content: e.content,
+    created_at: e.created_at,
+    ...(attachments.length ? { attachments } : {}),
+  }
+}
 
 // Media attachments (NIP-92 `imeta` tags). Each imeta tag is ["imeta", "url <U>", "m <mime>", "x <sha256>",
 // "size <bytes>", "dim <WxH>", "thumb <U>", "filename <name>", …] — space-separated `key value` fields (only

@@ -15,10 +15,15 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
 import { openIngressStore, setChatAttachment, getReferral, type MediaType } from './ingress-store'
+import { openPondStore, restoreHandles, spliceHandles } from './pond-store'
 
 // Per-chat attachment store — the harness injects INGRESS_DB (absolute). Absent ⇒ the toggle is
 // unavailable (returns an error); `reply` still works.
 const ingressStore = process.env.INGRESS_DB ? openIngressStore(process.env.INGRESS_DB) : null
+// Pond secret-handle store (same file, own tables) — the resolve+splice side of the envelope
+// (PRD §6.6): `H-…` tokens in outgoing text become their stored values ONLY when this chat is the
+// handle's owner. Both sides of that equality are harness-injected; the model influences neither.
+const pondStore = process.env.INGRESS_DB ? openPondStore(process.env.INGRESS_DB) : null
 
 async function tgSend(body: Record<string, unknown>): Promise<unknown> {
   const token = process.env.TELEGRAM_BOT_TOKEN
@@ -48,10 +53,36 @@ server.registerTool(
   async ({ text }: { text: string }) => {
     const chat = process.env.TELEGRAM_REPLY_CHAT
     if (!chat) return asText({ ok: false, error: 'no source chat in scope — this cycle was not woken by Telegram' })
-    const body: Record<string, unknown> = { chat_id: chat, text }
+    // Envelope splice: resolve any pond secret-handles (`H-…`) against THIS chat. All-or-nothing —
+    // a handle that isn't this chat's (wrong owner, expired, already used) refuses the whole send,
+    // consuming nothing. The tool result NEVER carries the spliced value, only the count.
+    let out = text
+    let consumed: string[] = []
+    const at = Math.floor(Date.now() / 1000)
+    if (pondStore) {
+      const s = spliceHandles(pondStore, text, chat, at)
+      if (!s.ok) {
+        console.error(`[telegram-mcp] splice refused handle=${s.handle} reason=${s.reason}`)
+        return asText({
+          ok: false,
+          error:
+            `cannot deliver ${s.handle}: ${s.reason.replace('_', ' ')} — mint a fresh one ` +
+            `(e.g. enter_configurator again) and resend`,
+        })
+      }
+      out = s.text
+      consumed = s.handles
+    }
+    const body: Record<string, unknown> = { chat_id: chat, text: out }
     const replyTo = process.env.TELEGRAM_REPLY_TO
     if (replyTo) body.reply_parameters = { message_id: Number(replyTo) }
-    return asText(await tgSend(body))
+    const sent: any = await tgSend(body)
+    if (!sent?.ok && consumed.length && pondStore) {
+      // Delivery itself failed — the value reached no one; make the same handles work on retry.
+      restoreHandles(pondStore, consumed, at)
+      console.error(`[telegram-mcp] send failed, restored ${consumed.length} handle(s)`)
+    }
+    return asText(consumed.length && sent?.ok ? { ...sent, spliced: consumed.length } : sent)
   },
 )
 

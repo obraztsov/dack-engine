@@ -1,0 +1,187 @@
+/**
+ * Pond INGRESS — a `modules:`-supervised WS client on the leader's stimulus socket
+ * (`/v1/ws/manager`). Leader events (credits today; the type set will grow) become duck stimuli:
+ * a POST to the harness webhook that wakes the duck to TELL THE AFFECTED USER, destination-locked
+ * to that user's DM by the payload scalars (`chat_id` = `from_user_id` = the event's `tg_user_id`;
+ * in a Telegram DM chat_id == user_id).
+ *
+ * Delivery discipline (handoff §3): the WS is a lossy fast path over a durable journal. Every frame
+ * carries the journal `id`; we persist the highest id PROCESSED (pond_cursor in the shared ingress
+ * SQLite) and on every (re)connect first replay `GET /v1/manager/events?after=<cursor>`, then consume
+ * live frames, deduping by id. The cursor advances only after the harness ACKs the webhook (202) —
+ * at-least-once into the bus, where per-user coalescing absorbs the rare duplicate.
+ *
+ * The leader never pings and ignores every inbound frame — so we SEND a periodic text frame as
+ * keepalive (NAT liveness + dead-socket detection); a send failure forces a reconnect. Reconnect is
+ * jittered exponential backoff 1 s → 30 s, forever; unknown event types advance the cursor silently.
+ *
+ * Env: MANAGER_JWT (module secrets), POND_LEADER_URL (default http://127.0.0.1:7700 — the WS URL is
+ * derived), HARNESS_WEBHOOK (default http://127.0.0.1:8787), POND_EVENTS_PATH (default /pond/events),
+ * INGRESS_DB (cursor store, same file the harness injects into the MCPs).
+ */
+import { leaderClient, type EventRow } from './pond-leader'
+import { getCursor, openPondStore, setCursor } from './pond-store'
+
+const LEADER_URL = (process.env.POND_LEADER_URL ?? 'http://127.0.0.1:7700').replace(/\/+$/, '')
+const WS_URL = LEADER_URL.replace(/^http/, 'ws') + '/v1/ws/manager'
+const WEBHOOK = (process.env.HARNESS_WEBHOOK ?? 'http://127.0.0.1:8787').replace(/\/+$/, '')
+const EVENTS_PATH = process.env.POND_EVENTS_PATH ?? '/pond/events'
+const JWT = process.env.MANAGER_JWT
+const DB_PATH = process.env.INGRESS_DB
+
+if (!JWT) {
+  console.error('[pond-ingress] MANAGER_JWT not set — exiting (supervisor will restart w/ backoff)')
+  process.exit(1)
+}
+if (!DB_PATH) {
+  console.error('[pond-ingress] INGRESS_DB not set — exiting (cursor needs a home)')
+  process.exit(1)
+}
+const db = openPondStore(DB_PATH)
+const leader = leaderClient({ baseUrl: LEADER_URL, jwt: JWT })
+
+// ── Event → stimulus translation ────────────────────────────────────────────────────────────────
+
+/** A human line the duck can lean on + the structured facts. Unknown types → null (skip, advance). */
+function translate(ev: EventRow): Record<string, unknown> | null {
+  if (!ev.tg_user_id) return null // no addressee — nothing to wake for
+  const p = (ev.payload ?? {}) as Record<string, unknown>
+  let text: string
+  switch (ev.type) {
+    case 'credits_low':
+      text =
+        `Pond billing: user's agent '${ev.agent}' credits are LOW — balance ${p.balance}, daily cost ` +
+        `${p.credits_per_day}. They cannot cover another day; let them know how to top up.`
+      break
+    case 'credits_exhausted':
+      text =
+        `Pond billing: user's agent '${ev.agent}' credits are EXHAUSTED — balance ${p.balance} ` +
+        `(daily cost ${p.credits_per_day}). Service is at risk; tell them how to top up.`
+      break
+    default:
+      return null // forward-compat: new leader event types appear before we teach the duck about them
+  }
+  return {
+    // Top-level SCALARS are load-bearing: scope_env + skill refs resolve against them.
+    type: ev.type,
+    agent: ev.agent,
+    balance: p.balance ?? null,
+    credits_per_day: p.credits_per_day ?? null,
+    tg_user_id: ev.tg_user_id,
+    from_user_id: ev.tg_user_id, // the attested addressee — what user-scoped locks key on
+    chat_id: ev.tg_user_id, // DM chat == user id: destination-locks the reply to their DM
+    dedup_key: String(ev.tg_user_id), // per-user thread: coalesces bursts, serializes wakes
+    event_id: ev.id,
+    text,
+  }
+}
+
+/** Deliver one event into the duck's bus. True ⇒ the harness accepted it (202) or it needs no wake. */
+async function deliver(ev: EventRow): Promise<boolean> {
+  const body = translate(ev)
+  if (!body) {
+    if (!ev.tg_user_id) console.error(`[pond-ingress] event ${ev.id} (${ev.type}) has no tg_user_id — skipped`)
+    return true
+  }
+  try {
+    const r = await fetch(`${WEBHOOK}${EVENTS_PATH}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(10_000),
+    })
+    if (r.status === 202) return true
+    console.error(`[pond-ingress] harness webhook ${EVENTS_PATH} → ${r.status} (event ${ev.id})`)
+    return false
+  } catch (e: any) {
+    console.error(`[pond-ingress] harness webhook unreachable (event ${ev.id}): ${e?.message ?? e}`)
+    return false
+  }
+}
+
+/** Process in id order; stop (and DON'T advance) on the first delivery failure — replay resumes there. */
+async function process_(events: EventRow[]): Promise<void> {
+  for (const ev of events.sort((a, b) => a.id - b.id)) {
+    if (ev.id <= getCursor(db)) continue // replay/live overlap — already handled
+    if (!(await deliver(ev))) return
+    setCursor(db, ev.id)
+  }
+}
+
+/** Catch up from the durable journal — everything after our cursor, paged. */
+async function replay(): Promise<void> {
+  for (;;) {
+    const page = await leader.events(getCursor(db), 500)
+    if (page.length === 0) return
+    const before = getCursor(db)
+    await process_(page)
+    if (getCursor(db) === before) return // delivery stalled — don't spin; next (re)connect resumes
+    if (page.length < 500) return
+  }
+}
+
+// ── The socket loop ──────────────────────────────────────────────────────────────────────────────
+
+const BACKOFF_FLOOR_MS = 1_000
+const BACKOFF_CAP_MS = 30_000
+const STABLE_MS = 60_000
+const KEEPALIVE_MS = 30_000
+
+let backoff = BACKOFF_FLOOR_MS
+
+function connectOnce(): Promise<void> {
+  return new Promise((resolve) => {
+    // Bun's WebSocket accepts custom headers; the `?token=` fallback exists but keeps the JWT out of
+    // logs less reliably — prefer the header.
+    const ws = new WebSocket(WS_URL, { headers: { Authorization: `Bearer ${JWT}` } } as any)
+    const openedAt = Date.now()
+    let keepalive: ReturnType<typeof setInterval> | null = null
+    let queue: Promise<void> = Promise.resolve() // serialize frame processing (order + cursor discipline)
+
+    const finish = () => {
+      if (keepalive) clearInterval(keepalive)
+      resolve()
+    }
+
+    ws.onopen = () => {
+      console.error(`[pond-ingress] connected ${WS_URL}; replaying after id ${getCursor(db)}`)
+      queue = queue.then(() => replay()).catch((e) => console.error('[pond-ingress] replay failed:', e?.message ?? e))
+      keepalive = setInterval(() => {
+        try {
+          ws.send('ping') // leader ignores inbound frames; this is pure liveness
+        } catch {
+          ws.close()
+        }
+      }, KEEPALIVE_MS)
+    }
+    ws.onmessage = (m: MessageEvent) => {
+      if (typeof m.data !== 'string') return
+      let ev: EventRow
+      try {
+        ev = JSON.parse(m.data)
+      } catch {
+        return
+      }
+      if (typeof ev?.id !== 'number' || typeof ev?.type !== 'string') return
+      queue = queue
+        .then(() => process_([ev]))
+        .catch((e) => console.error('[pond-ingress] frame processing failed:', e?.message ?? e))
+    }
+    ws.onerror = (e: any) => console.error('[pond-ingress] ws error:', e?.message ?? 'unknown')
+    ws.onclose = (e: CloseEvent) => {
+      console.error(`[pond-ingress] disconnected (code ${e.code})`)
+      if (Date.now() - openedAt > STABLE_MS) backoff = BACKOFF_FLOOR_MS
+      finish()
+    }
+  })
+}
+
+console.error(`[pond-ingress] starting; leader=${LEADER_URL} webhook=${WEBHOOK}${EVENTS_PATH} cursor=${getCursor(db)}`)
+for (;;) {
+  await connectOnce()
+  const jitter = 0.8 + Math.random() * 0.4
+  const wait = Math.round(backoff * jitter)
+  backoff = Math.min(backoff * 2, BACKOFF_CAP_MS)
+  console.error(`[pond-ingress] reconnecting in ${wait}ms`)
+  await new Promise((r) => setTimeout(r, wait))
+}

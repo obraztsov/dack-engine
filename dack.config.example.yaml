@@ -68,6 +68,8 @@ trust_tiers:
 # webhooks:
 #   "/telegram/op":  org
 #   "/telegram/pub": public
+#   "/pond/events":  public       # leader billing/lifecycle events (pond-ingress). Platform-authored, but
+                                  #   Express is all a notification needs — seed low, cap the walk.
 
 # ── Capabilities (MCP servers) ──────────────────────────────────────────────────────────────────
 # The agent's tools. `tier` = what kind of action (read=any state · post=Express · settle=Settle).
@@ -96,6 +98,16 @@ mcp_servers:
   #   auth: { secret: memclaw, header: X-API-Key } #   → X-API-Key: <tok> (custom header ⇒ raw, no "Bearer ")
   #   tier: read                                  #   set scheme: "Token"/"" to override the prefix
   #   trust: public
+  # - name: pond-management                       # duck-as-CEO surface over the pond (leader /v1/manager).
+  #   transport: { type: stdio, command: bun, args: [run, mcp/pond-mcp.ts] }
+  #   auth: { secret: pond_manager, env: MANAGER_JWT }   # the leader credential — never model-visible
+  #   env: { POND_LEADER_URL: "http://127.0.0.1:7700" }
+  #   tier: post
+  #   trust: self
+  #   scope_env: { POND_ACTING_TG_ID: from_user_id }     # THE id-gate: the acting user's authenticated tg id,
+  #                                                      #   injected below cognition — the model has no user-id
+  #                                                      #   argument, so it can only act on the asker's agents.
+  #                                                      #   Grant in DM-woken states ONLY (never public-reply).
 
 # The operator half of the capability handshake: a state-prompt requests a server in its `mcp:`
 # frontmatter; it's admitted only if listed here. mcp_whitelist:false = an OPEN tier (the soul may also
@@ -121,6 +133,11 @@ secrets_providers:
   #   env: { TOKEN_KEY: TELEGRAM_BOT_TOKEN, TOKEN_FILE: "secrets/telegram.token" }
   #   keys: [TELEGRAM_BOT_TOKEN]
   #   trust: org
+  # - name: pond_manager                          # the leader manager JWT (mint: `leader token --scope
+  #   command: ["python3", "secrets-providers/file_token.py"]  #   duck:manager --sub dack-manager --ttl 30d`)
+  #   env: { TOKEN_KEY: MANAGER_JWT, TOKEN_FILE: "secrets/pond_manager.token" }
+  #   keys: [MANAGER_JWT]
+  #   trust: self
 
 # Env-var NAMES forwarded into the agent + sensors (values from the daemon env, never YAML). Recoverable
 # values only — a leak means rotate. The Soul DID key is NEVER here (it's a harness-only reference).
@@ -138,6 +155,10 @@ secrets:
 #     command: [bun, run, mcp/telegram-ingress.ts]
 #     secrets: [telegram_bot]
 #     env: { TELEGRAM_INGRESS_CONFIG: telegram-ingress.config.json }
+#   - name: pond-ingress                          # leader stimulus socket → duck wakes (billing events…).
+#     command: [bun, run, mcp/pond-ingress.ts]    #   Durable-journal cursor discipline: replay-then-stream.
+#     secrets: [pond_manager]
+#     env: { POND_LEADER_URL: "http://127.0.0.1:7700", INGRESS_DB: ingress.sqlite }  # same file as `ingress_db`
 
 # ── Delegated workers (Docker isolation) ─────────────────────────────────────────────────────────
 # When enabled, an agent def with `isolation: docker` runs its worker's bridge in a container. Build

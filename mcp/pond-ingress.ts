@@ -19,7 +19,7 @@
  * derived), HARNESS_WEBHOOK (default http://127.0.0.1:8787), POND_EVENTS_PATH (default /pond/events),
  * INGRESS_DB (cursor store, same file the harness injects into the MCPs).
  */
-import { leaderClient, type EventRow } from './pond-leader'
+import { leaderClient, normalizeEvent, type EventRow } from './pond-leader'
 import { getCursor, openPondStore, setCursor } from './pond-store'
 
 const LEADER_URL = (process.env.POND_LEADER_URL ?? 'http://127.0.0.1:7700').replace(/\/+$/, '')
@@ -42,21 +42,40 @@ const leader = leaderClient({ baseUrl: LEADER_URL, jwt: JWT })
 
 // ── Event → stimulus translation ────────────────────────────────────────────────────────────────
 
-/** A human line the duck can lean on + the structured facts. Unknown types → null (skip, advance). */
+/** A human line the duck can lean on + the structured facts. Events are FLAT (type-specific fields
+ *  sit beside id/type/tg_user_id/agent; `normalizeEvent` in the client flattens any legacy nested
+ *  payload). Unknown types → null (skip, advance — the leader grows types before the duck learns them). */
 function translate(ev: EventRow): Record<string, unknown> | null {
   if (!ev.tg_user_id) return null // no addressee — nothing to wake for
-  const p = (ev.payload ?? {}) as Record<string, unknown>
   let text: string
+  const extra: Record<string, unknown> = {}
   switch (ev.type) {
     case 'credits_low':
       text =
-        `Pond billing: user's agent '${ev.agent}' credits are LOW — balance ${p.balance}, daily cost ` +
-        `${p.credits_per_day}. They cannot cover another day; let them know how to top up.`
+        `Pond billing: user's agent '${ev.agent}' credits are LOW — balance ${ev.balance}, daily cost ` +
+        `${ev.credits_per_day}. They cannot cover another day; let them know how to top up.`
+      extra.balance = ev.balance ?? null
+      extra.credits_per_day = ev.credits_per_day ?? null
       break
     case 'credits_exhausted':
       text =
-        `Pond billing: user's agent '${ev.agent}' credits are EXHAUSTED — balance ${p.balance} ` +
-        `(daily cost ${p.credits_per_day}). Service is at risk; tell them how to top up.`
+        `Pond billing: user's agent '${ev.agent}' credits are EXHAUSTED — balance ${ev.balance} ` +
+        `(daily cost ${ev.credits_per_day}). Service is at risk; tell them how to top up.`
+      extra.balance = ev.balance ?? null
+      extra.credits_per_day = ev.credits_per_day ?? null
+      break
+    case 'agent_created':
+      text =
+        `Pond: user's agent '${ev.agent}' (template ${ev.template}) finished provisioning and is READY. ` +
+        `Tell them, and offer the next step (usually enter_configurator to set secrets/config).`
+      extra.template = ev.template ?? null
+      break
+    case 'agent_create_failed':
+      text =
+        `Pond: creating user's agent '${ev.agent}' (template ${ev.template}) FAILED: ${ev.error}. ` +
+        `The day-1 charge was refunded automatically. Apologize, relay the reason, suggest retrying.`
+      extra.template = ev.template ?? null
+      extra.error = ev.error ?? null
       break
     default:
       return null // forward-compat: new leader event types appear before we teach the duck about them
@@ -65,8 +84,7 @@ function translate(ev: EventRow): Record<string, unknown> | null {
     // Top-level SCALARS are load-bearing: scope_env + skill refs resolve against them.
     type: ev.type,
     agent: ev.agent,
-    balance: p.balance ?? null,
-    credits_per_day: p.credits_per_day ?? null,
+    ...extra,
     tg_user_id: ev.tg_user_id,
     from_user_id: ev.tg_user_id, // the attested addressee — what user-scoped locks key on
     chat_id: ev.tg_user_id, // DM chat == user id: destination-locks the reply to their DM
@@ -158,7 +176,7 @@ function connectOnce(): Promise<void> {
       if (typeof m.data !== 'string') return
       let ev: EventRow
       try {
-        ev = JSON.parse(m.data)
+        ev = normalizeEvent(JSON.parse(m.data))
       } catch {
         return
       }

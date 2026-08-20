@@ -34,8 +34,14 @@ All three are TypeScript companions in `mcp/`, riding existing engine seams — 
   MCP + module env only — never model context. The pond-manager duck deployment is capability-poor
   by design (no workers, no self-plugged tools beyond the vetted set), so even a fully injected duck
   has no exfiltration path for it.
-- **Not in the surface, by design**: logs, restore, migrate, delete, exec, re-bind,
-  choose-recipient, read-secret-value. Do not add tools for them (PRD §12).
+- **In the surface** (2026-08-20 leader batch; all owned-only, id-gated): async create (202 +
+  `agent_created`/`agent_create_failed` completion wake; pond-generated secrets are dropped
+  leader-side — recovered via configurator), `operation_status`, logs (text, tail-capped), manifest,
+  HTTP surfaces (a bearer surface's ONE-TIME `auth_token` is enveloped like a configurator URL),
+  self-service backup/restore (202s), and full self-decommission. **exec/setup are Kata-gated
+  leader-side** (tenant code exec needs hardware isolation; runc → 409 with a message we relay).
+- **Not in the surface, by design**: migrate, re-bind, choose-recipient, read-secret-value. Do not
+  add tools for them (PRD §12).
 
 ## Ingress: lossy fast path, durable journal
 
@@ -46,7 +52,9 @@ no double-wake (the cursor advances only on a harness 202; per-user `dedup_key` 
 the rare overlap). The leader never pings and ignores inbound frames, so the module sends a
 keepalive text frame every 30 s and reconnects on failure (jittered 1 s → 30 s backoff, forever).
 Unknown event types advance the cursor silently — the leader will grow types before the duck learns
-them.
+them. Events are **flat** (`{id, type, tg_user_id, agent, …fields}`, identical on WS and replay);
+`normalizeEvent` tolerates the legacy nested-`payload` shape. Translated today: `credits_low`,
+`credits_exhausted`, `agent_created`, `agent_create_failed`.
 
 ## Wiring (all in `dack.config.example.yaml`, commented)
 
@@ -93,10 +101,10 @@ cd ../dack-engine/mcp && bun test pond          # store + client units
 
 ## Status / next
 
-- Built + unit-tested + live-smoked vs the local leader (2026-08-19, branch `feat/pond-manager`):
-  client parity on credits/templates/agents/stranger-404/events; WS connect + replay + hold.
-- NEXT: driver-level E2E (create → configurator handle → splice), then a real DM E2E through a
-  running duck with a test bot; then the pond-manager duck's own soul (CEO persona, DM states,
-  capability-poor config) as its own artifact.
+- Built + unit-tested + live-proven vs the local leader (2026-08-19/20, branch `feat/pond-manager`):
+  driver E2E v2 all-pass — async create → operation → `agent_created` wake (DM-locked, flat),
+  kata-gate 409 relay, logs/manifest, envelope splice, stranger id-gate, decommission cleanup.
+- NEXT: a real DM E2E through a running duck with the pond test bot; then the pond-manager duck's
+  own soul (CEO persona, DM states, capability-poor config) as its own artifact.
 - Asks for the leader session: none blocking. Future event types (agent-down, backup-failed,
   setup-complete) slot into `translate()` in `pond-ingress.ts` one case each.

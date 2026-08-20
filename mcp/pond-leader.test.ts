@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from 'bun:test'
-import { LeaderError, leaderClient } from './pond-leader'
+import { LeaderError, leaderClient, normalizeEvent } from './pond-leader'
 
 // A minimal fake leader: records the last request, answers from a script.
 let last: { method: string; path: string; headers: Headers; body: string } | null = null
@@ -20,13 +20,41 @@ const base = `http://127.0.0.1:${srv.port}`
 describe('leader client', () => {
   test('data plane sends Bearer + X-Acting-Tg-Id; create never sends chat-collected secrets', async () => {
     const c = leaderClient({ baseUrl: base, jwt: 'JWT', actingTgId: '424242' })
-    respond = () => Response.json({ agent: {}, secrets: {}, balance: 3 }, { status: 201 })
-    await c.createAgent('m6a', 'whoami', { openai_base_url: 'x' })
+    respond = () =>
+      Response.json({ operation: 'op_1', agent: 'm6a', status: 'creating', balance: 3 }, { status: 202 })
+    const r = await c.createAgent('m6a', 'whoami', { openai_base_url: 'x' })
     expect(last!.method).toBe('POST')
     expect(last!.path).toBe('/v1/manager/agents')
     expect(last!.headers.get('authorization')).toBe('Bearer JWT')
     expect(last!.headers.get('x-acting-tg-id')).toBe('424242')
     expect(JSON.parse(last!.body)).toEqual({ name: 'm6a', template: 'whoami', config: { openai_base_url: 'x' }, secrets: {} })
+    expect(r).toEqual({ operation: 'op_1', agent: 'm6a', status: 'creating', balance: 3 }) // 202 async accept
+  })
+
+  test('logs is a TEXT verb (no JSON parse), tail forwarded', async () => {
+    const c = leaderClient({ baseUrl: base, jwt: 'JWT', actingTgId: '424242' })
+    respond = () => new Response('line1\nline2 {not json}\n', { status: 200 })
+    const t = await c.logs('m6a', 50)
+    expect(last!.path).toBe('/v1/manager/agents/m6a/logs?tail=50')
+    expect(t).toBe('line1\nline2 {not json}\n')
+  })
+
+  test('events are normalized flat (and legacy nested payload still flattens)', async () => {
+    const c = leaderClient({ baseUrl: base, jwt: 'JWT', actingTgId: '424242' })
+    respond = () =>
+      Response.json([
+        { id: 1, type: 'credits_low', tg_user_id: '4', agent: 'a', balance: 7, credits_per_day: 10 }, // flat (current)
+        { id: 2, type: 'agent_created', tg_user_id: '4', agent: 'b', payload: { template: 'buzz' } }, // legacy nested
+      ])
+    const evs = await c.events(0)
+    expect(evs[0]!.balance).toBe(7)
+    expect(evs[1]!.template).toBe('buzz')
+    expect('payload' in evs[1]!).toBe(false)
+  })
+
+  test('normalizeEvent: flat fields win over stale payload duplicates', () => {
+    const e = normalizeEvent({ id: 3, type: 't', tg_user_id: null, agent: null, balance: 1, payload: { balance: 99 } })
+    expect(e.balance).toBe(1)
   })
 
   test('service tier (events) omits the acting header and pages by cursor', async () => {

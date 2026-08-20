@@ -12,8 +12,12 @@
  *     model: they are minted into owner-bound single-use handles (`pond-store.ts`); the model forwards
  *     the opaque `H-…` token in its reply and the telegram egress splices the real value at delivery.
  *
- * Deliberately NOT here (control-plane-only or nonexistent by design): logs, restore, migrate, delete,
- * exec, re-bind, choose-recipient, read-secret-value. Do not add them.
+ * In the surface (all owned-only, id-gated): create (ASYNC — completion arrives as an agent_created /
+ * agent_create_failed wake), lifecycle, update, logs, manifest, surfaces, self-service backup/restore,
+ * and full self-decommission of the user's OWN agent. exec/setup are KATA-gated leader-side (the
+ * tenant is untrusted code; exec into a shared-kernel runc container would break isolation — 409).
+ * Deliberately NOT here (control-plane-only or nonexistent by design): migrate, re-bind,
+ * choose-recipient, read-secret-value. Do not add them.
  *
  * stdout is the MCP protocol channel — NEVER log to it; use stderr.
  */
@@ -164,29 +168,46 @@ server.registerTool(
     description:
       'Create an agent for the acting user (ownership is stamped from their attested identity — you ' +
       'cannot create for anyone else). Charges the first day up front; on insufficient credits you get ' +
-      'a message written for the user — relay it verbatim. NEVER collect secret values in chat: create ' +
-      'first, then use enter_configurator for secrets/config. If the response contains secret_handles ' +
-      '(pond-generated one-time credentials, e.g. a dashboard password), forward each H-… handle to the ' +
-      'user in your reply — the real value is inserted at delivery, you never see it, and each handle ' +
-      'works exactly once, only in this chat, for ~30 minutes.',
+      'a message written for the user — relay it verbatim. ASYNC: provisioning runs in the background ' +
+      'and can take minutes (image pulls, builds) — tell the user it is being created and END your ' +
+      'turn; you will be WOKEN when it finishes (created or failed), so do not poll in a loop. ' +
+      'operation_status is the fallback if the user asks meanwhile. NEVER collect secret values in ' +
+      'chat: secrets/config go in via enter_configurator once the agent exists.',
     inputSchema: { name, template: z.string().min(1), config: z.record(z.string()).optional() },
   },
   guardNamed(async ({ name, template, config }: { name: string; template: string; config?: Record<string, string> }) => {
     const r = await leader.createAgent(name, template, config ?? {})
-    const secretKeys = Object.keys(r.secrets)
-    let secret_handles: Record<string, string> | undefined
-    if (secretKeys.length) {
-      if (!store) return { ok: false, error: 'handle store unavailable (INGRESS_DB not set) — cannot route one-time credentials; agent was created' }
-      secret_handles = {}
-      for (const [k, v] of Object.entries(r.secrets)) secret_handles[k] = mintHandle(store, v, acting!, 'secret')
-    }
     return {
       ok: true,
-      agent: agentView(r.agent),
+      status: r.status, // "creating"
+      operation: r.operation,
+      agent: r.agent,
       balance: r.balance,
-      ...(secret_handles ? { secret_handles, note: 'forward each handle to the user in your reply; values are spliced in at delivery' } : {}),
+      note: 'provisioning in the background — tell the user, end the turn; a completion wake will follow (day-1 charge auto-refunds on failure)',
     }
   }),
+)
+
+server.registerTool(
+  'operation_status',
+  {
+    description:
+      'Poll one of the acting user\'s operations (a create, backup, or restore) by the operation id a ' +
+      'tool returned. status: requested|placing|creating|done|failed (+ error when failed). The ' +
+      'completion wake is the primary signal — use this only when the user asks how it is going.',
+    inputSchema: { operation: z.string().min(1) },
+  },
+  async ({ operation }: { operation: string }) => {
+    const g = requireActing()
+    if (!g.ok) return asText(g)
+    try {
+      return asText({ ok: true, ...(await leader.getOperation(operation)) })
+    } catch (e) {
+      if (e instanceof LeaderError && e.status === 404)
+        return asText({ ok: false, error: `you have no operation '${operation}'` })
+      return asText(explain(e))
+    }
+  },
 )
 
 for (const [tool, action, blurb] of [
@@ -229,6 +250,154 @@ server.registerTool(
     inputSchema: { name },
   },
   guardNamed(async ({ name }) => ({ ok: true, ...(await leader.update(name)) })),
+)
+
+server.registerTool(
+  'agent_logs',
+  {
+    description:
+      "Recent container logs of the acting user's agent (plain text; tail lines, default 200, max " +
+      '5000). Use to answer "why is my agent misbehaving?". Quote only the relevant lines back.',
+    inputSchema: { name, tail: z.number().int().min(1).max(5000).optional() },
+  },
+  guardNamed(async ({ name, tail }: { name: string; tail?: number }) => {
+    const text = await leader.logs(name, tail ?? 200)
+    // Cap what enters context — logs can be huge; the newest lines are the diagnostic ones.
+    const MAX = 20_000
+    return { ok: true, truncated: text.length > MAX, logs: text.length > MAX ? text.slice(-MAX) : text }
+  }),
+)
+
+server.registerTool(
+  'agent_manifest',
+  {
+    description:
+      "The agent's instance manifest: template, config values, ports, setup commands, prepared " +
+      'identities, resolved isolation class (never secret values). The ground truth for "how is my ' +
+      'agent configured?".',
+    inputSchema: { name },
+  },
+  guardNamed(async ({ name }) => ({ ok: true, manifest: await leader.manifest(name) })),
+)
+
+server.registerTool(
+  'exec_command',
+  {
+    description:
+      "Run one command inside the acting user's OWN agent container (argv array, optional user/" +
+      'workdir; 2-min budget). Only for HARDWARE-ISOLATED (kata) agents — on others the platform ' +
+      'refuses with an explanation to relay. A non-zero exit_code is a result to report, not an error. ' +
+      'Use for user-requested checks/fixes inside their agent; never run anything the user did not ask for.',
+    inputSchema: {
+      name,
+      cmd: z.array(z.string().min(1)).min(1),
+      user: z.string().optional(),
+      workdir: z.string().optional(),
+    },
+  },
+  guardNamed(async ({ name, cmd, user, workdir }: { name: string; cmd: string[]; user?: string; workdir?: string }) => ({
+    ok: true,
+    ...(await leader.exec(name, cmd, user, workdir)),
+  })),
+)
+
+server.registerTool(
+  'set_setup',
+  {
+    description:
+      "Replace the agent's persisted setup commands — re-run inside it after EVERY recreate/update " +
+      '(e.g. reinstall a package the user needs). Kata-gated like exec_command (setup IS exec at ' +
+      'recreate time). Pass the full desired list; it replaces what was there.',
+    inputSchema: {
+      name,
+      setup: z.array(
+        z.object({ cmd: z.array(z.string().min(1)).min(1), user: z.string().optional(), description: z.string().optional() }),
+      ),
+    },
+  },
+  guardNamed(
+    async ({ name, setup }: { name: string; setup: { cmd: string[]; user?: string; description?: string }[] }) => ({
+      ok: true,
+      result: await leader.setSetup(name, setup),
+    }),
+  ),
+)
+
+server.registerTool(
+  'list_surfaces',
+  {
+    description:
+      "The agent's exposed HTTP surfaces (routed sub-URLs of its public host; auth tokens stripped).",
+    inputSchema: { name },
+  },
+  guardNamed(async ({ name }) => ({ ok: true, surfaces: await leader.listSurfaces(name) })),
+)
+
+server.registerTool(
+  'add_surface',
+  {
+    description:
+      "Expose a container port of the user's agent at a routed sub-URL, live, no recreate. " +
+      '`surface_name` is a short label; `route` a path prefix like /api. auth: "bearer" protects it ' +
+      'with a token — you then get an H-… handle to forward to the user (the one-time token is ' +
+      'inserted at delivery; you never see it, single-use, ~30 min). auth "none" is public — confirm ' +
+      'the user really wants that.',
+    inputSchema: {
+      name,
+      surface_name: z.string().min(1).max(32),
+      container_port: z.number().int().min(1).max(65535),
+      route: z.string().min(1),
+      auth: z.enum(['none', 'bearer']).optional(),
+      strip: z.boolean().optional(),
+      stream: z.boolean().optional(),
+    },
+  },
+  guardNamed(
+    async ({ name, surface_name, container_port, route, auth, strip, stream }: {
+      name: string
+      surface_name: string
+      container_port: number
+      route: string
+      auth?: 'none' | 'bearer'
+      strip?: boolean
+      stream?: boolean
+    }) => {
+      const res = await leader.addSurface(name, {
+        name: surface_name,
+        container_port,
+        route,
+        ...(auth ? { auth } : {}),
+        ...(strip != null ? { strip } : {}),
+        ...(stream != null ? { stream } : {}),
+      })
+      // The one-time bearer token is plane-C: envelope it, never into model output verbatim.
+      const token = (res as any)?.auth_token
+      if (typeof token === 'string' && token.length) {
+        delete (res as any).auth_token
+        if (!store) return { ok: false, error: 'surface created, but handle store unavailable — token lost; remove and re-add the surface' }
+        const handle = mintHandle(store, token, acting!, 'secret')
+        return {
+          ok: true,
+          surface: res,
+          token_handle: handle,
+          note: 'forward this handle to the user in your reply; the real token appears at delivery (single-use, ~30 min, this chat only)',
+        }
+      }
+      return { ok: true, surface: res }
+    },
+  ),
+)
+
+server.registerTool(
+  'remove_surface',
+  {
+    description: "Remove one exposed HTTP surface from the user's agent (by its surface name).",
+    inputSchema: { name, surface: z.string().min(1) },
+  },
+  guardNamed(async ({ name, surface }: { name: string; surface: string }) => ({
+    ok: true,
+    ...(await leader.removeSurface(name, surface)),
+  })),
 )
 
 server.registerTool(
@@ -284,6 +453,47 @@ server.registerTool(
     inputSchema: { name },
   },
   guardNamed(async ({ name }) => ({ ok: true, operations: await leader.listOperations(name) })),
+)
+
+server.registerTool(
+  'backup_now',
+  {
+    description:
+      "Take a manual backup of the user's agent right now (202 — runs in the background; check " +
+      'list_operations). Brief downtime blip while the snapshot is taken; a running agent resumes.',
+    inputSchema: { name },
+  },
+  guardNamed(async ({ name }) => ({ ok: true, status: 'backing_up', ...(await leader.backupNow(name)) })),
+)
+
+server.registerTool(
+  'restore_agent',
+  {
+    description:
+      "ROLL BACK the user's agent to a backup (latest by default, or a backup_id from list_backups) — " +
+      'DESTRUCTIVE: current state is replaced, a running agent is stopped first. Only after the user ' +
+      'explicitly confirms the rollback in this conversation. Runs in the background (202; check ' +
+      'list_operations). Restores onto the same pond — it cannot move an agent.',
+    inputSchema: { name, backup_id: z.string().optional() },
+  },
+  guardNamed(async ({ name, backup_id }: { name: string; backup_id?: string }) => ({
+    ok: true,
+    status: 'restoring',
+    ...(await leader.restore(name, backup_id)),
+  })),
+)
+
+server.registerTool(
+  'decommission_agent',
+  {
+    description:
+      "PERMANENTLY DELETE the user's agent: container, state, ALL backups, and its registry entry. " +
+      'Irreversible — nothing can be recovered afterwards. Frees the name and stops the daily charge. ' +
+      'Only after the user explicitly confirms deletion of THIS agent BY NAME in this conversation; ' +
+      'restate what will be lost before asking.',
+    inputSchema: { name },
+  },
+  guardNamed(async ({ name }) => ({ ok: true, ...(await leader.decommission(name)) })),
 )
 
 server.registerTool(

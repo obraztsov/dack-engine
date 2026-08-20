@@ -32,7 +32,20 @@ export type AgentRow = {
   updated_at: string
 }
 
-export type CreateResponse = { agent: AgentRow; secrets: Record<string, string>; balance: number | null }
+/** Create is ASYNC (202): validate + charge synchronously (credit refusals are immediate 409), then
+ *  provision in the background. Completion arrives as an `agent_created` / `agent_create_failed`
+ *  journaled event; `GET /operations/{id}` is the durable fallback. Pond-generated one-time secrets
+ *  are NOT returned — they surface through the configurator instead. */
+export type CreateAccepted = { operation: string; agent: string; status: string; balance: number | null }
+export type Operation = {
+  operation: string
+  kind: string
+  status: string // requested | placing | creating | done | failed
+  phase: string
+  agent: string | null
+  error: string | null
+  updated_at: string
+}
 export type AgentDetail = { registry: AgentRow; pond: unknown | null }
 export type UpdateResponse = {
   agent: string
@@ -65,13 +78,22 @@ export type Credits = {
   days_left: number | null
   ledger: { delta: number; balance_after: number; reason: string; created_at: string }[]
 }
+/** Events are FLAT: `{id, type, tg_user_id, agent, …type-specific fields…}` — identical shape on the
+ *  WS fast path and the `/events` replay (replay adds `created_at`), so dedupe-by-id is trivial.
+ *  `normalizeEvent` also tolerates the legacy nested-`payload` shape from a pre-flatten leader. */
 export type EventRow = {
   id: number
   type: string
   tg_user_id: string | null
   agent: string | null
-  payload: Record<string, unknown> | null
-  created_at: string
+  created_at?: string
+  [field: string]: unknown
+}
+
+export function normalizeEvent(raw: Record<string, unknown>): EventRow {
+  const { payload, ...rest } = raw
+  const flat = { ...(payload && typeof payload === 'object' ? (payload as object) : {}), ...rest }
+  return flat as EventRow
 }
 
 export class LeaderError extends Error {
@@ -98,7 +120,7 @@ export function leaderClient(opts?: { baseUrl?: string; jwt?: string; actingTgId
   async function request<T>(
     method: string,
     path: string,
-    o?: { body?: unknown; acting?: boolean; timeoutMs?: number },
+    o?: { body?: unknown; acting?: boolean; timeoutMs?: number; text?: boolean },
   ): Promise<T> {
     if (!jwt) throw new LeaderError(0, 'config', 'MANAGER_JWT not set — pond management unavailable')
     const headers: Record<string, string> = { Authorization: `Bearer ${jwt}` }
@@ -124,6 +146,17 @@ export function leaderClient(opts?: { baseUrl?: string; jwt?: string; actingTgId
     } catch (e: any) {
       throw new LeaderError(0, 'unreachable', `leader unreachable: ${e?.message ?? e}`)
     }
+    if (o?.text) {
+      const t = await r.text()
+      if (!r.ok) {
+        let j: any = null
+        try {
+          j = JSON.parse(t)
+        } catch {}
+        throw new LeaderError(r.status, j?.error?.code ?? 'http', j?.error?.message ?? `leader returned ${r.status}`)
+      }
+      return t as unknown as T
+    }
     const j: any = await r.json().catch(() => null)
     if (!r.ok) {
       const code = j?.error?.code ?? 'http'
@@ -145,7 +178,8 @@ export function leaderClient(opts?: { baseUrl?: string; jwt?: string; actingTgId
     // ── data plane (acting header) ────────────────────────────────────────────
     createAgent: (name: string, template: string, config: Record<string, string> = {}) =>
       // secrets ALWAYS {} — secret values are never collected in chat; they go in via the configurator.
-      request<CreateResponse>('POST', '/agents', { body: { name, template, config, secrets: {} } }),
+      request<CreateAccepted>('POST', '/agents', { body: { name, template, config, secrets: {} } }),
+    getOperation: (id: string) => request<Operation>('GET', `/operations/${id}`),
     listAgents: (state?: string, template?: string) => request<AgentRow[]>('GET', `/agents${qs({ state, template })}`),
     getAgent: (name: string) => request<AgentDetail>('GET', `/agents/${name}`),
     lifecycle: (name: string, action: LifecycleAction) => request<AgentRow>('POST', `/agents/${name}/${action}`),
@@ -160,6 +194,31 @@ export function leaderClient(opts?: { baseUrl?: string; jwt?: string; actingTgId
       request<{ ok: boolean; agent: string }>('POST', `/agents/${name}/configurator/cancel`),
     listBackups: (name: string) => request<BackupRow[]>('GET', `/agents/${name}/backups`),
     listOperations: (name: string) => request<OperationRow[]>('GET', `/agents/${name}/operations`), // last 20
+    // ── host-level ops on the tenant's own agent ──────────────────────────────
+    logs: (name: string, tail = 200) =>
+      request<string>('GET', `/agents/${name}/logs${qs({ tail })}`, { text: true }), // plain text, not JSON
+    manifest: (name: string) => request<Record<string, unknown>>('GET', `/agents/${name}/manifest`),
+    // exec/setup are KATA-gated leader-side (409 on runc — tenant code exec needs hardware isolation).
+    exec: (name: string, cmd: string[], user?: string, workdir?: string) =>
+      request<{ stdout: string; stderr: string; exit_code: number }>('POST', `/agents/${name}/exec`, {
+        body: { cmd, ...(user ? { user } : {}), ...(workdir ? { workdir } : {}) },
+        timeoutMs: 120_000,
+      }),
+    setSetup: (name: string, setup: { cmd: string[]; user?: string; description?: string }[]) =>
+      request<Record<string, unknown>>('PUT', `/agents/${name}/setup`, { body: { setup } }),
+    listSurfaces: (name: string) => request<unknown[]>('GET', `/agents/${name}/surfaces`),
+    // With auth:bearer the response carries a ONE-TIME auth_token — plane-C, handle-store it.
+    addSurface: (name: string, surface: Record<string, unknown>) =>
+      request<Record<string, unknown>>('POST', `/agents/${name}/surface`, { body: surface }),
+    removeSurface: (name: string, surface: string) =>
+      request<{ removed: unknown }>('DELETE', `/agents/${name}/surface/${surface}`),
+    backupNow: (name: string) => request<{ operation: string; agent: string }>('POST', `/agents/${name}/backup`),
+    restore: (name: string, backupId?: string) =>
+      request<{ operation: string; agent: string }>('POST', `/agents/${name}/restore`, {
+        body: backupId ? { backup_id: backupId } : {},
+      }),
+    decommission: (name: string) =>
+      request<{ outcome: string; agent: string }>('DELETE', `/agents/${name}`),
     setBackupPolicy: (name: string, windowStart: number, windowEnd: number, retention?: number) =>
       request<AgentRow>('PUT', `/agents/${name}/backup-policy`, {
         body: { window_start: windowStart, window_end: windowEnd, ...(retention != null ? { retention } : {}) },
@@ -168,7 +227,9 @@ export function leaderClient(opts?: { baseUrl?: string; jwt?: string; actingTgId
     listTemplates: () => request<TemplateRow[]>('GET', '/templates'), // [] can mean "no pond seen in 180s"
     credits: () => request<Credits>('GET', '/credits'),
     // ── service tier (no acting header) ───────────────────────────────────────
-    events: (after: number, limit = 500) =>
-      request<EventRow[]>('GET', `/events${qs({ after, limit })}`, { acting: false }),
+    events: async (after: number, limit = 500) =>
+      (await request<Record<string, unknown>[]>('GET', `/events${qs({ after, limit })}`, { acting: false })).map(
+        normalizeEvent,
+      ),
   }
 }

@@ -40,6 +40,12 @@ pub struct SensorCandidate {
     pub dedup_key: Option<String>,
     #[serde(default)]
     pub payload_tier: Option<TrustTier>,
+    /// **Cursor-only**: advance the duty's watermark PAST this item's `cursor.field`, but do NOT enqueue a
+    /// wake for it. A sensor emits this for a tweet it deliberately DROPS (e.g. `twitter-mentions` skipping a
+    /// reply inside the duck's own thread — `twitter-thread-replies` owns it) so the cursor still covers it and
+    /// it can never be re-surfaced as a "new" item when it later falls out of the sensor's own drop-filter.
+    #[serde(default)]
+    pub cursor_only: bool,
 }
 
 /// Whether a stimulus's script reference is honored, by the directive's trust tier.

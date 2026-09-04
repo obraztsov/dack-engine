@@ -59,6 +59,7 @@ impl Bus {
                 payload,
                 dedup_key,
                 payload_tier: cand_tier,
+                cursor_only: _, // filtered out before the bus (advances the cursor only, never a wake)
             } = c;
             // The source assigns the tier; a sensor may only *LOWER* it. A candidate claiming a tier
             // above the source-derived `payload_seed` is clamped down (the taint `meet`) — closing a
@@ -300,6 +301,7 @@ mod tests {
             payload: json!({ "text": text }),
             dedup_key: Some(key.into()),
             payload_tier: None,
+            cursor_only: false,
         }
     }
 
@@ -310,6 +312,7 @@ mod tests {
             payload: json!({ "chat_id": chat, "message_id": msg, "text": text }),
             dedup_key: Some(chat.to_string()), // the THREAD key (per-chat), not per-message
             payload_tier: None,
+            cursor_only: false,
         }
     }
 
@@ -495,6 +498,7 @@ mod tests {
             payload: json!({ "text": "trust me" }),
             dedup_key: None,
             payload_tier: Some(TrustTier::operator()),
+            cursor_only: false,
         };
         // Seed = self; the candidate's operator claim is clamped DOWN to the seed (the meet).
         b.ingest(&def, vec![candidate], 1000, TrustTier::self_()).await.unwrap();

@@ -19,7 +19,8 @@
  * derived), HARNESS_WEBHOOK (default http://127.0.0.1:8787), POND_EVENTS_PATH (default /pond/events),
  * INGRESS_DB (cursor store, same file the harness injects into the MCPs).
  */
-import { leaderClient, normalizeEvent, type EventRow } from './pond-leader'
+import { openIngressStore, markReferralApplied, pendingReferrals } from './ingress-store'
+import { leaderClient, normalizeEvent, TERMINAL_REDEEM_REASONS, type EventRow } from './pond-leader'
 import { getCursor, openPondStore, setCursor } from './pond-store'
 
 const LEADER_URL = (process.env.POND_LEADER_URL ?? 'http://127.0.0.1:7700').replace(/\/+$/, '')
@@ -77,6 +78,29 @@ function translate(ev: EventRow): Record<string, unknown> | null {
       extra.template = ev.template ?? null
       extra.error = ev.error ?? null
       break
+    case 'agent_suspended':
+      text =
+        `Pond billing: user's agent '${ev.agent}' was SUSPENDED (paused) — balance ${ev.balance}, next ` +
+        `day needs ${ev.needed}. Nothing is lost and nothing is charged while paused; it auto-resumes ` +
+        `on the tick after they top up. Tell them plainly and say how to top up.`
+      extra.balance = ev.balance ?? null
+      extra.needed = ev.needed ?? null
+      break
+    case 'agent_resumed':
+      text =
+        `Pond billing: user's agent '${ev.agent}' auto-RESUMED after top-up — balance ${ev.balance}, ` +
+        `daily cost ${ev.credits_per_day}. Let them know it's back.`
+      extra.balance = ev.balance ?? null
+      extra.credits_per_day = ev.credits_per_day ?? null
+      break
+    case 'referral_redeemed':
+      // Lands on the REFERRER's tg: someone they invited just joined.
+      text =
+        `Pond referral: someone joined through this user's referral link — they earned ` +
+        `${ev.credits_earned} credits (balance now ${ev.balance}). Congratulate them briefly.`
+      extra.credits_earned = ev.credits_earned ?? null
+      extra.balance = ev.balance ?? null
+      break
     default:
       return null // forward-compat: new leader event types appear before we teach the duck about them
   }
@@ -94,13 +118,8 @@ function translate(ev: EventRow): Record<string, unknown> | null {
   }
 }
 
-/** Deliver one event into the duck's bus. True ⇒ the harness accepted it (202) or it needs no wake. */
-async function deliver(ev: EventRow): Promise<boolean> {
-  const body = translate(ev)
-  if (!body) {
-    if (!ev.tg_user_id) console.error(`[pond-ingress] event ${ev.id} (${ev.type}) has no tg_user_id — skipped`)
-    return true
-  }
+/** POST one wake body into the duck's bus. True ⇒ the harness accepted it (202). */
+async function postWake(body: Record<string, unknown>, label: string): Promise<boolean> {
   try {
     const r = await fetch(`${WEBHOOK}${EVENTS_PATH}`, {
       method: 'POST',
@@ -109,12 +128,22 @@ async function deliver(ev: EventRow): Promise<boolean> {
       signal: AbortSignal.timeout(10_000),
     })
     if (r.status === 202) return true
-    console.error(`[pond-ingress] harness webhook ${EVENTS_PATH} → ${r.status} (event ${ev.id})`)
+    console.error(`[pond-ingress] harness webhook ${EVENTS_PATH} → ${r.status} (${label})`)
     return false
   } catch (e: any) {
-    console.error(`[pond-ingress] harness webhook unreachable (event ${ev.id}): ${e?.message ?? e}`)
+    console.error(`[pond-ingress] harness webhook unreachable (${label}): ${e?.message ?? e}`)
     return false
   }
+}
+
+/** Deliver one event into the duck's bus. True ⇒ the harness accepted it (202) or it needs no wake. */
+async function deliver(ev: EventRow): Promise<boolean> {
+  const body = translate(ev)
+  if (!body) {
+    if (!ev.tg_user_id) console.error(`[pond-ingress] event ${ev.id} (${ev.type}) has no tg_user_id — skipped`)
+    return true
+  }
+  return postWake(body, `event ${ev.id}`)
 }
 
 /** Process in id order; stop (and DON'T advance) on the first delivery failure — replay resumes there. */
@@ -137,6 +166,52 @@ async function replay(): Promise<void> {
     if (page.length < 500) return
   }
 }
+
+// ── Referral auto-redeem (Phase 4, handoff 2026-08-27) — BELOW COGNITION ─────────────────────────
+// The telegram ingress captures `?start=<code>` deep-link opens first-touch into the shared ingress
+// store. This loop drains the pending rows: redeem against the leader with THAT user's identity (the
+// code comes from the captured param, never model text), mark applied on any decided outcome
+// (thrown = transient → stays pending, retried next tick; both sides are idempotent), and on a grant
+// wake the duck to welcome the new user with their bonus. The model never sees a code it didn't earn.
+
+const ingressDb = openIngressStore(DB_PATH) // same file as the pond store; creates the referrals table
+const REDEEM_TICK_MS = 20_000
+
+async function redeemTick(): Promise<void> {
+  for (const ref of pendingReferrals(ingressDb, 20)) {
+    const user = leaderClient({ baseUrl: LEADER_URL, jwt: JWT, actingTgId: ref.user_id })
+    try {
+      const r = await user.redeemReferral(ref.param)
+      markReferralApplied(ingressDb, ref.user_id) // decided either way — stop retrying
+      if (r.redeemed) {
+        console.error(`[pond-ingress] referral ${ref.param} redeemed for ${ref.user_id}: +${r.referee_bonus}`)
+        await postWake(
+          {
+            type: 'referral_welcome',
+            referee_bonus: r.referee_bonus,
+            balance: r.balance,
+            plan: r.plan,
+            tg_user_id: ref.user_id,
+            from_user_id: ref.user_id,
+            chat_id: ref.chat_id, // the DM the /start arrived in
+            dedup_key: String(ref.user_id),
+            text:
+              `Pond referral: this user's invite code was accepted — they received ${r.referee_bonus} ` +
+              `credits (balance ${r.balance}). Welcome them warmly and mention the credits.`,
+          },
+          `referral ${ref.user_id}`,
+        )
+      } else {
+        const tone = TERMINAL_REDEEM_REASONS.has(r.reason) ? '' : ' (unexpected reason)'
+        console.error(`[pond-ingress] referral ${ref.param} for ${ref.user_id}: ${r.reason}${tone} — quiet`)
+      }
+    } catch (e: any) {
+      // Transient (network/5xx): leave pending, the next tick retries. Redeem is idempotent.
+      console.error(`[pond-ingress] referral redeem transient failure for ${ref.user_id}: ${e?.message ?? e}`)
+    }
+  }
+}
+setInterval(() => void redeemTick().catch((e) => console.error('[pond-ingress] redeem tick:', e)), REDEEM_TICK_MS)
 
 // ── The socket loop ──────────────────────────────────────────────────────────────────────────────
 

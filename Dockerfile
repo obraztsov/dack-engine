@@ -4,8 +4,10 @@
 #
 # Build (a DEPLOY step — the harness never builds images at runtime; build native amd64 on the VPS):
 #   docker build -t dack/duck:latest .
-# Run one duck (outbound-only: telegram long-polls, the webhook is 127.0.0.1 inside the box → NO -p):
-#   docker run -d --name <duck> --restart unless-stopped --cpus 2 --memory 3g \
+# Run one duck (outbound-only: telegram long-polls, the webhook is 127.0.0.1 inside the box → NO -p).
+# `--init` is REQUIRED: `dack run` is otherwise PID 1, and the bridge's orphans (MCP bun servers, git)
+# reparent to it on every cycle's kill_on_drop → they zombie forever (dack only reaps its own children):
+#   docker run -d --init --name <duck> --restart unless-stopped --cpus 2 --memory 3g \
 #     -v /srv/ducks/<duck>:/duck dack/duck:latest
 #
 # REBUILD after any change to src/ (harness), openclaude-bridge (the runtime bridge), mcp/, or recall-mcp

@@ -49,3 +49,4 @@ docs/internal/
 
 # runtime media store (harness-owned; also created here when a dev run uses cwd-relative media_dir)
 /media/
+pond-e2e/

@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from 'bun:test'
-import { LeaderError, leaderClient, normalizeEvent } from './pond-leader'
+import { AGENT_NAME_RE, LeaderError, leaderClient, normalizeEvent } from './pond-leader'
 
 // A minimal fake leader: records the last request, answers from a script.
 let last: { method: string; path: string; headers: Headers; body: string } | null = null
@@ -90,6 +90,26 @@ describe('leader client', () => {
       expect((e as LeaderError).code).toBe('conflict')
       expect((e as LeaderError).message).toBe("insufficient credits: balance 0, first day of 'whoami' costs 10")
     }
+  })
+
+  test('agent name rule tracks the leader (DNS label: 1-31, no trailing hyphen)', () => {
+    for (const good of ['a', 'm6a', 'my-agent-2', 'x'.repeat(31)]) expect(AGENT_NAME_RE.test(good)).toBe(true)
+    for (const bad of ['', '-a', 'a-', 'A1', 'a_b', 'x'.repeat(32)]) expect(AGENT_NAME_RE.test(bad)).toBe(false)
+  })
+
+  test('referral verbs: redeem posts the captured code with the acting header; my link is a GET', async () => {
+    const c = leaderClient({ baseUrl: base, jwt: 'JWT', actingTgId: '80375347' })
+    respond = () => Response.json({ redeemed: false, reason: 'already_redeemed' })
+    const r = await c.redeemReferral('launch1000')
+    expect(last!.method).toBe('POST')
+    expect(last!.path).toBe('/v1/manager/referral/redeem')
+    expect(last!.headers.get('x-acting-tg-id')).toBe('80375347')
+    expect(JSON.parse(last!.body)).toEqual({ code: 'launch1000' })
+    expect(r).toEqual({ redeemed: false, reason: 'already_redeemed' })
+    respond = () => Response.json({ code: 'r_x', link: 'https://t.me/B?start=r_x', referred_count: 1, credits_earned: 30, redeemed_welcome: true })
+    const m = await c.myReferral()
+    expect(last!.path).toBe('/v1/manager/referral')
+    expect(m.code).toBe('r_x')
   })
 
   test('unreachable leader → code "unreachable" (not an exception leak)', async () => {

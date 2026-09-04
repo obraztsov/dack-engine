@@ -99,13 +99,16 @@ impl Ingestor {
                     payload,
                     dedup_key,
                     payload_tier: None,
+                    cursor_only: false,
                 }]
             }
         };
 
         // Advance the watermark to the newest discovered item, at DISCOVERY time (so a later
         // processing failure never re-discovers it — a mention is "seen" once; we don't risk a
-        // double-reply by retrying). Empty poll → no candidate carries the field → no change.
+        // double-reply by retrying). Empty poll → no candidate carries the field → no change. This runs over
+        // ALL candidates — INCLUDING `cursor_only` ones — so a sensor can advance the cursor past an item it
+        // deliberately drops (the fix for the twitter-mentions ⇄ thread-replies double-reply).
         if let Some(cur) = &def.frontmatter.cursor {
             if let Some(mark) = watermark(&candidates, &cur.field) {
                 self.queue
@@ -113,6 +116,10 @@ impl Ingestor {
                     .await?;
             }
         }
+
+        // `cursor_only` candidates advanced the watermark above; they must NOT become wakes. Drop them before
+        // the bus so they're never enqueued (a dropped-but-cursor-covered item, e.g. an own-thread reply).
+        let candidates: Vec<SensorCandidate> = candidates.into_iter().filter(|c| !c.cursor_only).collect();
 
         // The cycle's PAYLOAD trust seed: derived from the SOURCE (a signed sensor script
         // met with its sensor-secret tiers, a registered webhook tier, or a pure-cron `self`). The
@@ -331,6 +338,51 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    #[tokio::test]
+    async fn cursor_only_candidate_advances_the_watermark_but_is_not_enqueued() {
+        // The twitter-mentions ⇄ thread-replies double-reply fix: a sensor drops an item (an own-thread
+        // reply) yet still advances the cursor PAST it via `cursor_only`, so it can never be re-surfaced.
+        let root = std::env::temp_dir().join(format!("dack-ingest-curonly-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        write_exec(
+            &root.join("stimuli/curtest/scripts/emit.sh"),
+            "#!/bin/sh\n\
+             printf '{\"type\":\"mention\",\"payload\":{\"id\":\"100\",\"text\":\"real\"},\"dedup_key\":\"c100\"}\\n'\n\
+             printf '{\"type\":\"mention\",\"payload\":{\"id\":\"200\"},\"cursor_only\":true}\\n'\n",
+        );
+        std::fs::write(
+            root.join("stimuli/curtest/STIMULUS.md"),
+            "---\nid: curtest\ntrigger: { type: cron, schedule: \"* * * * *\" }\n\
+             sensor: ./scripts/emit.sh\ndirective_tier: self\n\
+             emits:\n  type: mention\n\
+             coalesce: { mode: none }\n\
+             cursor: { field: id, env: SINCE }\n\
+             entry: perceive\n---\nPoll.\n",
+        )
+        .unwrap();
+        let config = Arc::new(DackConfig::from_yaml("operator_did: \"did:key:zOp\"").unwrap());
+        let queue: Arc<dyn crate::queue::Queue> = Arc::new(SqliteQueue::open_in_memory().unwrap());
+        let ingestor = Ingestor {
+            repo_root: root.clone(),
+            config: config.clone(),
+            bus: Arc::new(Bus::new(config, queue.clone())),
+            queue: queue.clone(),
+            sensor: Arc::new(SubprocessSensor::new()),
+            broker: Arc::new(SecretsBroker::new_test(vec![])),
+            registry: Arc::new(RwLock::new(Registry::load(&root).unwrap())),
+        };
+        let ids = ingestor
+            .process(FiredTrigger { def_id: "curtest".into(), payload: vec![] }, 1000)
+            .await
+            .unwrap();
+        // Only the REAL mention becomes a wake; the cursor_only item is NOT enqueued.
+        assert_eq!(ids.len(), 1, "cursor_only candidate is not a wake");
+        assert_eq!(queue.depth().await.unwrap(), 1, "exactly one row queued (the real mention)");
+        // …but the watermark advanced PAST the (newer) cursor_only item — so it can never be re-surfaced.
+        assert_eq!(queue.get_cursor("curtest").await.unwrap().as_deref(), Some("200"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// A webhook duty (no sensor, POSTed body IS the payload — exactly like `telegram-pub`).
     fn webhook_ingestor(root: &std::path::Path) -> (Ingestor, Arc<dyn crate::queue::Queue>) {
         std::fs::remove_dir_all(root).ok();
@@ -438,6 +490,7 @@ mod tests {
             payload: serde_json::json!({ "id": id }),
             dedup_key: None,
             payload_tier: None,
+            cursor_only: false,
         };
         // Numeric max (a snowflake id), NOT lexical: "100" > "99" numerically though "99" wins lexically.
         assert_eq!(watermark(&[c("99"), c("100"), c("250")], "id").as_deref(), Some("250"));

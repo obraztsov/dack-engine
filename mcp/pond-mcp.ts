@@ -42,6 +42,9 @@ function agentView(a: AgentRow) {
     desired_state: a.desired_state,
     observed_state: a.observed_state,
     observed_at: a.observed_at,
+    // paused + suspended = credit-suspended (auto-resumes on top-up, not charged meanwhile);
+    // paused + !suspended = the user paused it themselves (also free, never auto-resumed).
+    suspended: a.suspended ?? false,
     backup_window:
       a.backup_window_start != null && a.backup_window_end != null
         ? `${a.backup_window_start}:00-${a.backup_window_end}:00 UTC (retention ${a.backup_retention})`
@@ -100,6 +103,25 @@ const guardNamed =
 
 const server = new McpServer({ name: 'pond-management', version: '0.1.0' })
 const name = z.string().regex(AGENT_NAME_RE, 'lowercase letters/digits/hyphens, starts alphanumeric, ≤32 chars')
+
+server.registerTool(
+  'my_referral_link',
+  {
+    description:
+      "The acting user's personal referral link and stats — for \"how do I invite friends?\". Sharing " +
+      'it earns them credits when someone joins through it. Returns {code, link, referred_count, ' +
+      'credits_earned}. The link is theirs to share publicly — paste it in your reply as-is.',
+    inputSchema: {},
+  },
+  guard(async () => {
+    const r = await leader.myReferral()
+    // The leader builds the link from ITS configured bot; in a deployment fronted by a different bot,
+    // POND_BOT_USERNAME (operator-set static env) rebuilds it against the bot the user actually talks to.
+    const bot = process.env.POND_BOT_USERNAME?.replace(/^@/, '')
+    const link = bot ? `https://t.me/${bot}?start=${r.code}` : r.link
+    return { ok: true, code: r.code, link, referred_count: r.referred_count, credits_earned: r.credits_earned }
+  }),
+)
 
 server.registerTool(
   'credits',

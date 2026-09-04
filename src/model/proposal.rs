@@ -84,6 +84,50 @@ where
     }))
 }
 
+/// Lenient `tag_notes` deserializer for MODEL output — a sticky note is disposable, the cycle is not.
+/// The 2026-08-28 live regression: a twitter-feed cycle emitted a note missing `tag`, serde failed the
+/// WHOLE `AgentOutput` parse ("missing field `tag`"), and the harness dropped the finished cycle
+/// terminally — the same class as `"kind":"pub"`, which made [`NoteKind`] lenient while `tag`/`note`
+/// stayed strict. Entries yielding a non-empty string `tag` + `note` are kept (scalars stringified,
+/// `kind` via the lenient [`NoteKind`] parse); a malformed entry or non-list shape is dropped with a
+/// warn, never an error. All-dropped/absent/null → `None` (no notes this cycle).
+fn de_lenient_tag_notes<'de, D>(d: D) -> Result<Option<Vec<TagNote>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde_json::Value;
+    let scalar = |v: &Value| -> Option<String> {
+        match v {
+            Value::String(s) => Some(s.clone()),
+            Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        }
+    };
+    let to_note = |v: &Value| -> Option<TagNote> {
+        let map = v.as_object()?;
+        let tag = map.get("tag").and_then(scalar).filter(|s| !s.is_empty())?;
+        let note = map.get("note").and_then(scalar).filter(|s| !s.is_empty())?;
+        let kind = map
+            .get("kind")
+            .and_then(|k| serde_json::from_value::<NoteKind>(k.clone()).ok())
+            .unwrap_or_default();
+        Some(TagNote { tag, note, kind })
+    };
+    let items: Vec<Value> = match Value::deserialize(d)? {
+        Value::Null => return Ok(None),
+        Value::Array(items) => items,
+        // A single bare note object (the model forgot the list wrapper) still counts.
+        obj @ Value::Object(_) => vec![obj],
+        _ => Vec::new(),
+    };
+    let total = items.len();
+    let kept: Vec<TagNote> = items.iter().filter_map(to_note).collect();
+    if kept.len() < total {
+        tracing::warn!("tag_notes: dropped {} of {total} malformed note(s) (model shape drift)", total - kept.len());
+    }
+    Ok(if kept.is_empty() { None } else { Some(kept) })
+}
+
 /// A requested state transition. The agent names the **next state-prompt id** it chooses
 /// — exactly one of the current prompt's declared `transitions` (or `None` to terminate). Whether
 /// it is honored is decided by the harness: the id must be in the allowed set, resolve to a real
@@ -207,7 +251,8 @@ pub struct AgentOutput {
     /// (`runlogs/tag-notes.ndjson`). Replaces the old `memory_append` — long-term `memory/` is written
     /// only by org+ digest jobs / reflect. Honored only for org+ (`memory_write_min_trust`)
     /// Express/Reflect cycles; dropped otherwise. `None` (the common case) = no note this cycle.
-    #[serde(default)]
+    /// LENIENT parse (`de_lenient_tag_notes`): a malformed note is dropped, never the whole cycle.
+    #[serde(default, deserialize_with = "de_lenient_tag_notes")]
     pub tag_notes: Option<Vec<TagNote>>,
     #[serde(default)]
     pub proposal: Option<Proposal>,
@@ -278,6 +323,47 @@ mod tests {
         let bad: BatonIntent =
             serde_json::from_value(serde_json::json!({"to_prompt":"x","priority":"critical"})).unwrap();
         assert_eq!(bad.priority, None);
+    }
+
+    /// The 2026-08-28 live regression: a twitter-feed cycle emitted a tag-note missing `tag` →
+    /// "missing field `tag`" failed the WHOLE result parse and the harness dropped the finished cycle.
+    /// A malformed note must be dropped alone; the cycle's output (thought, batons, valid notes) survives.
+    #[test]
+    fn model_output_tolerates_malformed_tag_notes() {
+        // The prod shape: one valid note + one missing `tag` — the valid one survives, cycle parses.
+        let out: AgentOutput = serde_json::from_value(serde_json::json!({
+            "thought": "feed read",
+            "tag_notes": [
+                {"tag": "base-institutional", "note": "thesis going loud", "kind": "digest"},
+                {"note": "orphan note, no tag"}
+            ],
+            "batons": [{"to_prompt": "twitter/feed_reply", "gist": "g"}]
+        }))
+        .expect("a note missing `tag` must not fail the whole cycle parse");
+        let notes = out.tag_notes.as_ref().unwrap();
+        assert_eq!(notes.len(), 1, "the malformed note is dropped, the valid one kept");
+        assert_eq!(notes[0].tag, "base-institutional");
+        assert_eq!(notes[0].kind, NoteKind::Digest);
+        assert_eq!(out.fan_out().len(), 1, "the rest of the cycle output survives");
+
+        // Shape drift: a bare object (no list wrapper) counts; a numeric tag stringifies.
+        let out: AgentOutput = serde_json::from_value(serde_json::json!({
+            "thought": "t", "tag_notes": {"tag": 1787940003i64, "note": "n"}
+        }))
+        .unwrap();
+        assert_eq!(out.tag_notes.unwrap()[0].tag, "1787940003");
+
+        // All-malformed / null / garbage shapes → None, never an error.
+        for bad in [
+            serde_json::json!([{"note": "no tag"}, {"tag": "", "note": "empty tag"}, "just a string"]),
+            serde_json::json!(null),
+            serde_json::json!("not a list"),
+        ] {
+            let out: AgentOutput =
+                serde_json::from_value(serde_json::json!({"thought": "t", "tag_notes": bad}))
+                    .expect("malformed tag_notes must degrade, not error");
+            assert!(out.tag_notes.is_none());
+        }
     }
 
     /// A weaker model emits `intent`/`refs` in shapes the strict schema would reject. None of these

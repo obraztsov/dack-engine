@@ -28,6 +28,9 @@ export type AgentRow = {
   backup_window_start: number | null
   backup_window_end: number | null
   backup_retention: number
+  /** Credit-suspended (leader paused it for lack of credits; auto-resumes on top-up). A user-paused
+   *  agent has desired_state=paused with suspended=false — different story, tell them apart. */
+  suspended: boolean
   created_at: string
   updated_at: string
 }
@@ -81,6 +84,28 @@ export type Credits = {
 /** Events are FLAT: `{id, type, tg_user_id, agent, …type-specific fields…}` — identical shape on the
  *  WS fast path and the `/events` replay (replay adds `created_at`), so dedupe-by-id is trivial.
  *  `normalizeEvent` also tolerates the legacy nested-`payload` shape from a pre-flatten leader. */
+/** POST /referral/redeem — IDEMPOTENT (the leader grants exactly once; safe to call on every /start).
+ *  Terminal `reason`s (stop retrying): already_redeemed | invalid_or_expired_code | self_referral |
+ *  plan_inactive | referrals_disabled. Anything thrown (network/5xx) is transient — retry later. */
+export type RedeemResult =
+  | { redeemed: true; plan: string; referee_bonus: number; referrer_bonus: number; balance: number }
+  | { redeemed: false; reason: string }
+export const TERMINAL_REDEEM_REASONS = new Set([
+  'already_redeemed',
+  'invalid_or_expired_code',
+  'self_referral',
+  'plan_inactive',
+  'referrals_disabled',
+])
+
+export type MyReferral = {
+  code: string
+  link: string // https://t.me/<bot>?start=<code> — populated from the LEADER's referral.bot_username
+  referred_count: number
+  credits_earned: number
+  redeemed_welcome: boolean
+}
+
 export type EventRow = {
   id: number
   type: string
@@ -106,7 +131,9 @@ export class LeaderError extends Error {
   }
 }
 
-export const AGENT_NAME_RE = /^[a-z0-9][a-z0-9-]{0,31}$/ // leader's registry::valid_name — check client-side, save a round-trip
+// leader's registry::valid_name (DNS-label shaped, 2026-08-25): 1-31 chars, lowercase alnum + hyphen,
+// first AND last char alphanumeric (no trailing hyphen). Check client-side, save a round-trip.
+export const AGENT_NAME_RE = /^[a-z0-9](?:[a-z0-9-]{0,29}[a-z0-9])?$/
 
 export type LifecycleAction = 'start' | 'stop' | 'pause' | 'resume'
 
@@ -219,6 +246,10 @@ export function leaderClient(opts?: { baseUrl?: string; jwt?: string; actingTgId
       }),
     decommission: (name: string) =>
       request<{ outcome: string; agent: string }>('DELETE', `/agents/${name}`),
+    // ── referral (Phase 4) ────────────────────────────────────────────────────
+    // `code` comes from the harness-captured deep-link param, NEVER model free-text.
+    redeemReferral: (code: string) => request<RedeemResult>('POST', '/referral/redeem', { body: { code } }),
+    myReferral: () => request<MyReferral>('GET', '/referral'),
     setBackupPolicy: (name: string, windowStart: number, windowEnd: number, retention?: number) =>
       request<AgentRow>('PUT', `/agents/${name}/backup-policy`, {
         body: { window_start: windowStart, window_end: windowEnd, ...(retention != null ? { retention } : {}) },

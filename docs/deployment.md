@@ -86,13 +86,16 @@ give it a git identity two things need care:
 ## Run a duck
 
 ```sh
-docker run -d --name <name> --restart unless-stopped \
+docker run -d --init --name <name> --restart unless-stopped \
   --cpus 2 --memory 3g \
   -v /srv/ducks/<name>:/duck \
   -v /srv/ssh-soul:/root/.ssh:ro \
   dack/duck:latest
 ```
 
+- `--init` gives the container a real PID 1 (tini) that reaps orphans. Without it `dack run` is PID 1:
+  every cycle's bridge is `kill_on_drop`-killed, its children (MCP bun servers, git) reparent to dack,
+  exit, and stay zombies forever — the process table grows by ~75 entries/day.
 - `--restart unless-stopped` survives reboots/crashes (replaces a `nohup`/systemd wrapper).
 - `--cpus`/`--memory` partition the host across ducks; tune `max_concurrent_cycles` per duck to match.
 - No `-p`: nothing is published (outbound-only).
@@ -114,7 +117,7 @@ Deploy is git-driven:
 ```sh
 # on the host that has the engine clone:
 cd dack-engine && git pull && docker build -t dack/duck:latest .
-docker rm -f <name> && docker run -d --name <name> --restart unless-stopped \
+docker rm -f <name> && docker run -d --init --name <name> --restart unless-stopped \
   --cpus 2 --memory 3g -v /srv/ducks/<name>:/duck -v /srv/ssh-soul:/root/.ssh:ro dack/duck:latest
 ```
 

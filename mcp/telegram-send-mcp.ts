@@ -36,6 +36,7 @@ import {
   getReferral,
   pendingReferrals,
   markReferralApplied,
+  recordSend,
   type MediaType,
 } from './ingress-store'
 
@@ -158,11 +159,24 @@ server.registerTool(
         allow_known_private: DESTS.allow_known_private,
       })
     }
-    return asText(await tgSend({ chat_id: chat, text }))
+    const sent: any = await tgSend({ chat_id: chat, text })
+    if (!sent?.ok) console.error(`[telegram-send] send FAILED chat=${chat}: ${sent?.error ?? 'unknown'}`)
+    // Durable delivery ground truth (stderr is swallowed by the SDK; the runlog under-records).
+    if (ingressStore)
+      recordSend(ingressStore, {
+        via: 'send_message',
+        chatId: String(chat),
+        ok: !!sent?.ok,
+        messageId: sent?.message_id ?? null,
+        chars: text.length,
+        error: sent?.ok ? null : (sent?.error ?? 'unknown'),
+      })
+    return asText(sent)
   },
 )
 
 // Per-chat attachment store (harness-injected INGRESS_DB, absolute; shared with the ingress via WAL).
+// (Declared after the send tool but captured by its closure — tool calls only arrive post-init.)
 const ingressStore = process.env.INGRESS_DB ? openIngressStore(process.env.INGRESS_DB) : null
 
 server.registerTool(

@@ -8,6 +8,10 @@
  *     `param` (first-touch, e.g. a referrer's @username or a ref code) stored against the referee, so
  *     the duck can reward referrals in token later — retrievable via the telegram MCPs even if the
  *     first cycle failed to act on it, and markable `applied` for reward idempotency.
+ *   - the **send audit** — one row per outbound send ATTEMPT (`reply` and `send_message`), success or
+ *     failure. Ground truth for "did the reply land": the SDK swallows MCP-server stderr (so Bot API
+ *     400/429s never reach docker logs) and the runlog under-records tool-path replies — this table
+ *     is the only durable, queryable record of what was actually sent where.
  * It's the shared table the telegram MCP `set_chat_attachments` tool writes to.
  *
  * Uses Bun's built-in `bun:sqlite` (no dependency), WAL mode so the ingress (reader) and an MCP writer
@@ -46,6 +50,13 @@ export function openIngressStore(path: string): Database {
       'created_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL, seen_count INTEGER NOT NULL DEFAULT 1, ' +
       'applied_at INTEGER)',
   )
+  db.exec(
+    'CREATE TABLE IF NOT EXISTS send_audit ' +
+      '(id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, via TEXT NOT NULL, ' +
+      'chat_id TEXT NOT NULL, ok INTEGER NOT NULL, message_id INTEGER, reply_to TEXT, ' +
+      'chars INTEGER NOT NULL, error TEXT)',
+  )
+  db.exec('CREATE INDEX IF NOT EXISTS idx_send_audit_chat ON send_audit (chat_id, at)')
   return db
 }
 
@@ -198,6 +209,51 @@ export function pendingReferrals(db: Database, limit = 50): Referral[] {
   return db
     .query('SELECT * FROM referrals WHERE applied_at IS NULL ORDER BY created_at ASC LIMIT ?')
     .all(Math.max(1, Math.min(500, limit))) as Referral[]
+}
+
+// ── Send audit (outbound delivery ground truth) ──────────────────────────────────────────────────
+// Every outbound Telegram send ATTEMPT lands here — ok or failed, reply or proactive send — because
+// nothing else records failures durably (MCP stderr is swallowed by the SDK; the model may shrug off
+// an `ok:false` tool result). This is what a "did the duck's reply actually land?" investigation
+// queries, and what a future delivery-health sensor can watch.
+
+export type SendAudit = {
+  id: number
+  at: number
+  /** Which egress path: `reply` (destination-locked) | `send_message` (privileged proactive). */
+  via: string
+  chat_id: string
+  ok: number // 1 | 0 (sqlite boolean)
+  message_id: number | null // Telegram's id of the delivered message (null on failure)
+  reply_to: string | null // the message this was threaded to, when known
+  chars: number // length of the text we tried to send
+  error: string | null // failure detail (Bot API status+body slice, splice refusal, missing token…)
+}
+
+/** Record one send attempt. NEVER throws — auditing must not be able to break the send path itself
+ *  (a failed insert logs to stderr and is dropped). */
+export function recordSend(
+  db: Database,
+  a: { via: string; chatId: string; ok: boolean; messageId?: number | null; replyTo?: string | null; chars: number; error?: string | null },
+  now: number = Math.floor(Date.now() / 1000),
+): void {
+  try {
+    db.query(
+      'INSERT INTO send_audit (at, via, chat_id, ok, message_id, reply_to, chars, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    ).run(now, a.via, a.chatId, a.ok ? 1 : 0, a.messageId ?? null, a.replyTo ?? null, a.chars, a.error?.slice(0, 500) ?? null)
+  } catch (e) {
+    console.error('[ingress-store] send_audit insert failed (send unaffected):', e)
+  }
+}
+
+/** Recent send attempts, newest first — all chats, or one chat's. */
+export function recentSends(db: Database, chatId: string | null = null, limit = 50): SendAudit[] {
+  const cap = Math.max(1, Math.min(500, limit))
+  return (
+    chatId === null
+      ? db.query('SELECT * FROM send_audit ORDER BY at DESC, id DESC LIMIT ?').all(cap)
+      : db.query('SELECT * FROM send_audit WHERE chat_id = ? ORDER BY at DESC, id DESC LIMIT ?').all(chatId, cap)
+  ) as SendAudit[]
 }
 
 /** Mark `userId`'s referral rewarded (idempotent — only flips a still-pending row). Returns true if it

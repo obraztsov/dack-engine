@@ -13,6 +13,8 @@ import {
   pendingReferrals,
   markReferralApplied,
   parseStartParam,
+  recordSend,
+  recentSends,
 } from './ingress-store'
 
 test('attachmentKind classifies by intrinsic category (independent of path config)', () => {
@@ -118,4 +120,27 @@ test('referrals: first-touch capture, pending queue, idempotent apply', () => {
 
   // applying a user with no referral is a no-op false (never throws)
   expect(markReferralApplied(db, '999', 4000)).toBe(false)
+})
+
+test('send audit: records every attempt (ok + failed), queryable per chat, newest first', () => {
+  const db = openIngressStore(':memory:')
+  recordSend(db, { via: 'reply', chatId: '555', ok: true, messageId: 3010, replyTo: '3004', chars: 120 }, 1000)
+  recordSend(db, { via: 'reply', chatId: '555', ok: false, chars: 80, error: 'status 400 reply not found' }, 1001)
+  recordSend(db, { via: 'send_message', chatId: '-200', ok: true, messageId: 7, chars: 40 }, 1002)
+
+  const all = recentSends(db)
+  expect(all.length).toBe(3)
+  expect(all[0].via).toBe('send_message') // newest first
+
+  const chat = recentSends(db, '555')
+  expect(chat.length).toBe(2)
+  expect(chat[0].ok).toBe(0)
+  expect(chat[0].error).toContain('400')
+  expect(chat[1].ok).toBe(1)
+  expect(chat[1].message_id).toBe(3010)
+  expect(chat[1].reply_to).toBe('3004')
+
+  // a long error is truncated, not rejected (audit must never break the send path)
+  recordSend(db, { via: 'reply', chatId: '555', ok: false, chars: 1, error: 'x'.repeat(5000) }, 1003)
+  expect((recentSends(db, '555')[0].error ?? '').length).toBeLessThanOrEqual(500)
 })

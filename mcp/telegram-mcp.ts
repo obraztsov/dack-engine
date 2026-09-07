@@ -14,7 +14,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
-import { openIngressStore, setChatAttachment, getReferral, type MediaType } from './ingress-store'
+import { openIngressStore, setChatAttachment, getReferral, recordSend, type MediaType } from './ingress-store'
 import { openPondStore, restoreHandles, spliceHandles } from './pond-store'
 
 // Per-chat attachment store — the harness injects INGRESS_DB (absolute). Absent ⇒ the toggle is
@@ -63,6 +63,9 @@ server.registerTool(
       const s = spliceHandles(pondStore, text, chat, at)
       if (!s.ok) {
         console.error(`[telegram-mcp] splice refused handle=${s.handle} reason=${s.reason}`)
+        // The user perceives an undelivered reply — audit it as a failed attempt.
+        if (ingressStore)
+          recordSend(ingressStore, { via: 'reply', chatId: chat, ok: false, chars: text.length, error: `splice_refused:${s.reason}` }, at)
         return asText({
           ok: false,
           error:
@@ -82,6 +85,14 @@ server.registerTool(
       restoreHandles(pondStore, consumed, at)
       console.error(`[telegram-mcp] send failed, restored ${consumed.length} handle(s)`)
     }
+    if (!sent?.ok) console.error(`[telegram-mcp] send FAILED chat=${chat}: ${sent?.error ?? 'unknown'}`)
+    // Durable delivery ground truth (stderr is swallowed by the SDK; the runlog under-records).
+    if (ingressStore)
+      recordSend(
+        ingressStore,
+        { via: 'reply', chatId: chat, ok: !!sent?.ok, messageId: sent?.message_id ?? null, replyTo: replyTo ?? null, chars: out.length, error: sent?.ok ? null : (sent?.error ?? 'unknown') },
+        at,
+      )
     return asText(consumed.length && sent?.ok ? { ...sent, spliced: consumed.length } : sent)
   },
 )

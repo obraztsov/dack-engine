@@ -31,7 +31,9 @@ pub enum Intent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Proposal {
     pub intent: Intent,
-    /// Digested intent — NOT raw stimulus text.
+    /// Digested intent — NOT raw stimulus text. `default` so a gist-less proposal degrades to the
+    /// thought fallback downstream instead of failing the cycle.
+    #[serde(default)]
     pub gist: String,
     /// The duck's own soft reference annotations. The harness-critical refs (`source_tweet_id`,
     /// `source_author`) are injected DETERMINISTICALLY into the Baton from the stimulus payload, not
@@ -82,6 +84,114 @@ where
         "urgent" => Some(Priority::Urgent),
         _ => None,
     }))
+}
+
+/// Lenient scalar→string for MODEL output fields — the model writes ids it saw as numbers
+/// (`"reply_to": 3004`) or joins lists into one string; a strict `String` there kills the cycle.
+fn value_as_string(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// Lenient `tags` deserializer for MODEL output. The 2026-08-10/14 live regression: SIX telegram
+/// cycles (one user, five in one evening) died to `invalid type: string, expected a sequence` —
+/// the model emitted `"tags": "2094405368, …"` (a comma-joined string) instead of an array, and each
+/// finished reply was dropped at the parse. A string splits on commas; an array keeps its scalar
+/// items (numbers stringified); anything else degrades to no tags. Tags are recall hints — losing
+/// one is cosmetic, losing the cycle is a user-visible silence.
+fn de_lenient_tags<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde_json::Value;
+    Ok(match Value::deserialize(d)? {
+        Value::String(s) => s.split(',').map(str::trim).filter(|t| !t.is_empty()).map(String::from).collect(),
+        Value::Array(items) => items.iter().filter_map(value_as_string).filter(|t| !t.is_empty()).collect(),
+        n @ Value::Number(_) => vec![n.to_string()],
+        _ => Vec::new(),
+    })
+}
+
+/// Lenient `reply_to` deserializer for MODEL output — the model copies a message id it saw as a
+/// NUMBER (`"reply_to": 3004`); coerce to the string the harness matches on. Anything unusable →
+/// `None` (reply to the latest — the safe fallback the harness applies to unmatched ids anyway).
+fn de_lenient_reply_to<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(value_as_string(&serde_json::Value::deserialize(d)?).filter(|s| !s.is_empty()))
+}
+
+/// Lenient `batons` deserializer for MODEL output — per-item salvage: a baton that still fails after
+/// the field-level coercions (e.g. missing `to_prompt`) is dropped ALONE, with a warn; the cycle and
+/// its remaining branches survive. A bare object (the model forgot the list wrapper) counts as one.
+fn de_lenient_batons<'de, D>(d: D) -> Result<Vec<BatonIntent>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde_json::Value;
+    let items: Vec<Value> = match Value::deserialize(d)? {
+        Value::Array(items) => items,
+        obj @ Value::Object(_) => vec![obj],
+        _ => Vec::new(),
+    };
+    let total = items.len();
+    let kept: Vec<BatonIntent> = items.into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect();
+    if kept.len() < total {
+        tracing::warn!("batons: dropped {} of {total} malformed baton(s) (model shape drift)", total - kept.len());
+    }
+    Ok(kept)
+}
+
+/// Lenient salvage for an optional model-authored sub-object (`proposal`, `spawn`): a shape that
+/// doesn't parse degrades to `None` with a warn instead of failing the cycle. The harness treats
+/// both as optional already; absent-because-malformed is strictly better than a dropped cycle.
+fn de_lenient_opt<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let v = serde_json::Value::deserialize(d)?;
+    if v.is_null() {
+        return Ok(None);
+    }
+    Ok(match serde_json::from_value::<T>(v) {
+        Ok(t) => Some(t),
+        Err(e) => {
+            tracing::warn!("model output: dropped malformed optional sub-object ({e})");
+            None
+        }
+    })
+}
+
+/// Lenient `transition` deserializer for MODEL output — accepts the legacy object, a bare string
+/// (`"transition": "express"` → that prompt), or degrades to the default (terminate) with a warn.
+fn de_lenient_transition<'de, D>(d: D) -> Result<Transition, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde_json::Value;
+    Ok(match Value::deserialize(d)? {
+        Value::String(s) if !s.is_empty() => Transition { to_prompt: Some(s), reason: String::new() },
+        v @ Value::Object(_) => serde_json::from_value(v).unwrap_or_else(|e| {
+            tracing::warn!("transition: malformed object degraded to terminate ({e})");
+            Transition::default()
+        }),
+        _ => Transition::default(),
+    })
+}
+
+/// Lenient `thought` deserializer for MODEL output — null/absent → empty, a scalar stringifies.
+/// The thought is a log line, never control flow; it must not be able to kill the cycle.
+fn de_lenient_thought<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(value_as_string(&v).unwrap_or_default())
 }
 
 /// Lenient `tag_notes` deserializer for MODEL output — a sticky note is disposable, the cycle is not.
@@ -166,13 +276,15 @@ pub struct BatonIntent {
     /// batch it holds (the firebreak): an id not in `items` is ignored (the reply falls back to the
     /// latest/top-level, never an arbitrary target). `None` = reply to the coalesced top-level (the
     /// latest message — legacy). Platform-agnostic; the identifier FIELD is the emitting prompt's
-    /// `reply_key` (default `message_id`→`id`).
-    #[serde(default)]
+    /// `reply_key` (default `message_id`→`id`). LENIENT parse: a numeric id coerces to string.
+    #[serde(default, deserialize_with = "de_lenient_reply_to")]
     pub reply_to: Option<String>,
     /// Extra context-recall tags for this branch (beyond the auto conversation key the harness adds when
     /// the prompt sets `tag_key`) — e.g. a topic. Carried onto the runlog entry so a tagged view can
-    /// recall it later. Usually empty; the model rarely needs to set it. `#[serde(default)]` = none.
-    #[serde(default)]
+    /// recall it later. Usually empty; the model rarely needs to set it. LENIENT parse
+    /// (`de_lenient_tags`): a comma-joined string splits instead of failing the cycle (the Aug-14
+    /// six-lost-replies regression).
+    #[serde(default, deserialize_with = "de_lenient_tags")]
     pub tags: Vec<String>,
     #[serde(default)]
     pub reason: String,
@@ -246,6 +358,7 @@ impl NoteKind {
 pub struct AgentOutput {
     /// Internal reasoning — **logged, never published** (Eliza-style "thought").
     /// Rides the Baton for continuity but is NOT a safety boundary.
+    #[serde(default, deserialize_with = "de_lenient_thought")]
     pub thought: String,
     /// Tag-notes: per-conversation "sticky notes" appended to the SHORT-TERM tag-notes catalogue
     /// (`runlogs/tag-notes.ndjson`). Replaces the old `memory_append` — long-term `memory/` is written
@@ -254,19 +367,19 @@ pub struct AgentOutput {
     /// LENIENT parse (`de_lenient_tag_notes`): a malformed note is dropped, never the whole cycle.
     #[serde(default, deserialize_with = "de_lenient_tag_notes")]
     pub tag_notes: Option<Vec<TagNote>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_lenient_opt")]
     pub proposal: Option<Proposal>,
     /// Optional worker delegation. Honored only from Express; launched async, returns as
     /// an untrusted `worker_completion` stimulus. `None` (the common case) = no delegation.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_lenient_opt")]
     pub spawn: Option<SpawnRequest>,
     /// Legacy single transition (still accepted). `fan_out()` folds it into `batons`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_lenient_transition")]
     pub transition: Transition,
     /// **Fan-out**: the branches this cycle wants to take. Several = do several things at
     /// once, each its own gist + destination, each an independent branch. Empty = terminate. Wins
-    /// over the legacy `transition` when present.
-    #[serde(default)]
+    /// over the legacy `transition` when present. LENIENT parse: a malformed baton drops alone.
+    #[serde(default, deserialize_with = "de_lenient_batons")]
     pub batons: Vec<BatonIntent>,
 }
 
@@ -364,6 +477,65 @@ mod tests {
                     .expect("malformed tag_notes must degrade, not error");
             assert!(out.tag_notes.is_none());
         }
+    }
+
+    /// The 2026-08-10/14 live regression: SIX telegram-pub cycles (one user, five in one evening)
+    /// died to `invalid type: string, expected a sequence` — the model emitted a baton's `tags` as a
+    /// comma-joined string — and each finished reply was silently dropped. Field-level coercion must
+    /// REPAIR that baton (dropping it would still lose the reply it carried).
+    #[test]
+    fn model_output_repairs_string_tags_and_numeric_reply_to() {
+        // The Aug-14 shape: string tags + (plausible next killer) a numeric reply_to.
+        let out: AgentOutput = serde_json::from_value(serde_json::json!({
+            "thought": "Artobraz teasing me",
+            "tag_notes": [{"tag": "2094405368", "note": "5 day gap", "kind": "digest"}],
+            "batons": [{"to_prompt": "telegram/express", "gist": "fire back", "tags": "2094405368, trencher", "reply_to": 3004}]
+        }))
+        .expect("string tags must coerce, not fail the cycle");
+        let b = out.fan_out();
+        assert_eq!(b.len(), 1, "the reply baton SURVIVES repaired");
+        assert_eq!(b[0].tags, vec!["2094405368", "trencher"], "comma-joined string splits");
+        assert_eq!(b[0].reply_to.as_deref(), Some("3004"), "numeric reply_to coerces to string");
+
+        // Array tags with a numeric item stringify; a malformed baton drops ALONE.
+        let out: AgentOutput = serde_json::from_value(serde_json::json!({
+            "thought": "t",
+            "batons": [
+                {"to_prompt": "express", "tags": [2094405368i64, "topic"]},
+                {"gist": "no to_prompt — unusable branch"}
+            ]
+        }))
+        .unwrap();
+        let b = out.fan_out();
+        assert_eq!(b.len(), 1, "the baton missing to_prompt drops alone");
+        assert_eq!(b[0].tags, vec!["2094405368", "topic"]);
+    }
+
+    /// Belt-and-braces for the remaining model-authored fields: none of them may kill the cycle —
+    /// worst case each degrades (empty thought, no proposal/spawn, terminate transition).
+    #[test]
+    fn model_output_survives_shape_drift_on_every_field() {
+        let out: AgentOutput = serde_json::from_value(serde_json::json!({
+            "thought": null,
+            "proposal": {"gist": "no intent field"},
+            "spawn": {"agent": "researcher"},
+            "transition": "express",
+            "batons": "not a list"
+        }))
+        .expect("no single malformed field may fail the parse");
+        assert_eq!(out.thought, "", "null thought degrades to empty");
+        assert!(out.proposal.is_none(), "unparseable proposal degrades to None");
+        assert!(out.spawn.is_none(), "spawn missing brief degrades to None");
+        assert_eq!(out.transition.to_prompt.as_deref(), Some("express"), "bare-string transition maps to to_prompt");
+        assert!(out.batons.is_empty(), "garbage batons degrade to empty");
+
+        // A gist-less proposal with a KNOWN intent still parses (gist defaults).
+        let out: AgentOutput =
+            serde_json::from_value(serde_json::json!({"thought": "t", "proposal": {"intent": "reply"}})).unwrap();
+        assert_eq!(out.proposal.as_ref().unwrap().gist, "");
+
+        // Ceiling check: only a NON-OBJECT output (a real bridge-contract break) still errors.
+        assert!(serde_json::from_value::<AgentOutput>(serde_json::json!("just text")).is_err());
     }
 
     /// A weaker model emits `intent`/`refs` in shapes the strict schema would reject. None of these

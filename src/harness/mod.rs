@@ -288,6 +288,20 @@ impl Harness {
         // logging-not-rollback: a failed run is a tagged entry + a terminal `failed` row.
         self.log_dispatch_failure(snap, &err).await;
         let _ = self.queue.update_status(&snap.id, StimulusStatus::Failed).await;
+        // Op-notify (fire-and-forget): a terminal failure is exactly what the operator lane exists
+        // for — a silently-failed wake is a user the agent never answered. Spawned + timeboxed so
+        // a down router can never slow the consciousness loop.
+        if let Some(url) = self.config.notify_url.clone() {
+            let title = format!("cycle failed: {}", snap.id);
+            let body = format!("{err}");
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    notify_post(&url, &title, &body),
+                )
+                .await;
+            });
+        }
     }
 
     #[tracing::instrument(
@@ -1668,6 +1682,40 @@ const MAX_LINEAGE_DEPTH: usize = 4;
 /// stimulus AND a deferred baton-continuation (which is a stimulus), so async batons inherit it.
 const MAX_TIMEOUT_RETRIES: u32 = 3;
 
+/// Fire-and-forget POST to the op-notify router (the `notify_url` config). Hand-rolled HTTP/1.1
+/// over a plain TcpStream — the failure-REPORTING path deliberately adds no HTTP-client dependency
+/// and never reads the response (the router's jsonl is the audit; we never block on delivery).
+/// `http://host:port/path` only — the router is a localhost sibling by design.
+async fn notify_post(url: &str, title: &str, body_text: &str) {
+    let Some(rest) = url.strip_prefix("http://") else {
+        tracing::warn!("notify_url must be http://host:port/path — notification dropped");
+        return;
+    };
+    let (host, path) = match rest.split_once('/') {
+        Some((h, p)) => (h.to_string(), format!("/{p}")),
+        None => (rest.to_string(), "/notify".to_string()),
+    };
+    let payload = serde_json::json!({
+        "severity": "error",
+        "source": "harness",
+        "title": title,
+        "body": body_text,
+    })
+    .to_string();
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+        payload.len()
+    );
+    match tokio::net::TcpStream::connect(&host).await {
+        Ok(mut s) => {
+            use tokio::io::AsyncWriteExt;
+            let _ = s.write_all(req.as_bytes()).await;
+            let _ = s.flush().await;
+        }
+        Err(e) => tracing::warn!("op-notify router unreachable ({host}): {e}"),
+    }
+}
+
 /// Backoff (seconds) before re-attempting a timed-out wake — grows with the attempt so a hung
 /// provider isn't hammered.
 fn retry_backoff_secs(attempt: u32) -> i64 {
@@ -2606,11 +2654,11 @@ mod tests {
     fn build_baton_surfaces_telegram_source_refs() {
         let mut stim = poisoned_stimulus();
         stim.payload = serde_json::json!({
-            "chat_id": 80375347, "message_id": 42, "text": "gm duck",
+            "chat_id": 111111111, "message_id": 42, "text": "gm duck",
             "from_username": "mcfrog_xbt", "chat_type": "private"
         });
         let baton = build_baton(&perceive_output(), &stim, "runlogs/r#run".into(), TrustTier::from("org"));
-        assert_eq!(baton.refs.get("source_chat_id").map(String::as_str), Some("80375347"), "chat_id (a number) crosses as a ref");
+        assert_eq!(baton.refs.get("source_chat_id").map(String::as_str), Some("111111111"), "chat_id (a number) crosses as a ref");
         assert_eq!(baton.refs.get("source_from").map(String::as_str), Some("mcfrog_xbt"));
         assert!(!serde_json::to_string(&baton).unwrap().contains("gm duck"), "raw text must not ride the baton");
     }
@@ -3174,7 +3222,7 @@ mod tests {
         let mut stim = poisoned_stimulus();
         stim.payload_tier = TrustTier::self_();
         stim.payload = serde_json::json!({
-            "chat_id": 80375347i64, "message_id": 379, "text": "x", "items": [{"message_id": 1}]
+            "chat_id": 111111111i64, "message_id": 379, "text": "x", "items": [{"message_id": 1}]
         });
         harness.dispatch(stim, &Default::default()).await.unwrap();
 
@@ -3188,7 +3236,7 @@ mod tests {
         // scalars, so the deferred reply still resolves its chat (the "no source chat in scope" bug). The
         // bulky `items` array is stripped — scope is env-only, not the whole batch.
         let scope = cont.payload.get("scope").expect("continuation carries a scope");
-        assert_eq!(scope.get("chat_id").and_then(|v| v.as_i64()), Some(80375347), "scope keeps the origin chat");
+        assert_eq!(scope.get("chat_id").and_then(|v| v.as_i64()), Some(111111111), "scope keeps the origin chat");
         assert_eq!(scope.get("message_id").and_then(|v| v.as_i64()), Some(379), "scope keeps the latest message");
         assert!(scope.get("items").is_none(), "the batch `items` array is stripped from the carried scope");
 
@@ -3497,14 +3545,14 @@ mod tests {
             // Static operator config env (e.g. telegram-send destinations) — injected alongside.
             env: std::collections::BTreeMap::from([("TELEGRAM_DESTINATIONS".into(), "{\"op\":1}".into())]),
         };
-        let extra = std::collections::BTreeMap::from([("TELEGRAM_REPLY_CHAT".to_string(), "80375347".to_string())]);
+        let extra = std::collections::BTreeMap::from([("TELEGRAM_REPLY_CHAT".to_string(), "111111111".to_string())]);
         let cfg = build_mcp_config(&server, Some("bearer42"), &extra);
         assert_eq!(cfg["type"], "stdio");
         assert_eq!(cfg["env"]["X_BEARER_TOKEN"], "bearer42");
         // Static env is injected (operator config the server needs).
         assert_eq!(cfg["env"]["TELEGRAM_DESTINATIONS"], "{\"op\":1}");
         // Payload-scoped env is merged into the server's env (the destination-lock mechanism).
-        assert_eq!(cfg["env"]["TELEGRAM_REPLY_CHAT"], "80375347");
+        assert_eq!(cfg["env"]["TELEGRAM_REPLY_CHAT"], "111111111");
         assert_eq!(cfg["args"][1], "nonexistent-xyz.ts", "non-path arg left as-is");
     }
 

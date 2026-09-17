@@ -98,12 +98,12 @@ describe('leader client', () => {
   })
 
   test('referral verbs: redeem posts the captured code with the acting header; my link is a GET', async () => {
-    const c = leaderClient({ baseUrl: base, jwt: 'JWT', actingTgId: '80375347' })
+    const c = leaderClient({ baseUrl: base, jwt: 'JWT', actingTgId: '111111111' })
     respond = () => Response.json({ redeemed: false, reason: 'already_redeemed' })
     const r = await c.redeemReferral('launch1000')
     expect(last!.method).toBe('POST')
     expect(last!.path).toBe('/v1/manager/referral/redeem')
-    expect(last!.headers.get('x-acting-tg-id')).toBe('80375347')
+    expect(last!.headers.get('x-acting-tg-id')).toBe('111111111')
     expect(JSON.parse(last!.body)).toEqual({ code: 'launch1000' })
     expect(r).toEqual({ redeemed: false, reason: 'already_redeemed' })
     respond = () => Response.json({ code: 'r_x', link: 'https://t.me/B?start=r_x', referred_count: 1, credits_earned: 30, redeemed_welcome: true })

@@ -20,8 +20,8 @@
  *      operator-registering it by name). A persistent contacts store is the upgrade path for true-ever.
  *
  * TELEGRAM_DESTINATIONS json (backward compatible):
- *   - structured: {"named":{"operator":80375347},"groups":[-5426732960],"allow_known_private":true}
- *   - LEGACY flat: {"operator":80375347,"group":-5426732960}  → treated as `named` (no wildcard).
+ *   - structured: {"named":{"operator":111111111},"groups":[-5426732960],"allow_known_private":true}
+ *   - LEGACY flat: {"operator":111111111,"group":-5426732960}  → treated as `named` (no wildcard).
  *
  * Token: `TELEGRAM_BOT_TOKEN` (harness-injected, never the agent context). Raw Bot API `fetch`.
  * stdout is the MCP protocol channel — NEVER log to it; use stderr.

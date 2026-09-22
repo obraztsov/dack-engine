@@ -138,9 +138,12 @@ client ──(telegram doc / email attachment)──▶ client-duck ──(Buzz 
 > **Done:** telegram `m.document` inbound (`a92426c` — image-as-file → vision, doc → `attachments`; the
 > operator's "files don't work" fix); telegram `reply_document` **outbound** (`353413f` — send-by-`attachment_id`,
 > harness `MEDIA_DIR` + shared path-confined `attachments.ts`); buzz document inbound (`5301dda` — opt-in
-> `media_prefetch_docs` → routable stored `file`). **Contract established:** `attachments:[{file,mime,filename,
-> size,kind}]` inbound; `attachment_id` (basename, harness-confined) outbound. **Next:** buzz `send --file`
-> outbound skill; email channel (P1/P2 email); then Hermes.
+> `media_prefetch_docs` → routable stored `file`); buzz `--file` engine mechanism (`a789c94` —
+> `ArgSchema::Attachment`, confined; a signed manifest cmd away); **email channel** (`email-send-mcp.ts`
+> outbound `reply_email` + `email-ingress.ts` inbound + `cloudflare/email-worker.js`, §7b). **Contract:**
+> `attachments:[{file,mime,filename,size,kind}]` inbound; `attachment_id`/`{type:attachment}` (basename,
+> harness-confined via shared `attachments.ts` / `confine_attachment`) outbound. **Next:** wire the email
+> config + deploy the Cloudflare Worker; author the buzz `--file` manifest cmd; then Hermes e2e.
 
 
 - **P0 — Blob-carrying media store + Buzz file transfer.** Generalize the harness media store beyond
@@ -162,6 +165,46 @@ Minimal first demo (hotel invoice): **P0 + P2-email + P4** (Hermes generates the
 Buzz, duck emails it). Clinic questionnaire adds **P1** (receive the filled form) + P4 extraction.
 
 ---
+
+## 7b. Email channel wiring (Cloudflare inbound + transactional outbound)
+
+Email reuses the whole attachment core — it's just another channel adapter.
+
+**Inbound** (`mcp/cloudflare/email-worker.js` → `mcp/email-ingress.ts`):
+- A **Cloudflare Email Worker** on the duck's domain (Email Routing → "send to a Worker") parses each inbound
+  email (postal-mime) and POSTs `{from, subject, text, message_id, attachments:[{filename,mime,content(b64)}]}`
+  to the `email-ingress` module, authenticated with a shared `X-Email-Ingress-Secret`.
+- **email-ingress** (a harness module) verifies the secret (constant-time), stores each attachment to the
+  media dir (image → vision `media`; document → routable `attachments`), classifies trust by sender
+  (`operator_email` → `/email/op`, else `/email/pub`), and POSTs a stimulus with the reply-scope scalars
+  (`email_reply_to`, `email_subject`, `email_in_reply_to`) so a reply is destination-locked.
+- Topology: the Worker is external → the module must be reachable from Cloudflare (pond proxy route or a
+  tunnel). The module listens on `listen_port`.
+
+**Outbound** (`mcp/email-send-mcp.ts`): a stdio MCP `reply_email{subject?, text, attachment_id?}`,
+destination-locked to `EMAIL_REPLY_TO` (harness-injected scope_env), attachment confined via the shared
+`resolveAttachment`. Provider-agnostic: `EMAIL_API_URL` + `EMAIL_API_KEY` + `EMAIL_FROM`, Resend-shaped body
+(swap to Postmark/SendGrid/MailChannels by URL+key). Cloudflare Email Workers can't *send*, so outbound uses
+a transactional API. (Proactive `send_email{to,…}` behind an allow-list = a later privileged server.)
+
+**Config sketch** (`dack.config.yaml`):
+```yaml
+webhooks: { "/email/op": self, "/email/pub": public }
+mcp_servers:
+  - name: email
+    transport: { type: stdio, command: bun, args: [run, mcp/email-send-mcp.ts] }
+    tier: post
+    trust: self
+    scope_env: { EMAIL_REPLY_TO: email_reply_to, EMAIL_SUBJECT: email_subject, EMAIL_IN_REPLY_TO: email_in_reply_to }
+    env: { EMAIL_API_URL: "https://api.resend.com/emails", EMAIL_FROM: "hello@yourduck.tld" }
+    auth: { secret: email_api, env: EMAIL_API_KEY }
+modules:
+  - name: email-ingress
+    command: [bun, run, mcp/email-ingress.ts]
+    secrets: [email_ingress]   # → EMAIL_INGRESS_SECRET
+    env: { EMAIL_INGRESS_CONFIG: "…/email-ingress.config.json" }
+```
+Later: pond.city per-agent addresses (a shared Worker + per-duck routing); standalone first.
 
 ## 8. Decision needed from the operator
 

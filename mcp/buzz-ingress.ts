@@ -46,6 +46,10 @@ interface Config {
   // pulls full-res on demand via the `media_get` skill. `media_dir` MUST match the engine's `media_dir` (it's
   // where the harness resolves + confines media from); an absolute path is safest (the module's cwd may vary).
   media_prefetch: 'off' | 'thumb' | 'full'
+  // Prefetch NON-image documents (pdf/docx/…) into the store too. Unlike images these are never loaded as
+  // vision — they become routable stored attachments (a `file` on the attachment entry) the duck can forward
+  // (e.g. `reply_document` a doc a paperwork agent returned over Buzz). Off by default (bandwidth/opt-in).
+  media_prefetch_docs: boolean
   media_dir: string
   media_max_per_message: number
 }
@@ -66,6 +70,7 @@ const DEFAULTS: Config = {
   channels: [],
   thread_context: { max_ancestors: 8, full_thread_max: 40 },
   media_prefetch: 'off',
+  media_prefetch_docs: false,
   media_dir: 'media',
   media_max_per_message: 6,
 }
@@ -202,7 +207,40 @@ const compactEv = (e: Ev): SpineEv => {
 // duck's awareness that media exists); no bytes move here. The bytes live behind Blossom auth — fetching them
 // (`buzz media get`, a signed GET) and turning them into a vision block is P1. `sha` (the `x` hash) is the
 // stable ref P1's `media_get` will pull. Capped like the harness's MAX_MEDIA_PER_STIMULUS.
-type MediaMeta = { sha: string | null; mime: string; dim: string | null; size: number | null; filename: string | null; has_thumb: boolean }
+type MediaMeta = { sha: string | null; mime: string; dim: string | null; size: number | null; filename: string | null; has_thumb: boolean; file?: string }
+
+const EXT_FOR_MIME: Record<string, string> = {
+  'application/pdf': '.pdf',
+  'application/msword': '.doc',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
+  'application/vnd.ms-excel': '.xls',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx',
+  'text/plain': '.txt',
+  'text/csv': '.csv',
+  'application/zip': '.zip',
+}
+/** Prefetch NON-image documents into the store: fetch full bytes (Blossom authed) and STAMP `file` (the
+ *  stored basename) onto each fetched attachment entry, so a Buzz-received document becomes a routable stored
+ *  attachment (channel-agnostic with telegram). Mutates the entries; no-op unless `media_prefetch_docs`. */
+function prefetchDocsInto(attachments: MediaMeta[]): void {
+  if (!cfg.media_prefetch_docs || attachments.length === 0) return
+  const dir = mediaDirAbs()
+  try {
+    mkdirSync(dir, { recursive: true })
+  } catch {
+    /* harness ensures it at boot */
+  }
+  for (const a of attachments.slice(0, cfg.media_max_per_message)) {
+    if (!a.sha || a.mime.startsWith('image/')) continue // images ride prefetchMedia (the vision lane)
+    const ext = (a.filename?.includes('.') ? '.' + a.filename.split('.').pop() : EXT_FOR_MIME[a.mime]) ?? '.bin'
+    const file = `${a.sha}${ext.toLowerCase().replace(/[^a-z0-9.]/g, '')}`
+    const outPath = join(dir, file)
+    if (existsSync(outPath) || buzzMediaGet(a.sha, outPath)) {
+      a.file = file
+      log('prefetched doc', `${a.sha.slice(0, 12)}… (${a.mime}) → media dir`)
+    }
+  }
+}
 function parseImeta(ev: Ev): MediaMeta[] {
   const out: MediaMeta[] = []
   for (const t of ev.tags ?? []) {
@@ -288,8 +326,9 @@ function discover(): void {
 async function post(ch: { id: string; name?: string }, ev: Ev, kind: 'mention' | 'reply_to_own'): Promise<void> {
   const tier = tierFor(ch)
   const { spine, truncated, root } = buildSpine(ev)
-  const attachments = parseImeta(ev) // P0: media awareness — metadata for every attachment (all images)
+  const attachments = parseImeta(ev) // P0: media awareness — metadata for every attachment (all mimes)
   const media = prefetchMedia(attachments) // P2: passively fetched thumb(s)/image(s) the duck SEES on wake
+  prefetchDocsInto(attachments) // Slice 2: fetch non-image docs → stamp `file` (routable stored attachment)
   const body = {
     channel: { id: ch.id, name: ch.name ?? null },
     trigger: kind,

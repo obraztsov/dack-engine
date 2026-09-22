@@ -19,16 +19,19 @@
  */
 import { Database } from 'bun:sqlite'
 
-export type MediaType = 'image' | 'voice'
+export type MediaType = 'image' | 'voice' | 'file'
 export type AttachKind = 'operator' | 'trusted' | 'dm' | 'group' | 'pub'
 export type AttachDefaults = Partial<Record<MediaType, Partial<Record<AttachKind, boolean>>>>
 
 // Conservative defaults per media type: DM + operator + vetted (trusted/org) chats ON; open groups +
 // broadcast channels OFF — so we never spend vision/ASR tokens on public contacts until the duck
-// explicitly enables one (a per-chat override authored via the telegram MCP).
+// explicitly enables one (a per-chat override authored via the telegram MCP). `file` = a document/blob
+// sent "as a file" (Telegram `m.document`: PDF/docx/… OR an uncompressed image) — stored + surfaced to the
+// duck for routing, NOT auto-loaded into the model (a document isn't a vision block on the OpenAI-compat wire).
 export const ATTACH_DEFAULTS: Record<MediaType, Record<AttachKind, boolean>> = {
   image: { operator: true, trusted: true, dm: true, group: false, pub: false },
   voice: { operator: true, trusted: true, dm: true, group: false, pub: false },
+  file: { operator: true, trusted: true, dm: true, group: false, pub: false },
 }
 
 /** Open (creating if needed) the ingress store + its schema. `:memory:` is accepted for tests. */

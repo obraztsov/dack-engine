@@ -166,6 +166,32 @@ async function downloadPhoto(ctx: any, m: any): Promise<{ kind: string; file: st
   }
 }
 
+/** Download a document/file message (`m.document` — a file sent via Telegram's "send as file": a PDF/docx/…
+ *  OR an uncompressed image) to the harness media dir. Returns a stored-attachment ref (filename only — bytes
+ *  never cross the webhook; the harness reads the file). Best-effort → null on failure. */
+async function downloadDocument(doc: any, m: any): Promise<{ file: string; mime: string; filename: string; size: number; kind: string } | null> {
+  try {
+    if (doc.file_size && doc.file_size > MAX_MEDIA_BYTES) {
+      console.error(`[tg-ingress] document ${doc.file_unique_id} too large (${doc.file_size}b) — skipped`)
+      return null
+    }
+    const buf = await downloadFileBuffer(doc.file_id)
+    if (!buf || buf.length > MAX_MEDIA_BYTES) return null
+    const mime = String(doc.mime_type ?? 'application/octet-stream')
+    const origName = String(doc.file_name ?? '')
+    const ext = (origName.includes('.') ? origName.split('.').pop()! : 'bin').toLowerCase().replace(/[^a-z0-9]/g, '') || 'bin'
+    const name = `${m.chat.id}_${m.message_id}_${doc.file_unique_id}.${ext}`
+    mkdirSync(cfg.media_dir, { recursive: true })
+    writeFileSync(`${cfg.media_dir}/${name}`, buf)
+    const kind = mime.startsWith('image/') ? 'image' : 'file'
+    console.error(`[tg-ingress] stored ${kind} ${name} (${buf.length}b, ${mime}) for msg ${m.message_id}`)
+    return { file: name, mime, filename: origName || name, size: buf.length, kind }
+  } catch (e) {
+    console.error('[tg-ingress] document download failed:', e)
+    return null
+  }
+}
+
 /** Download any Telegram file (by file_id) to a Buffer. Best-effort → null on failure. */
 async function downloadFileBuffer(fileId: string): Promise<Buffer | null> {
   try {
@@ -282,7 +308,30 @@ bot.on('message', async (ctx) => {
   const allowPhoto = wantsPhoto && attachmentsAllowed(store, cfg.attachments ?? {}, String(m.chat.id), kind, 'image')
   if (wantsPhoto && !allowPhoto)
     console.error(`[tg-ingress] photo from chat ${m.chat.id} (${kind}) — image attachments off, text only`)
-  const media = allowPhoto ? [await downloadPhoto(ctx, m)].filter(Boolean) : []
+  const media: Array<{ kind: string; file: string; mime: string }> = []
+  if (allowPhoto) {
+    const p = await downloadPhoto(ctx, m)
+    if (p) media.push(p)
+  }
+  // DOCUMENT (sent "as a file" = `m.document`): a PDF/docx/… OR an uncompressed image. An image-as-file joins
+  // the VISION lane (`media`, same as a photo — this is the "media works but files don't" operator fix); a
+  // non-image document becomes an `attachments` entry — stored + surfaced to the duck (filename/mime/size)
+  // for routing/sending, NOT loaded as a vision block (a document isn't one on the OpenAI-compat wire).
+  const attachments: Array<{ file: string; mime: string; filename: string; size: number; kind: string }> = []
+  const doc = (m as any).document
+  if (doc) {
+    const isImageDoc = String(doc.mime_type ?? '').startsWith('image/')
+    const permKind = isImageDoc ? 'image' : 'file'
+    if (attachmentsAllowed(store, cfg.attachments ?? {}, String(m.chat.id), kind, permKind as any)) {
+      const got = await downloadDocument(doc, m)
+      if (got) {
+        if (isImageDoc) media.push({ kind: 'image', file: got.file, mime: got.mime })
+        else attachments.push(got)
+      }
+    } else {
+      console.error(`[tg-ingress] document from chat ${m.chat.id} (${kind}) — ${permKind} attachments off, text only`)
+    }
+  }
   // VOICE (Phase 2): a voice note → separately gated (VOICE attachments) + a per-user daily cap, then
   // downloaded, transcoded (ogg→mp3), and transcribed. The TRANSCRIPT becomes the message `text`, so it
   // flows downstream as an ordinary (untrusted, channel-tier) text message — no harness change.
@@ -311,8 +360,13 @@ bot.on('message', async (ctx) => {
     // messages fold into one debounced wake) and keys the chat's sticky session on it. The
     // per-message id stays in `message_id` above (for reply-targeting + context).
     dedup_key: String(m.chat.id),
-    // Present only for a photo message → keeps every existing text payload byte-identical (back-compat).
+    // Present only for a photo / image-as-file message → keeps every existing text payload byte-identical
+    // (back-compat). Images ride the VISION lane the harness already carries onto the model turn.
     ...(media.length ? { media } : {}),
+    // Present only when a non-image document was sent "as a file": stored files the duck is AWARE of
+    // (filename/mime/size) and can route/send — NOT loaded into the model as vision. Channel-agnostic shape
+    // (buzz/email map to the same `attachments`). Outbound send-by-reference is a later slice.
+    ...(attachments.length ? { attachments } : {}),
   }
   try {
     const r = await fetch(cfg.harness_webhook + path, {

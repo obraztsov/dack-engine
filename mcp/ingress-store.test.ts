@@ -46,6 +46,21 @@ test('attachmentsAllowed: per-media defaults + override; image and voice are gat
   expect(attachmentsAllowed(db, { voice: { dm: false } }, '777', 'dm', 'image')).toBe(true) // image unaffected
 })
 
+test('attachmentsAllowed: `file` (document sent as-a-file) is a THIRD separate gate', () => {
+  const db = openIngressStore(':memory:')
+  // built-in defaults: operator/trusted/dm ON, group/pub OFF — same posture as image/voice
+  expect(attachmentsAllowed(db, {}, '555', 'operator', 'file')).toBe(true)
+  expect(attachmentsAllowed(db, {}, '555', 'dm', 'file')).toBe(true)
+  expect(attachmentsAllowed(db, {}, '-200', 'group', 'file')).toBe(false)
+  expect(attachmentsAllowed(db, {}, '999', 'pub', 'file')).toBe(false)
+  // gated independently of image/voice: turning a chat's files OFF leaves images ON
+  setChatAttachment(db, '555', 'file', false)
+  expect(attachmentsAllowed(db, {}, '555', 'dm', 'file')).toBe(false)
+  expect(attachmentsAllowed(db, {}, '555', 'dm', 'image')).toBe(true)
+  // and a config default can flip files for a kind
+  expect(attachmentsAllowed(db, { file: { group: true } }, '-200', 'group', 'file')).toBe(true)
+})
+
 test('set/getChatAttachment upsert per (chat, media)', () => {
   const db = openIngressStore(':memory:')
   expect(getChatAttachment(db, '-500', 'voice')).toBe(null)

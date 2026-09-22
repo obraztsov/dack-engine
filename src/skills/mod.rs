@@ -93,7 +93,7 @@ pub fn authorize(
     let cmd = manifest
         .command(command)
         .ok_or_else(|| DackError::Config(format!("skill `{skill}` has no command `{command}`")))?;
-    let mut argv = cmd.build_argv(&skill_dir.to_string_lossy(), args, scope)?;
+    let mut argv = cmd.build_argv(&skill_dir.to_string_lossy(), args, scope, media_dir)?;
 
     // A `produces: media` command writes an image to `${MEDIA_OUT}`. The harness — NOT the model — fixes that
     // path under the media dir: a basename-sanitized cache name derived from the (pattern-validated) `ref` arg,
@@ -204,6 +204,11 @@ pub enum ArgSchema {
     Ref {
         from: String,
     },
+    /// A stored ATTACHMENT the model names by **basename** (e.g. a file a client sent, or one a paperwork
+    /// agent returned) — the harness confines it to the media dir and substitutes the absolute path, so an
+    /// outbound file (e.g. buzz `messages send --file`) can only ever attach a STORED file, never an
+    /// arbitrary host path. The skill-path twin of telegram `reply_document`'s `attachment_id`.
+    Attachment {},
 }
 
 impl SkillManifest {
@@ -311,8 +316,32 @@ impl ArgSchema {
             }
             // A `ref` arg is filled by the harness (build_argv), never validated against model input.
             ArgSchema::Ref { .. } => Ok(()),
+            // An `attachment` arg is CONFINED (not regex-validated) against the media dir in build_argv.
+            ArgSchema::Attachment {} => Ok(()),
         }
     }
+}
+
+/// Confine a MODEL-named attachment id (a basename) to the media dir → an absolute path to a STORED file.
+/// basename (drops any `../`) + canonicalize + store-prefix check + must be a regular file. Mirrors the TS
+/// `mcp/attachments.ts::resolveAttachment`, so the skill (execve) and MCP (telegram) egress paths confine
+/// identically — an outbound file can only reach a stored file. Any escape / missing file is an `Err`.
+fn confine_attachment(media_dir: &Path, id: &str) -> Result<String> {
+    let name = Path::new(id)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| DackError::Config(format!("invalid attachment id `{id}`")))?;
+    let canon = media_dir
+        .join(name)
+        .canonicalize()
+        .map_err(|_| DackError::Config(format!("attachment `{name}` not found in the store")))?;
+    let root = media_dir
+        .canonicalize()
+        .map_err(|e| DackError::Config(format!("media dir unavailable: {e}")))?;
+    if !canon.starts_with(&root) || !canon.is_file() {
+        return Err(DackError::Config(format!("attachment `{name}` escapes the store or is not a regular file")));
+    }
+    Ok(canon.to_string_lossy().into_owned())
 }
 
 impl SkillCommand {
@@ -320,7 +349,7 @@ impl SkillCommand {
     /// arg must be present (no missing, no extra), each value must validate, then `${SKILL_DIR}` → `skill_dir`
     /// and each `{hole}` → its validated value. The result is spawned via execve — never a shell — so the
     /// values are inert argv elements. `skill_dir` is the absolute (or guest) path substituted for the token.
-    pub fn build_argv(&self, skill_dir: &str, model_args: &BTreeMap<String, String>, scope: &BTreeMap<String, String>) -> Result<Vec<String>> {
+    pub fn build_argv(&self, skill_dir: &str, model_args: &BTreeMap<String, String>, scope: &BTreeMap<String, String>, media_dir: Option<&Path>) -> Result<Vec<String>> {
         // The model may supply only NON-ref declared args (a `ref` arg is harness-routed).
         for k in model_args.keys() {
             match self.args.get(k) {
@@ -329,7 +358,8 @@ impl SkillCommand {
                 _ => {}
             }
         }
-        // Resolve every declared arg: `ref` from the trusted reply-scope, others from the (validated) model.
+        // Resolve every declared arg: `ref` from the trusted reply-scope, `attachment` = a model-named
+        // basename CONFINED to the media dir, others from the (validated) model.
         let mut values: BTreeMap<String, String> = BTreeMap::new();
         for (name, schema) in &self.args {
             let value = match schema {
@@ -337,6 +367,11 @@ impl SkillCommand {
                     .get(from)
                     .cloned()
                     .ok_or_else(|| DackError::Config(format!("command `{}`: reply-scope has no `{from}` for arg `{name}`", self.id)))?,
+                ArgSchema::Attachment {} => {
+                    let v = model_args.get(name).ok_or_else(|| DackError::Config(format!("command `{}`: missing arg `{name}`", self.id)))?;
+                    let dir = media_dir.ok_or_else(|| DackError::Config(format!("command `{}`: arg `{name}` is an attachment but no media dir is configured", self.id)))?;
+                    confine_attachment(dir, v).map_err(|e| DackError::Config(format!("command `{}` arg `{name}`: {e}", self.id)))?
+                }
                 _ => {
                     let v = model_args.get(name).ok_or_else(|| DackError::Config(format!("command `{}`: missing arg `{name}`", self.id)))?;
                     schema.validate(name, v)?;
@@ -492,19 +527,19 @@ commands:
         let feed = m.command("feed").unwrap();
         let mut args = BTreeMap::new();
         args.insert("limit".to_string(), "25".to_string());
-        let argv = feed.build_argv("/soul/skills/buzz", &args, &BTreeMap::new()).unwrap();
+        let argv = feed.build_argv("/soul/skills/buzz", &args, &BTreeMap::new(), None).unwrap();
         assert_eq!(argv, vec!["/soul/skills/buzz/bin/buzz", "feed", "read", "--limit", "25"]);
 
         // Enum rejects an off-list value.
         let mut bad = BTreeMap::new();
         bad.insert("limit".to_string(), "999".to_string());
-        assert!(feed.build_argv("/x", &bad, &BTreeMap::new()).unwrap_err().to_string().contains("not one of"));
+        assert!(feed.build_argv("/x", &bad, &BTreeMap::new(), None).unwrap_err().to_string().contains("not one of"));
 
         // Missing / extra args are rejected.
-        assert!(feed.build_argv("/x", &BTreeMap::new(), &BTreeMap::new()).unwrap_err().to_string().contains("missing arg"));
+        assert!(feed.build_argv("/x", &BTreeMap::new(), &BTreeMap::new(), None).unwrap_err().to_string().contains("missing arg"));
         let mut extra = args.clone();
         extra.insert("bogus".to_string(), "1".to_string());
-        assert!(feed.build_argv("/x", &extra, &BTreeMap::new()).unwrap_err().to_string().contains("unexpected arg"));
+        assert!(feed.build_argv("/x", &extra, &BTreeMap::new(), None).unwrap_err().to_string().contains("unexpected arg"));
     }
 
     #[test]
@@ -514,19 +549,19 @@ commands:
         // A normal note validates + lands as ONE argv element (execve, not shell → metachars inert).
         let mut args = BTreeMap::new();
         args.insert("text".to_string(), "gm; rm -rf / $(whoami) `id`".to_string());
-        let argv = post.build_argv("/s", &args, &BTreeMap::new()).unwrap();
+        let argv = post.build_argv("/s", &args, &BTreeMap::new(), None).unwrap();
         assert_eq!(argv.last().unwrap(), "gm; rm -rf / $(whoami) `id`"); // inert — one element, no shell
         assert_eq!(argv[0], "/s/bin/buzz");
 
         // A 281-char note fails the `^.{1,280}$` bound (partial match can't sneak past — whole-span check).
         let mut too_long = BTreeMap::new();
         too_long.insert("text".to_string(), "x".repeat(281));
-        assert!(post.build_argv("/s", &too_long, &BTreeMap::new()).unwrap_err().to_string().contains("does not match"));
+        assert!(post.build_argv("/s", &too_long, &BTreeMap::new(), None).unwrap_err().to_string().contains("does not match"));
 
         // A newline-bearing value can't satisfy `^.{1,280}$` (`.` excludes \n) — no multiline smuggling.
         let mut nl = BTreeMap::new();
         nl.insert("text".to_string(), "line1\nline2".to_string());
-        assert!(post.build_argv("/s", &nl, &BTreeMap::new()).is_err());
+        assert!(post.build_argv("/s", &nl, &BTreeMap::new(), None).is_err());
     }
 
     #[test]
@@ -551,15 +586,15 @@ commands:
         model.insert("text".into(), "hi there".to_string());
         // ref args filled from scope; model supplies only `text`.
         assert_eq!(
-            cmd.build_argv("/s", &model, &scope).unwrap(),
+            cmd.build_argv("/s", &model, &scope, None).unwrap(),
             vec!["p", "--channel", "chan-1", "--content", "hi there", "--reply-to", "evt-9"]
         );
         // The model may NOT set a ref arg (destination-lock — no hijacking the reply target).
         let mut hijack = model.clone();
         hijack.insert("channel".into(), "attacker-channel".to_string());
-        assert!(cmd.build_argv("/s", &hijack, &scope).unwrap_err().to_string().contains("harness-routed"));
+        assert!(cmd.build_argv("/s", &hijack, &scope, None).unwrap_err().to_string().contains("harness-routed"));
         // No scope ⇒ deny (fail-closed).
-        assert!(cmd.build_argv("/s", &model, &BTreeMap::new()).unwrap_err().to_string().contains("reply-scope has no"));
+        assert!(cmd.build_argv("/s", &model, &BTreeMap::new(), None).unwrap_err().to_string().contains("reply-scope has no"));
     }
 
     #[test]
@@ -635,6 +670,49 @@ commands:
 
         // No media dir ⇒ deny (fail-closed).
         assert!(authorize(&base, "buzz", "media_get", &args, &trusted, &BTreeMap::new(), None).unwrap_err().to_string().contains("no media dir"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn attachment_arg_confines_a_model_named_file_to_the_media_dir() {
+        let base = std::env::temp_dir().join(format!("dack-attacharg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("invoice.pdf"), b"%PDF-1.4").unwrap();
+
+        let manifest = r#"
+name: buzz
+commands:
+  - id: send_file
+    tier: post
+    trust: self
+    argv: ["p", "messages", "send", "--channel", "{channel}", "--content", "{text}", "--file", "{attachment}"]
+    args:
+      channel: { type: ref, from: conversation }
+      text: { type: string, pattern: "^.{1,100}$" }
+      attachment: { type: attachment }
+"#;
+        let cmd = SkillManifest::parse(manifest.as_bytes()).unwrap().command("send_file").unwrap().clone();
+        let mut scope = BTreeMap::new();
+        scope.insert("conversation".into(), "chan-1".to_string());
+        let mut model = BTreeMap::new();
+        model.insert("text".into(), "here is your invoice".to_string());
+        model.insert("attachment".into(), "invoice.pdf".to_string());
+
+        // The `attachment` arg resolves to the CONFINED absolute path of the stored file.
+        let argv = cmd.build_argv("/s", &model, &scope, Some(base.as_path())).unwrap();
+        let want = base.join("invoice.pdf").canonicalize().unwrap().to_string_lossy().into_owned();
+        assert!(argv.contains(&want), "argv carries the confined path: {argv:?}");
+
+        // Traversal is stripped to a basename → not a real store file → DENY (never escapes).
+        let mut evil = model.clone();
+        evil.insert("attachment".into(), "../../etc/passwd".to_string());
+        assert!(cmd.build_argv("/s", &evil, &scope, Some(base.as_path())).unwrap_err().to_string().contains("not found"));
+        // A missing file → deny; no media dir → deny (fail-closed).
+        let mut missing = model.clone();
+        missing.insert("attachment".into(), "nope.pdf".to_string());
+        assert!(cmd.build_argv("/s", &missing, &scope, Some(base.as_path())).unwrap_err().to_string().contains("not found"));
+        assert!(cmd.build_argv("/s", &model, &scope, None).unwrap_err().to_string().contains("no media dir"));
         let _ = std::fs::remove_dir_all(&base);
     }
 

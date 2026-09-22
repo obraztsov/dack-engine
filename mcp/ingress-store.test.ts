@@ -17,15 +17,16 @@ import {
   recentSends,
 } from './ingress-store'
 
-test('attachmentKind classifies by intrinsic category (independent of path config)', () => {
+test('attachmentKind classifies by intrinsic category (independent of path config); multi-operator', () => {
   const groups = { '-100': '/telegram/trusted' }
-  const OP = 42
-  expect(attachmentKind(OP, groups, OP, 999, 'private')).toBe('operator')
-  expect(attachmentKind(OP, groups, 7, -100, 'supergroup')).toBe('trusted')
-  expect(attachmentKind(OP, groups, 7, 555, 'private')).toBe('dm')
-  expect(attachmentKind(OP, groups, 7, -200, 'supergroup')).toBe('group')
-  expect(attachmentKind(OP, groups, 7, -300, 'channel')).toBe('pub')
-  expect(attachmentKind(null, {}, 7, 555, 'private')).toBe('dm')
+  const OPS = [42, 43] // multi-operator list
+  expect(attachmentKind(OPS, groups, 42, 999, 'private')).toBe('operator')
+  expect(attachmentKind(OPS, groups, 43, 999, 'private')).toBe('operator') // second operator too
+  expect(attachmentKind(OPS, groups, 7, -100, 'supergroup')).toBe('trusted')
+  expect(attachmentKind(OPS, groups, 7, 555, 'private')).toBe('dm')
+  expect(attachmentKind(OPS, groups, 7, -200, 'supergroup')).toBe('group')
+  expect(attachmentKind(OPS, groups, 7, -300, 'channel')).toBe('pub')
+  expect(attachmentKind([], {}, 7, 555, 'private')).toBe('dm') // no operators configured
 })
 
 test('attachmentsAllowed: per-media defaults + override; image and voice are gated SEPARATELY', () => {

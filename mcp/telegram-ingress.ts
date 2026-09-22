@@ -49,6 +49,9 @@ function loadToken(): string {
 
 type Cfg = {
   harness_webhook: string
+  // OPERATORS: `operator_ids` is the multi-operator list; `operator_user_id` is the legacy single field
+  // (still honored). A sender in either → the operator route + operator attachment perms. Empty = none.
+  operator_ids?: number[]
   operator_user_id: number | null
   op_path: string
   pub_path: string
@@ -105,6 +108,11 @@ function loadConfig(): Cfg {
   return raw ? { ...def, ...JSON.parse(raw) } : def
 }
 
+/** The effective operator id set: the `operator_ids` list, else the legacy single `operator_user_id`. */
+function opIds(cfg: Cfg): number[] {
+  return cfg.operator_ids?.length ? cfg.operator_ids : cfg.operator_user_id != null ? [cfg.operator_user_id] : []
+}
+
 /** Resolve a message's webhook path by precedence: operator → trusted group → chat-type split → public.
  *  `chatType` is Telegram's `chat.type` (`private` | `group` | `supergroup` | `channel`). */
 function routeFor(
@@ -113,7 +121,7 @@ function routeFor(
   chatId: number,
   chatType: string,
 ): { path: string; why: string } {
-  if (cfg.operator_user_id != null && fromId === cfg.operator_user_id) return { path: cfg.op_path, why: 'OP→org' }
+  if (fromId != null && opIds(cfg).includes(fromId)) return { path: cfg.op_path, why: 'OP→org' }
   const group = cfg.groups[String(chatId)]
   if (group) return { path: group, why: `group→${group}` } // an explicitly trusted group wins
   // OPT-IN chat-type split (unset → falls through to pub_path, the current single-webhook behavior).
@@ -300,7 +308,7 @@ bot.on('message', async (ctx) => {
   const sent_at = m.date
     ? new Date(m.date * 1000).toISOString().replace('T', ' ').replace(/\..+Z$/, ' UTC')
     : null
-  const kind = attachmentKind(cfg.operator_user_id, cfg.groups, fromId, m.chat.id, m.chat.type)
+  const kind = attachmentKind(opIds(cfg), cfg.groups, fromId, m.chat.id, m.chat.type)
   // IMAGE (Phase 1): download a photo to the harness media dir, but only if IMAGE attachments are enabled
   // for this chat (per-chat override in ingress.sqlite, else default by kind — DM/operator/trusted on,
   // open groups/channels off). The caption (if any) is captured as `text` below.
@@ -422,5 +430,5 @@ function startTypingIndicator(): void {
 startTypingIndicator()
 
 bot.catch((err) => console.error('[tg-ingress] bot error:', err?.error ?? err))
-console.error(`[tg-ingress] long-polling; operator_user_id=${cfg.operator_user_id} → ${cfg.op_path}; trusted groups=${JSON.stringify(cfg.groups)}; else → ${cfg.pub_path}; harness=${cfg.harness_webhook}`)
+console.error(`[tg-ingress] long-polling; operators=${JSON.stringify(opIds(cfg))} → ${cfg.op_path}; trusted groups=${JSON.stringify(cfg.groups)}; else → ${cfg.pub_path}; harness=${cfg.harness_webhook}`)
 bot.start()

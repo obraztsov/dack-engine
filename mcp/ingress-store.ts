@@ -69,13 +69,13 @@ export function openIngressStore(path: string): Database {
  * operator > trusted group > private(`dm`) > broadcast channel(`pub`) > group/supergroup(`group`).
  */
 export function attachmentKind(
-  operatorId: number | null,
+  operatorIds: number[],
   groups: Record<string, string>,
   fromId: number | null,
   chatId: number,
   chatType: string,
 ): AttachKind {
-  if (operatorId != null && fromId === operatorId) return 'operator'
+  if (fromId != null && operatorIds.includes(fromId)) return 'operator'
   if (groups[String(chatId)]) return 'trusted'
   if (chatType === 'private') return 'dm'
   if (chatType === 'channel') return 'pub'

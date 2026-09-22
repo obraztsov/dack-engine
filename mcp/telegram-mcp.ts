@@ -14,8 +14,10 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
+import { readFileSync } from 'node:fs'
 import { openIngressStore, setChatAttachment, getReferral, recordSend, type MediaType } from './ingress-store'
 import { openPondStore, restoreHandles, spliceHandles } from './pond-store'
+import { resolveAttachment } from './attachments'
 
 // Per-chat attachment store — the harness injects INGRESS_DB (absolute). Absent ⇒ the toggle is
 // unavailable (returns an error); `reply` still works.
@@ -40,6 +42,23 @@ async function tgSend(body: Record<string, unknown>): Promise<unknown> {
 }
 
 const asText = (v: unknown) => ({ content: [{ type: 'text' as const, text: JSON.stringify(v) }] })
+
+// Send a stored file to a chat via Bot API `sendDocument` (multipart). Bytes never touched the model —
+// the harness stored them, the model only named the id.
+async function tgSendDocument(chat: string, filePath: string, fileName: string, caption: string | undefined, replyTo: string | undefined): Promise<any> {
+  const token = process.env.TELEGRAM_BOT_TOKEN
+  if (!token) return { ok: false, error: 'TELEGRAM_BOT_TOKEN not set' }
+  const form = new FormData()
+  form.append('chat_id', chat)
+  form.append('document', new Blob([readFileSync(filePath)]), fileName)
+  if (caption) form.append('caption', caption.slice(0, 1024))
+  if (replyTo) form.append('reply_parameters', JSON.stringify({ message_id: Number(replyTo) }))
+  const r = await fetch(`https://api.telegram.org/bot${token}/sendDocument`, { method: 'POST', body: form })
+  const j: any = await r.json().catch(() => ({}))
+  if (!r.ok || j?.ok === false) return { ok: false, status: r.status, error: JSON.stringify(j).slice(0, 400) }
+  console.error('[telegram-mcp] sent document', fileName, 'message_id=', j?.result?.message_id, 'to', j?.result?.chat?.id)
+  return { ok: true, message_id: j?.result?.message_id, chat_id: j?.result?.chat?.id }
+}
 
 const server = new McpServer({ name: 'telegram', version: '0.2.0' })
 
@@ -94,6 +113,35 @@ server.registerTool(
         at,
       )
     return asText(consumed.length && sent?.ok ? { ...sent, spliced: consumed.length } : sent)
+  },
+)
+
+server.registerTool(
+  'reply_document',
+  {
+    description:
+      'Send a FILE (a document — PDF/docx/… — or any stored attachment) to the Telegram chat that woke you. ' +
+      '`attachment_id` names a file already in your attachment store (e.g. one a client sent you, or one produced ' +
+      'for you) — you cannot attach an arbitrary path or a file you were never given. Optional short caption. The ' +
+      'destination is fixed to your chat, same as reply.',
+    inputSchema: { attachment_id: z.string().min(1).max(256), caption: z.string().max(1024).optional() },
+  },
+  async ({ attachment_id, caption }: { attachment_id: string; caption?: string }) => {
+    const chat = process.env.TELEGRAM_REPLY_CHAT
+    if (!chat) return asText({ ok: false, error: 'no source chat in scope — this cycle was not woken by Telegram' })
+    const res = resolveAttachment(process.env.MEDIA_DIR, attachment_id)
+    if ('error' in res) return asText({ ok: false, error: res.error })
+    const replyTo = process.env.TELEGRAM_REPLY_TO
+    const at = Math.floor(Date.now() / 1000)
+    const sent: any = await tgSendDocument(chat, res.path, res.name, caption, replyTo)
+    if (!sent?.ok) console.error(`[telegram-mcp] sendDocument FAILED chat=${chat}: ${sent?.error ?? 'unknown'}`)
+    if (ingressStore)
+      recordSend(
+        ingressStore,
+        { via: 'reply_document', chatId: chat, ok: !!sent?.ok, messageId: sent?.message_id ?? null, replyTo: replyTo ?? null, chars: 0, error: sent?.ok ? null : (sent?.error ?? 'unknown') },
+        at,
+      )
+    return asText(sent)
   },
 )
 

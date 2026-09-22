@@ -1427,6 +1427,14 @@ impl Harness {
                         };
                         extra_env.insert("INGRESS_DB".to_string(), abs.to_string_lossy().into_owned());
                     }
+                    // Every MCP server also sees MEDIA_DIR (ABSOLUTE): the harness-owned attachment store.
+                    // A file-sending tool (e.g. telegram `reply_document`) confines a model-named
+                    // `attachment_id` (basename) to THIS dir before upload — so the model can attach only a
+                    // stored file, never an arbitrary host path. Benign for servers that don't use it.
+                    extra_env.insert(
+                        "MEDIA_DIR".to_string(),
+                        crate::media::dir(&self.config.media_dir).to_string_lossy().into_owned(),
+                    );
                     for (var, field) in &server.scope_env {
                         // Reserved field `dedup_key` resolves to the Stimulus's conversation key (not a
                         // payload field) — the platform-agnostic conversation TAG (telegram chat_id /

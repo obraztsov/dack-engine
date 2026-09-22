@@ -133,6 +133,16 @@ client ──(telegram doc / email attachment)──▶ client-duck ──(Buzz 
 
 ## 7. Build phases (with effort from the inventory)
 
+> **Progress (2026-09-22):** decision locked — heavy processing → Hermes/workers (tested later); now building
+> channel-agnostic bidirectional attachment I/O; email next (Cloudflare Email Workers).
+> **Done:** telegram `m.document` inbound (`a92426c` — image-as-file → vision, doc → `attachments`; the
+> operator's "files don't work" fix); telegram `reply_document` **outbound** (`353413f` — send-by-`attachment_id`,
+> harness `MEDIA_DIR` + shared path-confined `attachments.ts`); buzz document inbound (`5301dda` — opt-in
+> `media_prefetch_docs` → routable stored `file`). **Contract established:** `attachments:[{file,mime,filename,
+> size,kind}]` inbound; `attachment_id` (basename, harness-confined) outbound. **Next:** buzz `send --file`
+> outbound skill; email channel (P1/P2 email); then Hermes.
+
+
 - **P0 — Blob-carrying media store + Buzz file transfer.** Generalize the harness media store beyond
   `MediaKind::Image` to an opaque stored **blob** (file the duck can *route/attach* without pushing it as a
   vision block); relax Buzz `prefetchMedia`/`media_get` off the image-only filter (a `file_get`); wire a Buzz

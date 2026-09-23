@@ -214,6 +214,13 @@ pub struct StatePromptFrontmatter {
     /// read-modify-write cycle. Only opt a prompt in once you're sure it never writes `memory/`.
     #[serde(default)]
     pub parallel: bool,
+    /// Opt-in **op-notification when a cycle entering this prompt produces NOTHING** — it terminates with
+    /// zero outward tool calls AND zero batons (a "swallowed answer": a reply that died in a thought; or a
+    /// housekeeping cycle that silently no-op'd). The harness POSTs an `alert` to the notify router
+    /// (`config.notify_url`). Default `false` (off for every prompt); any state prompt may set it — a
+    /// self-tier housekeeping prompt can want it just as a client-facing perceive does.
+    #[serde(default)]
+    pub notify_on_silent: bool,
 }
 
 /// A parsed state-prompt: its id (path), frontmatter, and the trusted directive body.
@@ -232,6 +239,8 @@ pub struct StatePrompt {
     pub reply_key: Option<String>,
     /// De-bloat knobs for the injected context blocks (memory/runlog). `None` ⇒ both on (`ContextConfig::default`).
     pub context: Option<ContextConfig>,
+    /// Opt-in op-notification when a cycle entering this prompt terminates with zero outward + zero batons.
+    pub notify_on_silent: bool,
     /// **Multithreading Axis-2:** `true` ⇒ this step takes a READ-lock (runs concurrently; wall-guaranteed
     /// to make no memory/soul write). Default `false` ⇒ an exclusive WRITE-lock for the whole cycle.
     pub parallel: bool,
@@ -270,6 +279,7 @@ impl StatePrompt {
             reply_key: fm.reply_key,
             context: fm.context,
             parallel: fm.parallel,
+            notify_on_silent: fm.notify_on_silent,
             system_frame,
             body,
             resume_body,
@@ -396,6 +406,14 @@ mod tests {
         assert!(!StatePrompt::parse("p", "---\nstate: perceive\n---\nx").unwrap().parallel);
         // `parallel: true` → read-lock opt-in.
         assert!(StatePrompt::parse("p", "---\nstate: perceive\nparallel: true\n---\nx").unwrap().parallel);
+    }
+
+    #[test]
+    fn notify_on_silent_defaults_off_and_parses() {
+        // Absent → false (no swallowed-answer op-notification).
+        assert!(!StatePrompt::parse("p", "---\nstate: perceive\n---\nx").unwrap().notify_on_silent);
+        // `notify_on_silent: true` → alert when a cycle entering this prompt produces nothing.
+        assert!(StatePrompt::parse("p", "---\nstate: perceive\nnotify_on_silent: true\n---\nx").unwrap().notify_on_silent);
     }
 
     #[test]

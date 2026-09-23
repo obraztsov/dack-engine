@@ -378,7 +378,7 @@ impl Harness {
             tokio::spawn(async move {
                 let _ = tokio::time::timeout(
                     std::time::Duration::from_secs(5),
-                    notify_post(&url, &title, &body),
+                    notify_post(&url, "error", &title, &body),
                 )
                 .await;
             });
@@ -475,6 +475,14 @@ impl Harness {
             /// reaches ONLY `assemble_mcp_servers` (env vars), never the model (the firebreak).
             scope_override: Option<serde_json::Value>,
         }
+        // Swallowed-answer op-notification (opt-in on the ENTRY prompt's frontmatter): if this cycle
+        // produces NOTHING — zero outward tool calls across every step AND zero batons — the reply likely
+        // died in a thought (or a housekeeping cycle silently no-op'd). Track across the whole dispatch.
+        let entry_notify_on_silent = current.notify_on_silent;
+        let entry_prompt_id = current.id.clone();
+        let mut acted_outward_any = false;
+        let mut produced_baton_any = false;
+
         let mut work: std::collections::VecDeque<Branch> = std::collections::VecDeque::new();
         work.push_back(Branch {
             prompt: current,
@@ -496,9 +504,11 @@ impl Harness {
                 );
                 break;
             }
-            let (out, runlog_ref, accessed) = self
+            let (out, runlog_ref, accessed, acted_outward) = self
                 .run_step(&b.prompt, &b.step, &stimulus, &b.trust, b.ceiling, b.scope_override.as_ref(), steps, wake_unretryable)
                 .await?;
+            acted_outward_any |= acted_outward;
+            produced_baton_any |= out.fan_out().iter().any(|baton| !baton.to_prompt.is_empty());
             // Taint by ACTUAL access: degrade THIS branch's trust by what the step called, then
             // recompute the ceiling its child batons are checked against (monotonic).
             let mut trust = b.trust.clone();
@@ -644,6 +654,22 @@ impl Harness {
             }
         }
 
+        // Swallowed-answer op-notification: the entry prompt opted in (`notify_on_silent`) AND this whole
+        // cycle produced nothing — no outward tool call anywhere, no baton. A reply that died in a thought
+        // (or a housekeeping cycle that silently no-op'd). Fire-and-forget to the notify router, timeboxed.
+        if entry_notify_on_silent && !acted_outward_any && !produced_baton_any {
+            if let Some(url) = self.config.notify_url.clone() {
+                let title = format!("silent cycle: {}", stimulus.id);
+                let body = format!(
+                    "a cycle entering `{entry_prompt_id}` produced zero outward actions and zero batons — a reply may have died in a thought (stimulus {})",
+                    stimulus.id
+                );
+                tokio::spawn(async move {
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), notify_post(&url, "alert", &title, &body)).await;
+                });
+            }
+        }
+
         // One push per cycle ships every local commit made above (per-state runlogs, memory
         // append, the sweep) with a single `git push`. No-op offline.
         self.push_soul().await;
@@ -672,7 +698,7 @@ impl Harness {
         // or it's a Reflect cycle) — shared across the wake's steps, so a timeout is only retried when
         // nothing irreversible/self-modifying happened anywhere in the wake.
         wake_unretryable: &std::sync::atomic::AtomicBool,
-    ) -> Result<(AgentOutput, String, Option<TrustTier>)> {
+    ) -> Result<(AgentOutput, String, Option<TrustTier>, bool)> {
         // MEMORY/SOUL LOCK (Axis-2), held for the WHOLE step. Context assembly READS memory/soul and a
         // writer later WRITES it, so the exclusive region must span read-through-write (a writer's
         // read-modify-write is atomic; two writers can't clobber each other). A `parallel: true` prompt
@@ -981,7 +1007,7 @@ impl Harness {
                 Err(e) => tracing::warn!("digest deliver failed: {e}"),
             }
         }
-        Ok((out, runlog_ref, accessed))
+        Ok((out, runlog_ref, accessed, recorder.acted_outward()))
     }
 
     /// The trust degradation from a step's ACTUAL tool calls (the taint model). Only MCP tools
@@ -2016,7 +2042,7 @@ const MAX_TIMEOUT_RETRIES: u32 = 3;
 /// over a plain TcpStream — the failure-REPORTING path deliberately adds no HTTP-client dependency
 /// and never reads the response (the router's jsonl is the audit; we never block on delivery).
 /// `http://host:port/path` only — the router is a localhost sibling by design.
-async fn notify_post(url: &str, title: &str, body_text: &str) {
+async fn notify_post(url: &str, severity: &str, title: &str, body_text: &str) {
     let Some(rest) = url.strip_prefix("http://") else {
         tracing::warn!("notify_url must be http://host:port/path — notification dropped");
         return;
@@ -2026,7 +2052,7 @@ async fn notify_post(url: &str, title: &str, body_text: &str) {
         None => (rest.to_string(), "/notify".to_string()),
     };
     let payload = serde_json::json!({
-        "severity": "error",
+        "severity": severity,
         "source": "harness",
         "title": title,
         "body": body_text,
@@ -4145,7 +4171,7 @@ mod tests {
             session: None,
             reply_key: None,
             context: None,
-            parallel: false,
+            parallel: false, notify_on_silent: false,
             system_frame: String::new(),
             body: String::new(),
             resume_body: None,
@@ -4275,7 +4301,7 @@ mod tests {
         // OPEN perceive: the inline public MCP is admitted, read-tier, with its wall prefix.
         let open = StatePrompt {
             id: "p".into(), state: ConsciousnessState::Perceive,
-            mcp: vec![inline(), McpRef::Import("cove-read".into())], transitions: vec![], model: None, session: None, reply_key: None, context: None, parallel: false, system_frame: String::new(), body: String::new(), resume_body: None,
+            mcp: vec![inline(), McpRef::Import("cove-read".into())], transitions: vec![], model: None, session: None, reply_key: None, context: None, parallel: false, notify_on_silent: false, system_frame: String::new(), body: String::new(), resume_body: None,
         };
         let (servers, inline_read, _) = harness.assemble_mcp_servers(&open, &stim, &TrustTier::self_(), None).await;
         assert!(servers.contains_key("rootai"), "inline admitted on an open tier");
@@ -4288,7 +4314,7 @@ mod tests {
         // LOCKED express (unconfigured → default locked): the same inline is rejected.
         let locked = StatePrompt {
             id: "e".into(), state: ConsciousnessState::Express,
-            mcp: vec![inline()], transitions: vec![], model: None, session: None, reply_key: None, context: None, parallel: false, system_frame: String::new(), body: String::new(), resume_body: None,
+            mcp: vec![inline()], transitions: vec![], model: None, session: None, reply_key: None, context: None, parallel: false, notify_on_silent: false, system_frame: String::new(), body: String::new(), resume_body: None,
         };
         let (servers, inline_read, _) = harness.assemble_mcp_servers(&locked, &stim, &TrustTier::self_(), None).await;
         assert!(servers.is_empty() && inline_read.is_empty(), "no self-plug on a locked tier");
@@ -4338,7 +4364,7 @@ mod tests {
         let stim = poisoned_stimulus();
         let express = StatePrompt {
             id: "e".into(), state: ConsciousnessState::Express,
-            mcp: vec![McpRef::Import("telegram".into())], transitions: vec![], model: None, session: None, reply_key: None, context: None, parallel: false, system_frame: String::new(), body: String::new(), resume_body: None,
+            mcp: vec![McpRef::Import("telegram".into())], transitions: vec![], model: None, session: None, reply_key: None, context: None, parallel: false, notify_on_silent: false, system_frame: String::new(), body: String::new(), resume_body: None,
         };
 
         // public cycle (rank 0) < org (rank 1) → telegram WITHHELD. And because the stimulus' ENTRY
@@ -4403,7 +4429,7 @@ mod tests {
         stim.directive_tier = TrustTier::public();
         let express = StatePrompt {
             id: "e".into(), state: ConsciousnessState::Express,
-            mcp: vec![McpRef::Import("telegram".into())], transitions: vec![], model: None, session: None, reply_key: None, context: None, parallel: false, system_frame: String::new(), body: String::new(), resume_body: None,
+            mcp: vec![McpRef::Import("telegram".into())], transitions: vec![], model: None, session: None, reply_key: None, context: None, parallel: false, notify_on_silent: false, system_frame: String::new(), body: String::new(), resume_body: None,
         };
         let (servers, _, unavail) = harness.assemble_mcp_servers(&express, &stim, &TrustTier::public(), None).await;
         assert!(!servers.contains_key("telegram"));
@@ -4419,7 +4445,7 @@ mod tests {
         let p = StatePrompt {
             id: "cove/perceive_trade".into(), state: ConsciousnessState::Perceive,
             mcp: vec![], transitions: vec![], model: None, session: None, reply_key: None,
-            context: None, parallel: false, system_frame: String::new(), body: String::new(), resume_body: None,
+            context: None, parallel: false, notify_on_silent: false, system_frame: String::new(), body: String::new(), resume_body: None,
         };
         // Both servers assembled; cove-read will be flagged unavailable (a live liveness failure).
         let servers: BTreeMap<String, serde_json::Value> =
@@ -4507,7 +4533,7 @@ mod tests {
         let express = StatePrompt {
             id: "e".into(), state: ConsciousnessState::Express,
             mcp: vec![McpRef::Import("telegram".into())], transitions: vec![], model: None, session: None,
-            reply_key: None, context: None, parallel: false, system_frame: String::new(), body: String::new(), resume_body: None,
+            reply_key: None, context: None, parallel: false, notify_on_silent: false, system_frame: String::new(), body: String::new(), resume_body: None,
         };
 
         // No override → the top-level latest (message_id 20).
@@ -4568,7 +4594,7 @@ mod tests {
         let perceive = StatePrompt {
             id: "p".into(), state: ConsciousnessState::Perceive,
             mcp: vec![McpRef::Import("recall".into())], transitions: vec![], model: None, session: None,
-            reply_key: None, context: None, parallel: false, system_frame: String::new(), body: String::new(), resume_body: None,
+            reply_key: None, context: None, parallel: false, notify_on_silent: false, system_frame: String::new(), body: String::new(), resume_body: None,
         };
 
         // dedup_key set → RECALL_TAG carries the conversation tag (recall public → cycle stays public).
@@ -4821,7 +4847,7 @@ mod tests {
             session: None,
             reply_key: None,
             context: None,
-            parallel: false,
+            parallel: false, notify_on_silent: false,
             system_frame: String::new(),
             body: "go".into(),
             resume_body: None,
@@ -4973,7 +4999,7 @@ mod tests {
                 auto_tags: Vec::new(),
                 runlog: crate::state_prompt::RunlogContext { thread: 20, ..Default::default() },
             }),
-            parallel: false,
+            parallel: false, notify_on_silent: false,
             system_frame: String::new(),
             body: "FULL-BODY-go".into(),
             resume_body: Some("LEAN-RESUME-only-new".into()),
@@ -5088,7 +5114,7 @@ mod tests {
             session: Some(SessionConfig { sticky: true, key: vec!["thread_id".into()] }),
             reply_key: None,
             context: None,
-            parallel: false,
+            parallel: false, notify_on_silent: false,
             system_frame: String::new(),
             body: "go".into(),
             resume_body: None,

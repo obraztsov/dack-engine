@@ -162,6 +162,61 @@ surface) that stays a human decision: the `twitter-digest` job, when it spots an
 [concepts](concepts.md#memory-short-term-vs-long-term) for the digest pattern and
 [capabilities](capabilities.md) for the trust classes.
 
+## Op-notify lane (operational error trail)
+
+The **notify lane is not a messaging channel** — it is a separate operational/error TRAIL for things a
+human should hear about *going wrong*. Talking to a person (a client reply, a heads-up to a group or
+another agent) is a normal **SEND**: multi-baton fan-out already lets one cycle reply the client *and*
+ping a group over telegram/buzz. The notify lane is the parallel audit + alerting path, with its own
+routing, dedup, and durable log.
+
+**Three producers feed one router:**
+
+- The harness **`notify_url` hook** — a terminal dispatch failure the harness gives up on POSTs
+  `severity:"error"`.
+- The **swallowed-answer detector** — a cycle entering a prompt whose frontmatter sets
+  `notify_on_silent: true` that finishes with zero outward tool calls **and** zero batons POSTs
+  `severity:"alert"` ("a reply may have died in a thought"). Opt-in per prompt (default off) so a
+  housekeeping/self-tier cycle can watch itself too, not just human-facing states.
+- The **`notify` MCP** (`mcp/notify-mcp.ts`) — the model's own hand: `notify{severity, title?, message}`
+  where severity is `error` / `alert` / `info`. Its destinations are operator config (there is no
+  destination argument), so it is safe to grant to any cycle — there is nothing to hijack. Durable-first:
+  it appends a local jsonl before POSTing, so a down router loses nothing.
+
+**The router (`mcp/notify-router.ts`, a module)** delivers by severity. `severity_routes[sev] → [connector]`
+and each connector carries its OWN targets, so one severity can fan to telegram **and** a buzz ops-channel:
+
+```json
+{ "severity_routes": { "error": ["telegram", "buzz"], "alert": ["telegram"], "info": ["log"] },
+  "telegram": { "chat_ids": [111111111] },
+  "buzz": { "channels": [], "relay": "https://buzz.a.pond.city" },
+  "dedup_window_sec": 600, "hourly_cap": 20, "audit_jsonl": "notify-audit.jsonl" }
+```
+
+Connectors: `telegram` (Bot API), `buzz` (the buzz CLI + the `buzz_key` secret → `BUZZ_PRIVATE_KEY`),
+and `log` (jsonl-only — **everything** is audited regardless of routing). Live-incident hygiene is built
+in: a **dedup window** (one brownout ≠ 50 identical pings), a **rolling hourly cap** with a *one-time*
+"storm suppressed → log only" notice (silent suppression is how operators stop trusting a lane), and a
+jsonl audit of every notification, delivered or not.
+
+Wire it as a module + the `notify` MCP + the top-level `notify_url`, and drop a `notify.config.json`
+(see `notify.config.example.json`) beside the daemon:
+
+```yaml
+modules:
+  - name: notify-router
+    command: [bun, run, mcp/notify-router.ts]
+    secrets: [telegram_bot, buzz_key]
+    env: { NOTIFY_CONFIG: notify.config.json, BUZZ_BIN: /usr/local/bin/buzz, BUZZ_RELAY_URL: "https://buzz.a.pond.city" }
+mcp_servers:
+  - name: notify
+    transport: { type: stdio, command: bun, args: [run, mcp/notify-mcp.ts] }
+    env: { NOTIFY_URL: "http://127.0.0.1:8794/notify" }
+    tier: post
+    scope_env: { NOTIFY_SOURCE_CHAT: chat_id }   # provenance only — destinations stay operator config
+notify_url: "http://127.0.0.1:8794/notify"
+```
+
 ## Coalescing a busy channel
 
 A high-volume channel (a group with read-everything enabled) can flood the single-flight loop. A duty

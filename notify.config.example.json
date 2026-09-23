@@ -1,0 +1,19 @@
+{
+  "_comment": "Example config for the notify-router module (mcp/notify-router.ts). Copy to notify.config.json (or point NOTIFY_CONFIG at it) beside the daemon. This is the OP-NOTIFY trail — operational error/alert/info reporting, NOT a messaging lane. `severity_routes` maps each severity to the connectors that deliver it; each connector carries its OWN targets, so one severity can fan to telegram AND a buzz ops-channel. `log` is jsonl-only (everything is audited regardless). Secrets are injected by the module (TELEGRAM_BOT_TOKEN, BUZZ_PRIVATE_KEY) — never put tokens here.",
+  "listen": "127.0.0.1:8794",
+  "severity_routes": {
+    "error": ["telegram", "buzz"],
+    "alert": ["telegram"],
+    "info": ["log"]
+  },
+  "telegram": {
+    "chat_ids": [111111111]
+  },
+  "buzz": {
+    "channels": [],
+    "relay": "https://buzz.a.pond.city"
+  },
+  "dedup_window_sec": 600,
+  "hourly_cap": 20,
+  "audit_jsonl": "notify-audit.jsonl"
+}

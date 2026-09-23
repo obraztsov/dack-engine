@@ -108,6 +108,12 @@ mcp_servers:
   #                                                      #   injected below cognition — the model has no user-id
   #                                                      #   argument, so it can only act on the asker's agents.
   #                                                      #   Grant in DM-woken states ONLY (never public-reply).
+  # - name: notify                                # OP-NOTIFY lane (NOT a messenger — see the notify-router module below).
+  #   transport: { type: stdio, command: bun, args: [run, mcp/notify-mcp.ts] }   # `notify{severity,title?,message}`:
+  #   env: { NOTIFY_URL: "http://127.0.0.1:8794/notify" }   #   the model reports an operational error/alert/info to the
+  #   tier: post                                  #   operator's configured targets. DESTINATIONS are config (below),
+  #   scope_env: { NOTIFY_SOURCE_CHAT: chat_id }  #   never a model arg → nothing to hijack; safe from ANY cycle.
+  #                                               #   Reply-to-a-client is a normal SEND baton; this is the error TRAIL.
 
 # The operator half of the capability handshake: a state-prompt requests a server in its `mcp:`
 # frontmatter; it's admitted only if listed here. mcp_whitelist:false = an OPEN tier (the soul may also
@@ -133,6 +139,11 @@ secrets_providers:
   #   env: { TOKEN_KEY: TELEGRAM_BOT_TOKEN, TOKEN_FILE: "secrets/telegram.token" }
   #   keys: [TELEGRAM_BOT_TOKEN]
   #   trust: org
+  # - name: buzz_key                              # the duck's buzz (Nostr) identity — used by buzz-ingress AND
+  #   command: ["python3", "secrets-providers/file_token.py"]  #   the notify-router's buzz connector.
+  #   env: { TOKEN_KEY: BUZZ_PRIVATE_KEY, TOKEN_FILE: "secrets/buzz.key" }
+  #   keys: [BUZZ_PRIVATE_KEY]
+  #   trust: self
   # - name: pond_manager                          # the leader manager JWT (mint: `leader token --scope
   #   command: ["python3", "secrets-providers/file_token.py"]  #   duck:manager --sub dack-manager --ttl 30d`)
   #   env: { TOKEN_KEY: MANAGER_JWT, TOKEN_FILE: "secrets/pond_manager.token" }
@@ -159,6 +170,13 @@ secrets:
 #     command: [bun, run, mcp/pond-ingress.ts]    #   Durable-journal cursor discipline: replay-then-stream.
 #     secrets: [pond_manager]
 #     env: { POND_LEADER_URL: "http://127.0.0.1:7700", INGRESS_DB: ingress.sqlite }  # same file as `ingress_db`
+#   - name: notify-router                         # the OP-NOTIFY sink: one operational/error TRAIL (not messaging).
+#     command: [bun, run, mcp/notify-router.ts]   #   Fed by the harness `notify_url` hook, the `notify` MCP, and the
+#     secrets: [telegram_bot, buzz_key]           #   swallowed-answer detector. Routes per severity → telegram / a
+#     env:                                        #   buzz ops-channel / jsonl. Config: notify.config.json (below).
+#       NOTIFY_CONFIG: notify.config.json
+#       BUZZ_BIN: /usr/local/bin/buzz             #   buzz connector: the buzz CLI path…
+#       BUZZ_RELAY_URL: "https://buzz.a.pond.city" #  …and the relay (buzz_key secret → BUZZ_PRIVATE_KEY).
 
 # ── Delegated workers (Docker isolation) ─────────────────────────────────────────────────────────
 # When enabled, an agent def with `isolation: docker` runs its worker's bridge in a container. Build
@@ -210,6 +228,11 @@ db_path: "dack.sqlite"                   # embedded queue (ephemeral; losing it 
 webhook_addr: "127.0.0.1:8787"           # localhost-only webhook listener
 invoke_timeout_secs: 300                 # budget for one consciousness invocation
 # reflect_invoke_timeout_secs: 900       # optional LONGER budget for Reflect (daily self-mod); omit ⇒ uses the above
+# notify_url: "http://127.0.0.1:8794/notify"  # OP-NOTIFY router endpoint. Set it to turn on the operational/error
+                                         # TRAIL: a TERMINAL dispatch failure POSTs `error` here, and any prompt with
+                                         # `notify_on_silent: true` in its frontmatter POSTs `alert` when its cycle
+                                         # produces nothing (a reply that died in a thought). Needs the notify-router
+                                         # module (above). Omit ⇒ off. NOT a messaging lane — replies are SEND batons.
 
 # Dry-run (testing): the wall denies any tool whose name starts with a `block` prefix — the agent
 # composes the action (visible in the runlog) but it never executes. Tool-level + uniform across MCPs.

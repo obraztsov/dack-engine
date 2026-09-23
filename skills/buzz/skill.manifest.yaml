@@ -1,0 +1,53 @@
+# Reference buzz executable-skill pack — the duck's OUTBOUND hand on Buzz (Nostr) + on-demand media pull.
+#
+# This is a REFERENCE the operator copies into their soul at `<soul>/skills/buzz/`, drops the buzz CLI at
+# `bin/buzz` (from the pond project), and SIGNS with `dack skill sign --dir skills/buzz --role soul`. The
+# detached `.sig` is the execute-gate: unsigned/tampered/wrong-signer ⇒ the duck may READ this manifest but
+# never RUN its commands. See ./README.md.
+#
+# Every command is a FIXED argv template with typed holes (execve, never a shell — arg values are inert
+# bytes). Destinations are HARNESS-ROUTED: a reply's `--channel` is a `ref` filled from the trusted stimulus
+# scope (`conversation`), never a model argument, so a cycle can only answer the channel it was woken on — it
+# cannot be talked into messaging somewhere else. `--relay` is baked in; changing it re-signs.
+name: buzz
+
+commands:
+  # On-demand full-res media pull (P1, already live). Fetches an attachment the duck saw as metadata
+  # (a Buzz `imeta` sha) via Blossom signed-GET into the harness-fixed ${MEDIA_OUT}; the bridge reads that
+  # file back into a vision block on the next turn. `ref` is the sha the stimulus surfaced.
+  - id: media_get
+    tier: read
+    trust: public                # arbitrary external image bytes → untrusted; running it floors the cycle to public
+    argv: ["${SKILL_DIR}/bin/buzz", "--relay", "https://buzz.a.pond.city", "media", "get", "{ref}", "-o", "${MEDIA_OUT}"]
+    args:
+      ref: { type: string, pattern: "^[0-9a-f]{64}(\\.thumb)?\\.(png|jpe?g|gif|webp)$" }
+    produces: media
+    secret: buzz_key
+    network: true
+
+  # Destination-locked text reply: the duck writes only `text`; the harness fills `--channel` from the
+  # stimulus scope (`conversation`). It answers the channel it was woken on, nowhere else.
+  - id: reply
+    tier: post
+    trust: self                  # Buzz is the pond's agent-to-agent / org fabric (not the open public web)
+    argv: ["${SKILL_DIR}/bin/buzz", "--relay", "https://buzz.a.pond.city", "messages", "send", "--channel", "{channel}", "--content", "{text}"]
+    args:
+      channel: { type: ref, from: conversation }
+      text: { type: string, pattern: "^[\\s\\S]{1,4000}$" }   # multiline allowed (unlike a tweet); bounded
+    secret: buzz_key
+    network: true
+
+  # The `--file` command (this epoch's addition): a destination-locked reply that ATTACHES a stored file.
+  # `attachment` is a model-named BASENAME the harness confines to the media dir (→ Blossom upload + imeta),
+  # so an outbound file can only ever be a STORED file (one a client sent, or one a paperwork agent returned)
+  # — never an arbitrary host path. `text` is the optional caption (may be empty). Channel is harness-routed.
+  - id: send_file
+    tier: post
+    trust: self
+    argv: ["${SKILL_DIR}/bin/buzz", "--relay", "https://buzz.a.pond.city", "messages", "send", "--channel", "{channel}", "--content", "{text}", "--file", "{attachment}"]
+    args:
+      channel: { type: ref, from: conversation }
+      text: { type: string, pattern: "^[\\s\\S]{0,4000}$" }   # caption optional (0-length ok)
+      attachment: { type: attachment }                        # a basename in the media dir, path-confined by the harness
+    secret: buzz_key
+    network: true

@@ -717,6 +717,47 @@ commands:
     }
 
     #[test]
+    fn shipped_buzz_reference_pack_parses_and_send_file_confines() {
+        // Guard the reference pack we ship (`skills/buzz/skill.manifest.yaml`) against drift from the code:
+        // it must parse + structurally validate, expose the three commands, and its `send_file` `--file`
+        // command must confine a model-named attachment to the media dir. (No signature here — the pack ships
+        // UNSIGNED for the adopter to `dack skill sign`; parse + build_argv don't need the execute-gate.)
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/skills/buzz/skill.manifest.yaml");
+        let bytes = std::fs::read(path).expect("read shipped buzz manifest");
+        let m = SkillManifest::parse(&bytes).expect("shipped buzz manifest parses + validates");
+        assert_eq!(m.name, "buzz");
+        for id in ["media_get", "reply", "send_file"] {
+            assert!(m.command(id).is_some(), "reference pack is missing `{id}`");
+        }
+        assert_eq!(m.command("media_get").unwrap().produces, Some(Produces::Media));
+
+        let send = m.command("send_file").unwrap();
+        assert_eq!(send.tier, CapabilityTier::Post);
+        assert!(matches!(send.args.get("attachment"), Some(ArgSchema::Attachment {})));
+        assert!(matches!(send.args.get("channel"), Some(ArgSchema::Ref { .. })));
+
+        // Build the argv end-to-end: a stored file is confined to its absolute path; a traversal is denied.
+        let base = std::env::temp_dir().join(format!("dack-buzzref-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("invoice.pdf"), b"%PDF-1.4").unwrap();
+        let mut scope = BTreeMap::new();
+        scope.insert("conversation".into(), "chan-42".to_string());
+        let mut model = BTreeMap::new();
+        model.insert("text".into(), "here is your invoice".to_string());
+        model.insert("attachment".into(), "invoice.pdf".to_string());
+        let argv = send.build_argv("/s/skills/buzz", &model, &scope, Some(base.as_path())).unwrap();
+        let want = base.join("invoice.pdf").canonicalize().unwrap().to_string_lossy().into_owned();
+        assert!(argv.contains(&want), "argv carries the confined file path: {argv:?}");
+        assert!(argv.contains(&"chan-42".to_string()), "channel is harness-routed from scope: {argv:?}");
+        // Traversal → basename → not a store file → deny (never escapes).
+        let mut evil = model.clone();
+        evil.insert("attachment".into(), "../../etc/passwd".to_string());
+        assert!(send.build_argv("/s", &evil, &scope, Some(base.as_path())).unwrap_err().to_string().contains("not found"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn rejects_duplicate_command_ids() {
         let bad = "name: x\ncommands:\n  - id: c\n    tier: read\n    trust: self\n    argv: [\"p\"]\n  - id: c\n    tier: read\n    trust: self\n    argv: [\"q\"]\n";
         assert!(SkillManifest::parse(bad.as_bytes()).unwrap_err().to_string().contains("duplicate command id"));

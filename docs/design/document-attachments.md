@@ -138,12 +138,14 @@ client ──(telegram doc / email attachment)──▶ client-duck ──(Buzz 
 > **Done:** telegram `m.document` inbound (`a92426c` — image-as-file → vision, doc → `attachments`; the
 > operator's "files don't work" fix); telegram `reply_document` **outbound** (`353413f` — send-by-`attachment_id`,
 > harness `MEDIA_DIR` + shared path-confined `attachments.ts`); buzz document inbound (`5301dda` — opt-in
-> `media_prefetch_docs` → routable stored `file`); buzz `--file` engine mechanism (`a789c94` —
-> `ArgSchema::Attachment`, confined; a signed manifest cmd away); **email channel** (`email-send-mcp.ts`
-> outbound `reply_email` + `email-ingress.ts` inbound + `cloudflare/email-worker.js`, §7b). **Contract:**
-> `attachments:[{file,mime,filename,size,kind}]` inbound; `attachment_id`/`{type:attachment}` (basename,
-> harness-confined via shared `attachments.ts` / `confine_attachment`) outbound. **Next:** wire the email
-> config + deploy the Cloudflare Worker; author the buzz `--file` manifest cmd; then Hermes e2e.
+> `media_prefetch_docs` → routable stored `file`); buzz `--file` **full outbound path** (`a789c94`
+> `ArgSchema::Attachment`, confined + the reference pack `skills/buzz/` whose `send_file` command wires
+> `messages send --file {attachment}` with a destination-locked `--channel`); **email channel**
+> (`email-send-mcp.ts` outbound `reply_email` + `email-ingress.ts` inbound + `cloudflare/email-worker.js`,
+> §7b). **Contract:** `attachments:[{file,mime,filename,size,kind}]` inbound;
+> `attachment_id`/`{type:attachment}` (basename, harness-confined via shared `attachments.ts` /
+> `confine_attachment`) outbound. **Next:** wire the email config + deploy the Cloudflare Worker; test
+> tg+buzz attachments end-to-end; then Hermes e2e.
 
 
 - **P0 — Blob-carrying media store + Buzz file transfer.** Generalize the harness media store beyond

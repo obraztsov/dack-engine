@@ -39,7 +39,7 @@ dack run                                               # boot the agent  (binary
 dack say "Say hi."                                     # hand it a trusted, signed instruction
 ```
 
-No gitlawb required — identities are native Ed25519 keys (`dack keygen`).
+Identities are native Ed25519 keys (`dack keygen`) — no external key service.
 
 Full walkthrough: **[docs/getting-started.md](docs/getting-started.md)**.
 
@@ -53,8 +53,10 @@ Full walkthrough: **[docs/getting-started.md](docs/getting-started.md)**.
 | [Configuration](docs/configuration.md) | Every `dack.config.yaml` field |
 | [Authoring souls](docs/authoring-souls.md) | Write the agent's prompts, duties, and memory |
 | [Capabilities](docs/capabilities.md) | Give the agent tools (MCP servers) |
-| [Channels](docs/channels.md) | Connect Telegram or another live channel |
+| [Skills](docs/skills.md) | Signed executable capability packages (`RunSkillCommand`) |
+| [Channels](docs/channels.md) | Telegram (incl. images/voice), Buzz, email, attachments, notify |
 | [Workers](docs/workers.md) | Delegated, sandboxed subagents |
+| [Pond manager](docs/pond-manager.md) | The duck-as-CEO surface over a pond leader |
 | [Operations](docs/operations.md) | Daemon lifecycle, soul repos, identities, health |
 | [Deployment](docs/deployment.md) | Containerized + multi-duck (image = code, per-duck volume) |
 | [Secrets & sandbox](docs/secrets-and-sandbox.md) | The secret + isolation model |
@@ -65,20 +67,30 @@ Design rationale lives inline in the code's module doc comments (`src/`) and acr
 ## Layout
 
 - `src/` — the harness crate (Rust).
-- `openclaude-bridge/` — the TypeScript runtime bridge + bundled channel/capability adapters (Bun).
+- `openclaude-bridge/` — the TypeScript runtime bridge (Bun) that talks to the model.
+- `mcp/` — the bundled channel/capability adapters (Telegram, Buzz, email, notify, …) and channel
+  ingress modules the harness supervises.
+- `recall-mcp/` — the short-term-memory recall servers (split public / self by trust).
+- `skills/` — reference executable-skill packs (e.g. `skills/buzz/`) an operator copies into a soul.
+- `secrets-providers/` — reference secret-materialization scripts.
 - `dack.config.example.yaml` — the operator control plane.
 
 A starting template for the agent's durable bundle provided separately (copy it into a soul directory;
 in production it's a separate, signed repo).
 
+Release notes live in **[CHANGELOG.md](CHANGELOG.md)**.
+
 ## Status
 
 The harness is functional and runs in production: the full ingestion → consciousness loop, the
-trust/state model, MCP capabilities, channels (Telegram/X), delegated workers, and a signed soul repo.
-It is **multithreaded** (independent conversations process concurrently; a conversation and any
-memory-writing cycle serialize), keeps short-term memory in a **SQLite** runlog, and ships a
-**containerized, multi-duck** deployment (one image, a directory per duck). The runtime is wired for
-OpenClaude over any OpenAI-compatible endpoint; the engine/connector are an extensibility seam.
+trust/state model, MCP capabilities, **signed executable skills**, channels (Telegram — with images and
+voice —, Buzz, email, and X), **bidirectional file attachments**, a separate **operational-notification**
+lane, delegated workers, and a signed soul repo. It is **multithreaded** (independent conversations
+process concurrently; a conversation and any memory-writing cycle serialize), keeps short-term memory in a
+**SQLite** runlog, and ships a **containerized, multi-duck** deployment (one image, a directory per duck).
+The runtime is wired for OpenClaude over any OpenAI-compatible endpoint (an in-house `duck-loop` engine is
+in progress); the engine/connector are an extensibility seam. See [CHANGELOG.md](CHANGELOG.md) for the
+0.2.0 feature set.
 
 ## License
 

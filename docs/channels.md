@@ -37,7 +37,7 @@ that stays up resets the curve), and on shutdown every child is killed.
 ```yaml
 modules:
   - name: telegram-ingress
-    command: [bun, run, openclaude-bridge/telegram-ingress.ts]
+    command: [bun, run, mcp/telegram-ingress.ts]
     secrets: [telegram_bot]          # injects TELEGRAM_BOT_TOKEN
     env: { TELEGRAM_INGRESS_CONFIG: telegram-ingress.config.json }
 ```
@@ -50,7 +50,8 @@ path→tier, and the adapter script — never a harness change. See
 
 ## The bundled Telegram adapter
 
-`openclaude-bridge/` ships a reference Telegram integration in three pieces, illustrating the pattern.
+`mcp/` ships a reference Telegram integration — an ingress module plus a few egress MCP servers,
+illustrating the pattern.
 
 ### Ingress (a module)
 
@@ -79,7 +80,7 @@ Its format (every key optional; defaults shown — the file it reads comes from 
 ```json
 {
   "harness_webhook": "http://127.0.0.1:8787",
-  "operator_user_id": 111111111,
+  "operator_ids": [111111111, 222222222],
   "op_path": "/telegram/op",
   "pub_path": "/telegram/pub",
   "groups": { "-1001234567890": "/telegram/trusted" },
@@ -89,8 +90,9 @@ Its format (every key optional; defaults shown — the file it reads comes from 
 ```
 
 - `harness_webhook` — base URL of the harness listener (match `webhook_addr`).
-- `operator_user_id` — your Telegram numeric user id; a message from it (in any chat) routes to
-  `op_path`. `null`/omitted = no operator recognition.
+- `operator_ids` — Telegram numeric user ids treated as operators; a message from **any** of them
+  (in any chat) routes to `op_path`. The legacy singular `operator_user_id` still works and folds into
+  this set. `[]`/omitted = no operator recognition.
 - `groups` — a `chat_id → webhook path` map; a message in a listed group routes to that path.
 - `op_path` / `pub_path` — operator and fallback (everyone-else) paths.
 - `dm_path` / `group_path` — **optional** chat-type split: a non-operator private chat → `dm_path`, a
@@ -135,6 +137,27 @@ everyone, and an authorized proactive send that's gated by trust. See
 [capabilities](capabilities.md#locking-a-capability-to-per-cycle-data-scope_env) for the `scope_env`
 and `min_trust` mechanisms.
 
+### Multimodal (images & voice)
+
+The ingress adapter handles more than text:
+
+- **Images** — a photo (or an image sent *as a file*) is downloaded into the harness-owned **media
+  dir** (`media_dir`); the stimulus carries a typed media reference the harness confines and turns into a
+  vision block on the goal turn. An image-bearing Perceive **routes to a vision model**
+  (`runtime.vision_models` / `default_vision_model`) — a text-only model can't see — and is never made a
+  sticky session (mixing an image turn into a resumed text session poisons it).
+- **Voice** — a voice note is transcribed *in the ingress* (ffmpeg → a MiMo ASR endpoint) before it ever
+  reaches the harness, with a per-user daily cap to bound abuse; the duck wakes on the transcript.
+- **Per-chat attachment permissions** — whether a given chat may send files/images is a per-chat toggle
+  stored in the ingress DB (`ingress.sqlite`); the duck can author these itself via a `set_chat_attachments`
+  tool. Off by default for untrusted chats.
+- **Documents** and outbound files are covered under [Attachments](#attachments-files-both-directions).
+
+Two smaller ingress features: a **typing indicator** that reflects *real* processing (the ingress polls
+the harness for active conversations and sends `sendChatAction` while a reply is actually being computed,
+not merely on receipt), and **deep-link referral** capture (`?start=<param>` on a `/start` is recorded to
+the ingress DB, first-touch, and retrievable by the duck).
+
 ## The bundled Twitter/X integration
 
 X is reached as MCP capabilities rather than a long-running module — inbound is a polling sensor, egress
@@ -161,6 +184,70 @@ surface) that stays a human decision: the `twitter-digest` job, when it spots an
 *suggests* it to the operator over Telegram (`telegram-send`), and the operator follows manually. See
 [concepts](concepts.md#memory-short-term-vs-long-term) for the digest pattern and
 [capabilities](capabilities.md) for the trust classes.
+
+## The bundled Buzz (Nostr) integration
+
+Buzz is a Nostr workspace — the pond's agent-to-agent + org fabric. It is a full **inbound channel**
+(a module) plus **outbound** via an executable skill.
+
+- **Inbound (`buzz-ingress` module)** — discovers the channels the duck is a member of (membership *is*
+  the whitelist), polls each channel's history, and detects a **wake** trigger: a mention (the duck's
+  pubkey in the event's p-tags — a DM p-tags the recipient, so DMs are mentions) or a reply to one of the
+  duck's own recent posts. On a wake it reconstructs the **thread spine** (root → … → parent → trigger)
+  and POSTs a normalized stimulus to a tier-specific webhook path (`/buzz/<tier>`), carrying the
+  reply-scope scalars (`conversation` = channel id, `in_reply_to` = event id) the reply path is locked to.
+- **Media awareness** — a message's attachments (NIP-92 `imeta`) surface as **metadata** on wake
+  (filename / mime / sha), so the duck knows a file exists without any bytes moving. Images can be
+  passively **prefetched** (opt-in `media_prefetch: thumb | full`) into the media dir so the duck sees them
+  on wake; otherwise it pulls full-res **on demand** via the `media_get` skill (a Blossom signed-GET into a
+  harness-fixed path → a vision block). Non-image documents surface as routable stored files (opt-in
+  `media_prefetch_docs`).
+- **Outbound (the `skills/buzz/` pack)** — a signed executable skill: `reply` (destination-locked text),
+  `send_file` (attach a stored file — see [Attachments](#attachments-files-both-directions)), and
+  `media_get`. Destinations are harness-routed from the stimulus scope, never a model argument. See
+  [Skills](skills.md).
+
+The same Buzz identity also backs the [op-notify](#op-notify-lane-operational-error-trail) `buzz`
+connector (posting operational alerts to an ops-channel).
+
+## The bundled Email integration
+
+Email is another channel adapter over the same attachment core — build it from
+[`mcp/cloudflare/email-worker.js`](../mcp/cloudflare/email-worker.js) (a Cloudflare Email Worker template)
+or any inbound provider that can POST.
+
+- **Inbound (`email-ingress` module)** — a small HTTP server that authenticates the inbound POST with a
+  **constant-time shared secret**, stores each attachment to the media dir (an image → a vision `media`
+  ref; a document → a routable `attachments` file), classifies trust by sender (a known operator address →
+  higher tier, else public), and fires a stimulus carrying the reply-scope scalars (`EMAIL_REPLY_TO`,
+  subject, message id).
+- **Outbound (`email-send-mcp.ts`)** — a `reply_email{subject?, text, attachment_id?}` MCP,
+  **destination-locked** to the harness-injected `EMAIL_REPLY_TO` (the model can't choose the recipient),
+  provider-agnostic (a Resend-shaped `EMAIL_API_URL` / key / from), with the attachment confined through the
+  shared path-confinement. There is no proactive `send_email{to}` yet — only the locked reply.
+
+## Attachments (files, both directions)
+
+Files move through a single **channel-agnostic** contract, so Telegram, Buzz, and email all share one
+mechanism and one confinement:
+
+- **Inbound** — an adapter stores each file in the harness-owned media dir and puts
+  `payload.attachments: [{ file, mime, filename, size, kind }]` on the stimulus (`kind` = `image` |
+  `file`). Two lanes: **images** ride the `media` / vision lane (the model *sees* them); **documents** ride
+  the `attachments` lane as routable stored files (the model gets metadata + can route them, but untrusted
+  bytes are never fed to it verbatim).
+- **Outbound** — a reply attaches a file by **`attachment_id`** (a basename): telegram `reply_document`,
+  the buzz `send_file` skill, or email `reply_email`'s `attachment_id`. The harness **confines** the name
+  to the media dir (basename + realpath + store-prefix + regular-file check), so an outbound file can only
+  ever be a **stored** file — one a client sent inbound, or one a paperwork agent returned — never an
+  arbitrary host path. The confinement is shared by the TypeScript egress (`mcp/attachments.ts`) and the
+  Rust skill egress (`skills::confine_attachment`), so both paths behave identically.
+
+The media dir (`media_dir`) is injected into every MCP server as `MEDIA_DIR` and is where all of this
+resolves; set `media_retention_days` to age stored files off. **Heavy document *processing*** (native-PDF
+fidelity, docx/xlsx, OCR, generation) is deliberately *not* done in the duck — it is delegated to a
+specialist agent (e.g. Hermes over Buzz media); the edge I/O here is about *carrying* files, not parsing
+them. See the design note `docs/design/document-attachments.md`.
 
 ## Op-notify lane (operational error trail)
 

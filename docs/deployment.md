@@ -27,8 +27,8 @@ model endpoint, the channel APIs (X, Telegram), your soul git remote, and any HT
 The `Dockerfile` at the repo root is multi-stage: a `rust` stage builds the harness (bundled SQLite
 needs only a C toolchain — no system libs), and an `oven/bun` runtime stage adds `git`, `openssh`,
 `python3` (the stdlib-only secrets providers), and `bubblewrap`/`socat` (the SDK's Linux command
-sandbox), then bakes the bridge (`openclaude-bridge/`, with `bun install`), the recall MCP
-(`recall-mcp/`), and the secrets providers. Build it **natively for the target architecture** (build on
+sandbox), then bakes the bridge (`openclaude-bridge/`), the MCP servers / channel adapters (`mcp/`), and
+the recall servers (`recall-mcp/`) — each with its own `bun install` — plus the secrets providers. Build it **natively for the target architecture** (build on
 the server, or cross-build with `buildx`):
 
 ```sh

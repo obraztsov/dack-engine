@@ -60,11 +60,12 @@ Each entry:
 | `min_trust` | tier | none | Authorization floor: the server is only assembled for a cycle whose current (post-taint) trust ranks `>=` this tier. A high-trust cycle that degrades mid-walk loses the capability. |
 | `scope_env` | map | `{}` | `{ ENV_VAR: payload_field }`. At assembly the harness reads `payload_field` from the waking stimulus and injects it into this server's env — locking the capability to per-cycle data the model can't supply (e.g. a reply destination). |
 | `env` | map | `{}` | Static env for the server (non-secret operator config the server needs, e.g. a named-destination map). |
+| `expand` | enum | `inline` | Tool-surface expansion: `inline` sends this server's tools up front; `deferred` holds them behind a `find_tools` search so a large surface doesn't bloat every prompt. **Runtime-gated** — honored only by the `duck-loop` runtime's client-side tool search; OpenClaude ignores it (all tools inline). A dack-engine config field, never sent to the server → backward-compatible. |
 
 ```yaml
 mcp_servers:
   - name: twitter
-    transport: { type: stdio, command: bun, args: [run, openclaude-bridge/twitter-mcp.ts] }
+    transport: { type: stdio, command: bun, args: [run, mcp/twitter-mcp.ts] }
     auth: { secret: x, env: X_BEARER_TOKEN }
     tier: post
     trust: public
@@ -148,7 +149,7 @@ declared secrets, and restarts it with backoff until shutdown. See [channels](ch
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `name` | string | required | Stable id for logs. |
-| `command` | list | required | argv (e.g. `[bun, run, openclaude-bridge/telegram-ingress.ts]`). |
+| `command` | list | required | argv (e.g. `[bun, run, mcp/telegram-ingress.ts]`). |
 | `secrets` | list | `[]` | Secrets-provider names whose env is injected, resolved fresh on each restart. |
 | `env` | map | `{}` | Static env (paths, ids, flags). |
 | `cwd` | string | the harness process cwd | Working directory for the module. |
@@ -157,7 +158,7 @@ declared secrets, and restarts it with backoff until shutdown. See [channels](ch
 ```yaml
 modules:
   - name: telegram-ingress
-    command: [bun, run, openclaude-bridge/telegram-ingress.ts]
+    command: [bun, run, mcp/telegram-ingress.ts]
     secrets: [telegram_bot]
     env: { TELEGRAM_INGRESS_CONFIG: telegram-ingress.config.json }
 ```
@@ -170,10 +171,17 @@ The engine + connector extensibility point. Swapping runtime/provider is one con
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `runtime.engine` | object | `{ type: openclaude, bridge_dir: openclaude-bridge }` | Which agent runtime drives the loop. Only `openclaude` is defined/wired (spawns `bun run bridge.ts`); `bridge_dir` is the bridge project directory. `claude-code` (the Claude Code CLI/SDK directly, for corporate prod) is the documented next variant, not yet wired. |
-| `runtime.connector` | object | `{ type: openai-compatible }` | How the engine reaches models. `openai-compatible` (renamed from `opengateway` — the old `type: opengateway` still parses via a serde alias) is an OpenAI-compatible env shim: `{ api_url, api_key }` → `OPENAI_BASE_URL`/`OPENAI_API_KEY` (both optional; `None` falls back to the harness env), plus it sets `CLAUDE_CODE_USE_OPENAI=1`. Point `api_url` at any OpenAI-compatible endpoint (a hosted gateway, provider-direct, a local vLLM). `anthropic` (`{ api_key }`, native catalog) parses but is a **NotImplemented stub** (`cli::run` rejects it). |
+| `runtime.engine` | object | `{ type: openclaude, bridge_dir: openclaude-bridge }` | Which agent runtime drives the loop. `openclaude` (default) spawns `bun run bridge.ts`; `bridge_dir` is the bridge project directory. `duck-loop` selects the project's **own** in-house agent-loop runtime (same NDJSON protocol + same connector env) — experimental: text cycles work, MCP tools + the wall are still being brought to parity, so it is not the default. `claude-code` (the Claude Code CLI/SDK directly) is a documented future variant, not yet wired. |
+| `runtime.connector` | object | `{ type: openai-compatible }` | How the engine reaches models. `openai-compatible` (renamed from `opengateway` — the old `type: opengateway` still parses via a serde alias) is an OpenAI-compatible env shim: `{ api_url, api_key, api_format? }` → `OPENAI_BASE_URL`/`OPENAI_API_KEY` (both optional; `None` falls back to the harness env), plus it sets `CLAUDE_CODE_USE_OPENAI=1`. Point `api_url` at any OpenAI-compatible endpoint (a hosted gateway, provider-direct, a local vLLM). `anthropic` (`{ api_key }`, native catalog) parses but is a **NotImplemented stub** (`cli::run` rejects it). |
+| `runtime.connector.api_format` | enum | `chat_completions` | Which OpenAI surface the connector targets: `chat_completions` (`/chat/completions`, the default) or `responses` (the newer `/responses` — reasoning as first-class items). `responses` is an experiment; validate on a throwaway per provider before enabling. |
 | `runtime.model` | string | none | The default model id. `tier_policy.<tier>.model` overrides it per state. On `openai-compatible` the per-state model is routed via the child's `OPENAI_MODEL` env (the SDK rejects a gateway name as `options.model`). |
+| `runtime.vision_models` | list | `[]` | Model ids that accept **image** input. An image-bearing Perceive keeps its selected model if that model is already a vision model, else routes to `default_vision_model`. Omit both ⇒ images are not ingested. |
+| `runtime.default_vision_model` | string | none | The model an image-bearing cycle routes to when the selected model isn't in `vision_models`. |
 | `runtime.env` | list | `[OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL, …]` | Extra env-var names forwarded into the runtime bridge (values from the harness env). The connector's own creds are applied on top. |
+
+> **Sticky sessions on `duck-loop`.** When the `duck-loop` engine is selected the harness wires
+> `DUCK_SESSION_DB` so sticky sessions (resume-by-id) persist across cycles, and `mcp_servers` supports
+> `expand` (deferred tool loading) — see the Capabilities table.
 
 ### `runtime.worker_sandbox` — Docker isolation for delegated workers
 

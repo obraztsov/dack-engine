@@ -23,15 +23,16 @@ Identities are native Ed25519 keys created with `dack keygen` — no external ke
 
 ```sh
 git clone <this-repo> dack-engine && cd dack-engine
-make build        # cargo build --release + bun install in openclaude-bridge/
+make build        # cargo build --release + bun install in every JS project
 ```
 
-`make build` compiles the `dack` binary (`target/release/dack`) and installs the bridge's dependencies
-(`@gitlawb/openclaude` + `grammy`, from the public npm registry). By hand:
+`make build` compiles the `dack` binary (`target/release/dack`) and installs the JS dependencies of the
+three Bun projects: the runtime **bridge** (`openclaude-bridge/`, `@gitlawb/openclaude` + `grammy`), the
+**MCP servers / channel adapters** (`mcp/`), and the **recall servers** (`recall-mcp/`). By hand:
 
 ```sh
 cargo build --release
-cd openclaude-bridge && bun install --frozen-lockfile && cd ..
+for p in openclaude-bridge mcp recall-mcp; do (cd $p && bun install --frozen-lockfile); done
 ```
 
 Confirm the build with the offline test suite:

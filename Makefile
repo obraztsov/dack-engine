@@ -1,20 +1,22 @@
-# DACK — a Rust harness (`dack`) + a small TS runtime bridge (`openclaude-bridge/`).
-# Two languages, one tool: the harness spawns the bridge per state invocation over stdio.
+# DACK — a Rust harness (`dack`) + TS side projects (Bun): the runtime bridge (`openclaude-bridge/`),
+# the MCP servers + channel adapters (`mcp/`), and the recall servers (`recall-mcp/`).
+# The harness spawns these per state invocation / as modules over stdio.
 SHELL := /bin/bash
 BRIDGE := openclaude-bridge
+JS_PROJECTS := openclaude-bridge mcp recall-mcp
 
-.PHONY: all build bridge test smoke run fmt lint clean dist help
+.PHONY: all build bridge deps test smoke run fmt lint clean dist help
 
 help: ## Show this help
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | sed -E 's/:.*## /\t/' | sort
 
 all: build
 
-build: bridge ## Release Rust binary + install the bridge's npm deps
+build: deps ## Release Rust binary + install every JS project's deps
 	cargo build --release
 
-bridge: ## Install the runtime bridge's deps (@gitlawb/openclaude from npm)
-	cd $(BRIDGE) && bun install --frozen-lockfile
+deps bridge: ## Install the JS deps (bridge + mcp/ + recall-mcp/)
+	@for p in $(JS_PROJECTS); do echo "bun install → $$p"; (cd $$p && bun install --frozen-lockfile); done
 
 test: ## Rust test suite (offline, deterministic)
 	cargo test

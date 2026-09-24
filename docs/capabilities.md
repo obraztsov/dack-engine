@@ -105,7 +105,7 @@ an argument. The canonical use is destination-locking a reply:
 
 ```yaml
 - name: telegram
-  transport: { type: stdio, command: bun, args: [run, openclaude-bridge/telegram-mcp.ts] }
+  transport: { type: stdio, command: bun, args: [run, mcp/telegram-mcp.ts] }
   auth: { secret: telegram_bot, env: TELEGRAM_BOT_TOKEN }
   tier: post
   scope_env: { TELEGRAM_REPLY_CHAT: chat_id, TELEGRAM_REPLY_TO: message_id }

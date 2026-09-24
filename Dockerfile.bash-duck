@@ -6,8 +6,10 @@
 # which the bash MCP confines each command with bubblewrap (mcp/sandbox.ts). Non-bash ducks use the plain
 # `dack/duck` image on runc.
 #
-# Build:  docker build -f Dockerfile.bash-duck -t dack/duck-bash:latest .   (base image built first)
-FROM dack/duck:latest
+# Build:  docker build -f Dockerfile.bash-duck --build-arg BASE=dack/duck-pond:latest -t dack/duck-bash:latest .
+# BASE is the engine base image to extend (build it first from this branch). Defaults to dack/duck:latest.
+ARG BASE=dack/duck:latest
+FROM ${BASE}
 
 # CLIs that plain-text skills call. Install GLOBALLY into /usr/local so the sandbox's read-only `/usr`
 # bind covers them (a `~/.bun` global install would be invisible inside bwrap). The base image is bun-only

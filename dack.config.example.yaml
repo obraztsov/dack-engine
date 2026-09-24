@@ -108,6 +108,20 @@ mcp_servers:
   #                                                      #   injected below cognition — the model has no user-id
   #                                                      #   argument, so it can only act on the asker's agents.
   #                                                      #   Grant in DM-woken states ONLY (never public-reply).
+  # ── Agentic skills: plain-text SKILL.md skills + a Settle-only sandboxed shell (see docs/skills.md) ──
+  # - name: skills                                # READ-ONLY skill navigation (list_skills / view_skill).
+  #   transport: { type: stdio, command: bun, args: [run, mcp/skills-mcp.ts] }   #   tier:read = safe every state.
+  #   env: { SKILLS_ROOT: skills }                # the soul's skills/ dir (SKILL.md + references/).
+  #   tier: read
+  #   trust: self
+  # - name: bash                                  # run a plain-text skill's CLI/curl in a CONFINED sandbox.
+  #   transport: { type: stdio, command: bun, args: [run, mcp/bash-mcp.ts] }     #   tier:settle → Settle-ONLY
+  #   tier: settle                                #   (irreversible; a clean cycle only). Default-OFF = don't list it.
+  #   env:                                        #   Requires bubblewrap (Kata/privileged container — docs/skills.md).
+  #     BASH_WORKSPACE: sandbox/work              #   the ONLY writable dir (root-created; NOT in the soul).
+  #     BASH_SKILL_DIRS: skills/bankr             #   `:`-sep skill dirs mounted read-only.
+  #     BASH_SECRET_ENV: BANKR_API_KEY            #   env NAMES forwarded into the sandbox (values via auth.secret).
+  #   auth: { secret: bankr, env: BANKR_API_KEY } #   the scoped skill key — reaches bash, never the model.
   # - name: notify                                # OP-NOTIFY lane (NOT a messenger — see the notify-router module below).
   #   transport: { type: stdio, command: bun, args: [run, mcp/notify-mcp.ts] }   # `notify{severity,title?,message}`:
   #   env: { NOTIFY_URL: "http://127.0.0.1:8794/notify" }   #   the model reports an operational error/alert/info to the

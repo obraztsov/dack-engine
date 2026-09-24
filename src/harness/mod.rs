@@ -2529,6 +2529,8 @@ fn skill_catalogue_entry(dir_name: &str, skill_md: &str) -> Option<String> {
         name: String,
         #[serde(default)]
         description: String,
+        #[serde(default)]
+        metadata: serde_yaml::Value,
     }
     let (yaml, _body) = crate::stimuli::split_frontmatter(skill_md).ok()?;
     let fm: SkillFm = serde_yaml::from_str(yaml).ok()?;
@@ -2537,7 +2539,41 @@ fn skill_catalogue_entry(dir_name: &str, skill_md: &str) -> Option<String> {
     if desc.is_empty() {
         return None;
     }
-    Some(format!("- {name} — {}", truncate_chars(&desc, 240)))
+    let mut line = format!("- {name} — {}", truncate_chars(&desc, 240));
+    // Surface a skill's declared CLI deps (`metadata.requires.bins`, or the Bankr/`clawdbot` nesting) so
+    // the model knows a skill needs a bin, and the operator knows to install it (system-wide, into the
+    // bash-sandbox). A skill whose bins aren't present just can't run — this makes that legible up front.
+    let bins = skill_required_bins(&fm.metadata);
+    if !bins.is_empty() {
+        line.push_str(&format!(" [needs CLI: {}]", bins.join(", ")));
+    }
+    Some(line)
+}
+
+/// A skill's declared `requires.bins` from its `metadata` frontmatter, tolerating both
+/// `metadata.requires.bins` and a one-level namespace nesting (`metadata.<ns>.requires.bins`, e.g. the
+/// Bankr/Hermes `metadata.clawdbot.requires.bins`).
+fn skill_required_bins(metadata: &serde_yaml::Value) -> Vec<String> {
+    fn bins_of(v: &serde_yaml::Value) -> Vec<String> {
+        v.get("requires")
+            .and_then(|r| r.get("bins"))
+            .and_then(|b| b.as_sequence())
+            .map(|arr| arr.iter().filter_map(|b| b.as_str().map(str::to_string)).collect())
+            .unwrap_or_default()
+    }
+    let top = bins_of(metadata);
+    if !top.is_empty() {
+        return top;
+    }
+    if let Some(map) = metadata.as_mapping() {
+        for (_k, v) in map {
+            let nested = bins_of(v);
+            if !nested.is_empty() {
+                return nested;
+            }
+        }
+    }
+    Vec::new()
 }
 
 /// Unix seconds → readable `YYYY-MM-DD HH:MM:SS UTC` — the SAME format as the `now` clock, message
@@ -4949,6 +4985,18 @@ mod tests {
         assert!(skill_catalogue_entry("x", "---\nname: x\n---\nbody").is_none());
         // No frontmatter fence → skipped, not a panic.
         assert!(skill_catalogue_entry("x", "no frontmatter here").is_none());
+    }
+
+    #[test]
+    fn skill_catalogue_entry_surfaces_required_bins() {
+        // Bankr/Hermes nesting: metadata.clawdbot.requires.bins → shown so the operator installs the CLI.
+        let bankr = "---\nname: bankr\ndescription: crypto trading\nmetadata:\n  clawdbot:\n    requires: { bins: [bankr] }\n---\n# body";
+        assert_eq!(skill_catalogue_entry("bankr", bankr).unwrap(), "- bankr — crypto trading [needs CLI: bankr]");
+        // Direct nesting: metadata.requires.bins, multiple.
+        let direct = "---\nname: k\ndescription: d\nmetadata:\n  requires: { bins: [foo, bar] }\n---\n#";
+        assert_eq!(skill_catalogue_entry("k", direct).unwrap(), "- k — d [needs CLI: foo, bar]");
+        // No requires → no annotation (unchanged shape).
+        assert_eq!(skill_catalogue_entry("k", "---\nname: k\ndescription: d\n---\n#").unwrap(), "- k — d");
     }
 
     #[test]

@@ -1022,14 +1022,20 @@ impl Harness {
             if !tc.decision.starts_with("allow") {
                 continue; // a DENIED call accessed no data — it can't taint.
             }
-            let Some(server) = mcp_server_of(&tc.tool) else {
-                continue; // a builtin tool — no external data, no taint.
+            let trust = if is_net_builtin(&tc.tool) {
+                // WebFetch/WebSearch fetch ARBITRARY PUBLIC WEB content — untrusted external data, exactly
+                // like `twitter-read`/public `recall`. They're builtins (no `mcp__` prefix) but they MUST
+                // taint the cycle to `public` so a cycle that reads the open web can't then reach Settle/
+                // Reflect (the firebreak). Other builtins (Read/Grep/Glob over the local soul) don't taint.
+                TrustTier::public()
+            } else if let Some(server) = mcp_server_of(&tc.tool) {
+                self.config
+                    .mcp_server(server)
+                    .map(|s| s.trust.clone())
+                    .unwrap_or_else(TrustTier::public)
+            } else {
+                continue; // a builtin local-FS tool — no external data, no taint.
             };
-            let trust = self
-                .config
-                .mcp_server(server)
-                .map(|s| s.trust.clone())
-                .unwrap_or_else(TrustTier::public);
             acc = Some(match acc {
                 Some(a) => lattice.meet(&a, &trust),
                 None => trust,
@@ -2695,6 +2701,12 @@ fn transitions_block(reachable: &[String]) -> ContextBlock {
 /// taint.
 fn mcp_server_of(tool: &str) -> Option<&str> {
     tool.strip_prefix("mcp__").and_then(|s| s.split_once("__")).map(|(server, _)| server)
+}
+
+/// A `Net`-class BUILTIN (`WebFetch`/`WebSearch`) — it pulls arbitrary public web content, so unlike the
+/// local-FS builtins it MUST taint the cycle to `public` (kept in sync with `classify.rs`'s `Net` set).
+fn is_net_builtin(tool: &str) -> bool {
+    matches!(tool, "WebFetch" | "WebSearch")
 }
 
 /// Whether a capability tier is exposed in `state`: read everywhere, post in Express,
@@ -4698,7 +4710,16 @@ mod tests {
 
         // Nothing external touched → no taint (the cycle keeps its current trust).
         assert_eq!(harness.accessed_trust(&[]), None);
-        assert_eq!(harness.accessed_trust(&[allow("Read"), allow("Grep")]), None, "builtins don't taint");
+        assert_eq!(harness.accessed_trust(&[allow("Read"), allow("Grep")]), None, "local-FS builtins don't taint");
+        // A `Net` builtin (WebFetch/WebSearch) reads the OPEN WEB → taints public (the firebreak), even
+        // though it carries no `mcp__` prefix. (Read/Grep above read the local soul and don't taint.)
+        assert_eq!(harness.accessed_trust(&[allow("WebFetch")]), Some(TrustTier::public()), "WebFetch taints public");
+        assert_eq!(harness.accessed_trust(&[allow("WebSearch")]), Some(TrustTier::public()), "WebSearch taints public");
+        assert_eq!(
+            harness.accessed_trust(&[allow("mcp__cove-read__x"), allow("WebFetch")]),
+            Some(TrustTier::public()),
+            "a clean read + a web fetch floors the meet to public"
+        );
         // A self-trust server keeps the cycle clean.
         assert_eq!(harness.accessed_trust(&[allow("mcp__cove-read__get_balance")]), Some(TrustTier::self_()));
         // A public server floors it; an UNregistered (soul-inline) server floors it too (fail-safe).

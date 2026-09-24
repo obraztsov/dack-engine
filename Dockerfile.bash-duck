@@ -1,0 +1,28 @@
+# Dockerfile.bash-duck — a dack duck image WITH the Settle bash sandbox + plain-text skill CLIs.
+#
+# This is the "custom user template" image for bash-enabled ducks (agentic skills / Bankr). It extends
+# the base duck (dack/duck) with the CLIs a plain-text SKILL.md skill shells out to. It MUST run under a
+# per-agent VM (pond `runtime_class: kata` + `privileged: true` + `needs_userns_sandbox: true`), inside
+# which the bash MCP confines each command with bubblewrap (mcp/sandbox.ts). Non-bash ducks use the plain
+# `dack/duck` image on runc.
+#
+# Build:  docker build -f Dockerfile.bash-duck -t dack/duck-bash:latest .   (base image built first)
+FROM dack/duck:latest
+
+# CLIs that plain-text skills call. Install GLOBALLY into /usr/local so the sandbox's read-only `/usr`
+# bind covers them (a `~/.bun` global install would be invisible inside bwrap). The base image is bun-only
+# (no `node`), and these CLIs' shebang is `#!/usr/bin/env node`, so alias node → bun as the runtime.
+#   - @bankr/cli — the Bankr skill's `bankr` command (crypto wallet/trading/LLM gateway).
+# Add more skill CLIs here as you install their skills.
+ENV BUN_INSTALL=/usr/local
+RUN ln -sf "$(command -v bun)" /usr/local/bin/node \
+ && bun install -g @bankr/cli \
+ && bankr --version
+
+# The sandbox scratch workspace (the ONLY writable mount inside bwrap; created root-owned so the sandbox
+# process — mapped to root in its userns — can write it). The bash MCP also mkdir's this, but pre-creating
+# it documents the layout and keeps it out of the soul (not tripwire-managed, not a secret).
+RUN mkdir -p /duck/sandbox/work
+
+# bubblewrap is already in the base image (the SDK's command sandbox). Nothing else to add — the bash +
+# skills MCP servers ship in the engine's mcp/ (already COPYed into the base image).

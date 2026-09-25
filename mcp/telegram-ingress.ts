@@ -360,6 +360,9 @@ bot.on('message', async (ctx) => {
     from_username: m.from?.username ?? null,
     from_user_id: fromId,
     chat_type: m.chat.type,
+    // Forum "topics": the thread a message lives in, so a reply lands back in the SAME topic. Only for
+    // real topic messages (not the auto reply-thread id); `null` elsewhere → the reply MCP omits it.
+    message_thread_id: (m as any).is_topic_message ? ((m as any).message_thread_id ?? null) : null,
     sent_at,
     // Present only on a referral deep-link open → the duck can act on the ref immediately (else it can
     // pull it later via the telegram MCP `get_referral`). Absent on every ordinary message (back-compat).

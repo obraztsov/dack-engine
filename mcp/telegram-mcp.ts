@@ -98,6 +98,10 @@ server.registerTool(
     const body: Record<string, unknown> = { chat_id: chat, text: out }
     const replyTo = process.env.TELEGRAM_REPLY_TO
     if (replyTo) body.reply_parameters = { message_id: Number(replyTo) }
+    // Forum topics: land the reply in the SAME topic the message came from (harness-injected via scope_env,
+    // like the chat/reply ids). Absent/`null` on a non-forum chat → omitted (sends to the chat as before).
+    const thread = process.env.TELEGRAM_REPLY_THREAD
+    if (thread && thread !== 'null') body.message_thread_id = Number(thread)
     const sent: any = await tgSend(body)
     if (!sent?.ok && consumed.length && pondStore) {
       // Delivery itself failed — the value reached no one; make the same handles work on retry.

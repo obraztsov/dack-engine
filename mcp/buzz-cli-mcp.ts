@@ -71,7 +71,9 @@ function runBuzz(rawArgs: string[]): Promise<{ ok: boolean; out?: string; error?
     if (!has('--channel') && process.env.BUZZ_REPLY_CHANNEL) args.push('--channel', process.env.BUZZ_REPLY_CHANNEL)
     if (!has('--reply-to') && process.env.BUZZ_REPLY_TO) args.push('--reply-to', process.env.BUZZ_REPLY_TO)
   }
-  if (!args.some((a) => a === '--format')) args.push('--format', 'json') // structured output by default
+  // `--format` is a GLOBAL flag — it must come BEFORE the subcommand (buzz rejects it after). Prepend it
+  // LAST, after the verb-based logic above has read the positional verbs.
+  if (!args.some((a) => a === '--format')) args.unshift('--format', 'json')
 
   const key = process.env.BUZZ_PRIVATE_KEY
   if (!key) return Promise.resolve({ ok: false, error: 'BUZZ_PRIVATE_KEY not set — identity unavailable' })

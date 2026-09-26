@@ -29,6 +29,16 @@ pub struct CoalescePolicy {
     /// in Reflect (responsiveness is a knob the duck owns).
     #[serde(default)]
     pub adaptive: Option<AdaptiveCoalesce>,
+    /// Greedy batching (`batch` only). The window governs how long a FRESH accumulator waits before it
+    /// fires; but while a cycle for this chat is already in flight, its later messages can't fold into
+    /// the (now-dispatched) accumulator, so by default each opens its own window → a reply per message.
+    /// With `greedy`, a new message instead folds into the oldest *still-queued* accumulator for this
+    /// chat REGARDLESS of the window — so everything that arrives while the model is busy collapses into
+    /// the ONE next wake (no one-by-one storm), while a quiet chat still fires on the normal window.
+    /// Opt-in; default off. (The fold is race-safe: if the accumulator was just claimed for dispatch,
+    /// the message seeds a fresh accumulator instead.)
+    #[serde(default)]
+    pub greedy: bool,
 }
 
 /// Per-chat adaptive coalesce budget. A *credit* = one wake (one new batch accumulator). The window

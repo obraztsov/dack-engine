@@ -99,21 +99,35 @@ impl Bus {
                         // into an accumulator whose window is still OPEN (`received_at < pop_after`) —
                         // never into one already firing. The fixed path is unchanged (`find` on a
                         // `true` predicate = the old `.next()`).
-                        let bound = if policy.adaptive.is_some() { None } else { policy.window_sec };
+                        //
+                        // GREEDY drops the window bound entirely: fold into the OLDEST still-queued
+                        // accumulator no matter how old it is. While a cycle for this chat is in flight,
+                        // its accumulator is `dispatched` (not coalescable) and later messages would each
+                        // open their own window → a reply per message; greedy instead pools them all into
+                        // the one queued next-wake, so the model answers the whole burst at once.
+                        let bound = if policy.greedy || policy.adaptive.is_some() {
+                            None
+                        } else {
+                            policy.window_sec
+                        };
                         let acc = self
                             .within_window(&type_, key, received_at, bound)
                             .await?
                             .into_iter()
                             .find(|s| {
-                                policy.adaptive.is_none()
+                                policy.greedy
+                                    || policy.adaptive.is_none()
                                     || s.pop_after.map_or(false, |p| received_at < p)
                             });
                         if let Some(acc) = acc {
-                            // Fold into the accumulator; keep its received_at (FIFO fairness)
-                            // so a hot thread can't starve older pending stimuli.
+                            // Fold into the accumulator; keep its received_at (FIFO fairness) so a hot
+                            // thread can't starve older pending stimuli. Conditional on the row still
+                            // being pending: greedy can target a row whose window has closed (poppable),
+                            // which the dispatcher may claim concurrently — if so the fold no-ops and this
+                            // message falls through to seed a fresh accumulator (never mutating an
+                            // already-firing wake, never lost).
                             let merged = merge_batch(acc.payload, &payload);
-                            self.queue.set_payload(&acc.id, merged).await?;
-                            folded = true;
+                            folded = self.queue.set_payload_if_pending(&acc.id, merged).await?;
                         }
                     }
                 }
@@ -430,6 +444,81 @@ mod tests {
             b.queue.get_cursor(&key).await.unwrap().as_deref(),
             Some("1"),
             "a batch costs one credit, not one per message"
+        );
+    }
+
+    /// A greedy adaptive duty (snappy 2s initial window, but greedy folding).
+    fn greedy_duty() -> StimulusDef {
+        StimulusDef::parse(
+            "---\nid: tg\ntrigger: { type: webhook, path: /telegram/pub }\n\
+             directive_tier: self\nemits:\n  type: telegram_message\n\
+             coalesce: { mode: batch, greedy: true, adaptive: { initial_window_sec: 2, daily_credits: 50, max_window_sec: 1800 } }\n\
+             entry: telegram/perceive\n---\nGroup.\n",
+            "stimuli/tg/STIMULUS.md",
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn greedy_folds_messages_that_arrive_after_the_window_closed() {
+        let b = bus();
+        let def = greedy_duty();
+        // msg1 opens an accumulator at t=1000 with a 2s window → pop_after 1002 (poppable, still pending
+        // because nothing has dispatched it — simulating "a cycle for this chat is in flight").
+        b.ingest(&def, vec![chat_cand(7, 1, "gm")], 1000, TrustTier::public()).await.unwrap();
+        // msg2 (t=1100) and msg3 (t=1200) land WELL past the 1002 window. Non-greedy would open a fresh
+        // accumulator each time (→ one wake per message); greedy folds them into the pending one.
+        b.ingest(&def, vec![chat_cand(7, 2, "wen")], 1100, TrustTier::public()).await.unwrap();
+        b.ingest(&def, vec![chat_cand(7, 3, "ser")], 1200, TrustTier::public()).await.unwrap();
+        assert_eq!(b.queue.depth().await.unwrap(), 1, "greedy pools the whole burst into ONE queued wake");
+        let row = b.queue.next().await.unwrap().unwrap();
+        assert_eq!(row.pop_after, Some(1002), "pop_after stays the first msg's → fires ASAP once free");
+        assert_eq!(
+            row.payload.get("message_id").and_then(|v| v.as_i64()),
+            Some(3),
+            "latest message hoisted (reply targets the newest)"
+        );
+        assert_eq!(row.payload.get("items").and_then(|v| v.as_array()).unwrap().len(), 3, "all pooled");
+    }
+
+    #[tokio::test]
+    async fn greedy_seeds_a_fresh_accumulator_once_the_prior_wake_is_claimed() {
+        // The free-moment: the queued accumulator is claimed for dispatch (→ no longer pending/
+        // coalescable), so the next message must NOT fold into the in-flight wake — it seeds a new one.
+        let b = bus();
+        let def = greedy_duty();
+        b.ingest(&def, vec![chat_cand(7, 1, "gm")], 1000, TrustTier::public()).await.unwrap();
+        let claimed = b.queue.next_eligible(&[]).await.unwrap().unwrap(); // dispatcher claims it
+        assert_eq!(claimed.payload.get("message_id").and_then(|v| v.as_i64()), Some(1));
+        b.ingest(&def, vec![chat_cand(7, 2, "wen")], 1100, TrustTier::public()).await.unwrap();
+        assert_eq!(
+            b.queue.depth().await.unwrap(),
+            1,
+            "the claimed wake is in flight; the new message starts a fresh pending accumulator"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_payload_if_pending_is_conditional_on_status() {
+        // The race guard in isolation: applies while pending, refuses once the row is claimed.
+        let b = bus();
+        let def = greedy_duty();
+        b.ingest(&def, vec![chat_cand(7, 1, "gm")], 1000, TrustTier::public()).await.unwrap();
+        let id = b
+            .queue
+            .find_coalescable(&StimulusType::from("telegram_message"), "7")
+            .await
+            .unwrap()[0]
+            .id
+            .clone();
+        assert!(
+            b.queue.set_payload_if_pending(&id, json!({ "x": 1 })).await.unwrap(),
+            "applies while the row is pending"
+        );
+        let _ = b.queue.next_eligible(&[]).await.unwrap().unwrap(); // claim → dispatched
+        assert!(
+            !b.queue.set_payload_if_pending(&id, json!({ "x": 2 })).await.unwrap(),
+            "refuses once the row has been claimed for dispatch"
         );
     }
 

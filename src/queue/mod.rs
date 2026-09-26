@@ -45,6 +45,17 @@ pub trait Queue: Send + Sync {
     /// a dumb store.
     async fn set_payload(&self, id: &StimulusId, payload: serde_json::Value) -> Result<()>;
 
+    /// Like [`set_payload`] but ONLY if the row is still `pending` (not yet claimed for dispatch);
+    /// returns whether it applied. This closes the greedy-fold race: a `pending` accumulator can be
+    /// claimed by the dispatcher (→ `dispatched`) concurrently with a fold, so the fold must be a
+    /// conditional update — if it lost the race it no-ops and the caller seeds a fresh accumulator,
+    /// never mutating a payload that a cycle is already reading.
+    async fn set_payload_if_pending(
+        &self,
+        id: &StimulusId,
+        payload: serde_json::Value,
+    ) -> Result<bool>;
+
     /// Rows eligible to coalesce with an incoming candidate (same type + dedup_key,
     /// still `pending`) — "coalesce".
     async fn find_coalescable(

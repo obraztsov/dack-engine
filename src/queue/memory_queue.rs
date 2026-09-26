@@ -88,6 +88,24 @@ impl Queue for InMemoryQueue {
         Ok(())
     }
 
+    async fn set_payload_if_pending(
+        &self,
+        id: &StimulusId,
+        payload: serde_json::Value,
+    ) -> Result<bool> {
+        let mut rows = self.rows.lock().unwrap();
+        match rows
+            .iter_mut()
+            .find(|s| &s.id == id && s.status == StimulusStatus::Pending)
+        {
+            Some(s) => {
+                s.payload = payload;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     async fn find_coalescable(
         &self,
         type_: &StimulusType,

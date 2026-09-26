@@ -294,6 +294,23 @@ impl Queue for SqliteQueue {
         Ok(())
     }
 
+    async fn set_payload_if_pending(
+        &self,
+        id: &StimulusId,
+        payload: serde_json::Value,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        // Atomic at the SQL level: the row is only updated while still 'pending', so it can't clobber a
+        // payload the dispatcher just claimed (status flips to 'dispatched' under the same table).
+        let n = conn
+            .execute(
+                "UPDATE stimulus SET payload=?1 WHERE id=?2 AND status='pending'",
+                params![payload.to_string(), id.0],
+            )
+            .map_err(db)?;
+        Ok(n > 0)
+    }
+
     async fn find_coalescable(
         &self,
         type_: &StimulusType,

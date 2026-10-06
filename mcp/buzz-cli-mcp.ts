@@ -25,32 +25,22 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
 import { execFile } from 'node:child_process'
+import { mkdirSync } from 'node:fs'
+import { join } from 'node:path'
+import { resolveAttachment } from './attachments'
+import { DEFAULT_DENY, deniedVerb, rejectsHostPathFlag } from './buzz-args'
 
 const BIN = process.env.BUZZ_BIN || 'dack-soul/skills/buzz/bin/buzz'
+const MEDIA_DIR = process.env.MEDIA_DIR
 const RELAY = process.env.BUZZ_RELAY_URL || ''
 const TIMEOUT_MS = (Number(process.env.BUZZ_CLI_TIMEOUT_SEC) || 45) * 1000
 const MAX_OUT = 64 * 1024 // cap returned bytes so a huge query can't blow the context
 
-// Irreversible / admin verbs a chatting agent should not casually run. Matched against the first arg and
-// the first-two args ("verb subverb"). Operator override: BUZZ_CLI_DENY="" allows everything.
-const DEFAULT_DENY = [
-  'agents', 'workflows', 'repos', 'projects', // identity / automation / git admin
-  'messages delete', 'messages edit',
-  'channels create', 'channels update', 'channels delete', 'channels leave',
-]
+// Verb deny-list + host-path flag guard are pure argv policy — see `buzz-args.ts` (unit-tested there).
 const DENY = (process.env.BUZZ_CLI_DENY ?? DEFAULT_DENY.join(','))
   .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean)
 
 const asText = (v: unknown) => ({ content: [{ type: 'text' as const, text: typeof v === 'string' ? v : JSON.stringify(v) }] })
-
-/** Reject a denied verb (fail-closed) before we ever spawn. */
-function denied(args: string[]): string | null {
-  const verbs = args.filter((a) => !a.startsWith('-')) // positional path, e.g. ["messages","send", …]
-  const one = (verbs[0] || '').toLowerCase()
-  const two = `${one} ${(verbs[1] || '').toLowerCase()}`.trim()
-  const hit = DENY.find((d) => d === one || d === two)
-  return hit ? hit : null
-}
 
 function runBuzz(rawArgs: string[]): Promise<{ ok: boolean; out?: string; error?: string; code?: number }> {
   // Strip anything that would override our injected identity/relay/format; we control those.
@@ -121,10 +111,85 @@ server.registerTool(
     inputSchema: { args: z.array(z.string().min(1)).min(1).max(40) },
   },
   async ({ args }: { args: string[] }) => {
-    const d = denied(args)
+    const d = deniedVerb(args, DENY)
     if (d) return asText({ ok: false, error: `buzz verb "${d}" is not allowed (irreversible/admin). Ask the operator if you need it.` })
+    const hp = rejectsHostPathFlag(args)
+    if (hp) {
+      console.error(`[buzz-cli] REFUSED host-path flag ${hp.flag} on the generic tool`)
+      return asText({
+        ok: false,
+        error: `"${hp.flag}" takes a filesystem path and is not allowed here — use the \`${hp.use}\` tool instead, which confines the file to your attachment store. (Your request was NOT sent.)`,
+      })
+    }
     const r = await runBuzz(args)
     return asText(r)
+  },
+)
+
+server.registerTool(
+  'send_file',
+  {
+    description:
+      'Send a STORED file to a Buzz channel (the confined counterpart of `messages send --file`). ' +
+      '`attachment_id` is the `file` basename from an `attachments` entry in a wake payload — never a path; ' +
+      'only files the harness already stored can leave, so you cannot attach an arbitrary host file. ' +
+      'Defaults to the channel + message that woke you; pass `channel` to post elsewhere.',
+    inputSchema: {
+      attachment_id: z.string().min(1).max(512),
+      text: z.string().min(1).max(8000),
+      channel: z.string().min(1).max(200).optional(),
+    },
+  },
+  async ({ attachment_id, text, channel }: { attachment_id: string; text: string; channel?: string }) => {
+    const a = resolveAttachment(MEDIA_DIR, attachment_id)
+    if ('error' in a) {
+      console.error(`[buzz-cli] send_file DENIED id=${JSON.stringify(attachment_id)} — ${a.error}`)
+      return asText({ ok: false, error: a.error })
+    }
+    const ch = channel || process.env.BUZZ_REPLY_CHANNEL
+    if (!ch) return asText({ ok: false, error: 'no channel: this wake carries no reply channel, so pass `channel` explicitly' })
+    const args = ['messages', 'send', '--channel', ch, '--content', text, '--file', a.path]
+    if (!channel && process.env.BUZZ_REPLY_TO) args.push('--reply-to', process.env.BUZZ_REPLY_TO)
+    const r = await runBuzz(args)
+    console.error(`[buzz-cli] send_file ${r.ok ? 'ok' : 'FAILED'} name=${a.name} ch=${ch.slice(0, 8)}…`)
+    return asText(r)
+  },
+)
+
+server.registerTool(
+  'media_fetch',
+  {
+    description:
+      'Fetch a Buzz attachment into your own attachment store so you can work with it (the relay keeps ' +
+      'media behind signed Blossom auth, so a plain URL fetch gets 401). Pass the `sha` of an `attachments` ' +
+      'entry from your wake payload. Returns the stored `attachment_id`: read a text file with the media ' +
+      "`read_attachment` tool, or forward any file with `send_file`. (Images you can SEE are delivered by " +
+      'the channel on wake — fetching one here stores it for forwarding, it does not show it to you.)',
+    inputSchema: {
+      sha: z.string().regex(/^[0-9a-f]{64}$/, 'a bare 64-hex sha256 from an attachments entry'),
+      filename: z.string().min(1).max(200).optional(),
+    },
+  },
+  async ({ sha, filename }: { sha: string; filename?: string }) => {
+    if (!MEDIA_DIR) return asText({ ok: false, error: 'MEDIA_DIR not set — the attachment store is unavailable' })
+    // The stored name is HARNESS-shaped, never model-shaped: a validated 64-hex sha + a sanitized extension.
+    // So the model cannot steer the write (no traversal, no overwriting a soul file), and the name matches
+    // what the ingress prefetch would have produced for the same object (idempotent, cache-friendly).
+    const rawExt = filename?.includes('.') ? '.' + filename.split('.').pop() : ''
+    const ext = rawExt.toLowerCase().replace(/[^a-z0-9.]/g, '').slice(0, 12)
+    const name = `${sha}${ext}`
+    try {
+      mkdirSync(MEDIA_DIR, { recursive: true })
+    } catch {
+      /* harness ensures it at boot */
+    }
+    const r = await runBuzz(['media', 'get', sha, '-o', join(MEDIA_DIR, name)])
+    if (!r.ok) {
+      console.error(`[buzz-cli] media_fetch FAILED sha=${sha.slice(0, 12)}…`)
+      return asText(r)
+    }
+    console.error(`[buzz-cli] media_fetch ok sha=${sha.slice(0, 12)}… → ${name}`)
+    return asText({ ok: true, attachment_id: name, hint: 'read it with read_attachment, or forward it with send_file' })
   },
 )
 

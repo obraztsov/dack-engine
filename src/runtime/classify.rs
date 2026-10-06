@@ -56,11 +56,16 @@ pub fn classify_tool(
     }
 
     match tool {
-        // Builtin FILE reads — blocked from the private `runlogs/` dir (the recall MCPs are the only
-        // path to runlog history; the gitignore makes raw Glob/Read unreliable, so this denies it
-        // outright → `Other`). A non-runlog path is a normal read.
+        // Builtin FILE reads — blocked from two private dirs, each of which has a dedicated MCP as its
+        // ONLY sanctioned path (so the raw builtin is denied outright → `Other`):
+        //   - `runlogs/` — the recall MCPs serve runlog history; the gitignore makes raw Glob/Read unreliable.
+        //   - `media/`   — the attachment store holds UNTRUSTED world bytes (whatever a stranger sent). A raw
+        //     `Read("../media/<name>")` would splice them into context verbatim AND carry no trust taint,
+        //     defeating the invariant in `src/media.rs`. The media-read MCP is the only way in: it caps the
+        //     size, admits plaintext only, and (being an MCP with its own `trust`) taints the cycle.
+        // Any other path is a normal read.
         "Read" | "FileRead" | "Grep" | "Glob" | "LS" | "NotebookRead" => {
-            if targets_runlogs(input) {
+            if targets_private_dir(input) {
                 return (ToolClass::Other, None);
             }
             (ToolClass::Read, None)
@@ -103,15 +108,23 @@ fn extract_path(input: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Does a file-read's input target the private `runlogs/` dir? Checks every path-ish field
-/// (`file_path`, `path`, `pattern` — the last for `Glob`) for a `runlogs` path SEGMENT, so
-/// `runlogs/2026-…md`, `…/runlogs`, and `runlogs/**/*` all match while `runlogs_archive` does not.
-fn targets_runlogs(input: &Value) -> bool {
+/// Private dirs a builtin file-read may never touch — each is served by a dedicated MCP instead
+/// (`runlogs/` → the recall servers; `media/` → the media-read server, which caps + taints).
+/// These are the conventional directory NAMES: `runlog_db`/`media_dir` are configurable, but the
+/// deny is a path-segment check (it cannot see config), so a non-default location must rely on the
+/// MCP being the only thing told where the store is. Matches the default config and the shipped souls.
+const PRIVATE_DIRS: [&str; 2] = ["runlogs", "media"];
+
+/// Does a file-read's input target one of [`PRIVATE_DIRS`]? Checks every path-ish field
+/// (`file_path`, `path`, `pattern` — the last for `Glob`) for the dir as a path SEGMENT, so
+/// `runlogs/2026-…md`, `…/runlogs`, `runlogs/**/*`, `../media/x.md` and `media` all match, while
+/// `runlogs_archive` / `media_cache` do not.
+fn targets_private_dir(input: &Value) -> bool {
     ["file_path", "path", "pattern"].iter().any(|k| {
-        input
-            .get(*k)
-            .and_then(Value::as_str)
-            .is_some_and(|p| p.split(|c| c == '/' || c == '\\').any(|seg| seg == "runlogs"))
+        input.get(*k).and_then(Value::as_str).is_some_and(|p| {
+            p.split(|c| c == '/' || c == '\\')
+                .any(|seg| PRIVATE_DIRS.contains(&seg))
+        })
     })
 }
 
@@ -282,6 +295,42 @@ mod tests {
         let recall = open(&["mcp__recall-self__", "mcp__recall__"]);
         assert_eq!(
             classify_tool("mcp__recall-self__recent_activity", &json!({}), &s, &p, &recall).0,
+            ToolClass::Read,
+        );
+    }
+
+    #[test]
+    fn media_store_file_reads_are_blocked_but_the_media_mcp_passes() {
+        let (s, p, r) = (settle(), post(), read());
+        // The attachment store holds UNTRUSTED world bytes: a raw builtin read of it is denied, so the
+        // only way in is the media-read MCP (capped, plaintext-only, trust-tainting).
+        for input in [
+            json!({"file_path": "media/deadbeef.md"}),
+            json!({"file_path": "../media/deadbeef.md"}), // escaping the soul repo sideways
+            json!({"file_path": "/duck/media/deadbeef.txt"}),
+            json!({"path": "media"}),
+            json!({"pattern": "media/**/*"}),
+        ] {
+            assert_eq!(
+                classify_tool("Read", &input, &s, &p, &r).0,
+                ToolClass::Other,
+                "media read must be denied: {input}",
+            );
+            assert_eq!(classify_tool("Grep", &input, &s, &p, &r).0, ToolClass::Other);
+        }
+        // SEGMENT-exact: a soul file that merely starts with "media" is a normal read.
+        assert_eq!(
+            classify_tool("Read", &json!({"file_path": "memory/media_cache/notes.md"}), &s, &p, &r).0,
+            ToolClass::Read,
+        );
+        assert_eq!(
+            classify_tool("Read", &json!({"file_path": "mediations.md"}), &s, &p, &r).0,
+            ToolClass::Read,
+        );
+        // The media-read MCP reads the store via node fs, not the Read tool → classified by prefix.
+        let media = open(&["mcp__media__"]);
+        assert_eq!(
+            classify_tool("mcp__media__read_attachment", &json!({}), &s, &p, &media).0,
             ToolClass::Read,
         );
     }

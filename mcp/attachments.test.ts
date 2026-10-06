@@ -2,7 +2,7 @@ import { test, expect } from 'bun:test'
 import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync, realpathSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { resolveAttachment } from './attachments'
+import { resolveAttachment, plaintextGate } from './attachments'
 
 function store(): string {
   const dir = mkdtempSync(join(tmpdir(), 'dack-attach-'))
@@ -50,3 +50,42 @@ test('a symlink pointing outside the store is rejected', () => {
   const r = resolveAttachment(dir, 'link.txt')
   expect('error' in r).toBe(true) // realpath escapes the store prefix → rejected
 })
+
+// ── plaintextGate: which attachments may be READ as text into the context window ───────────────────
+
+test('plaintext extensions are served', () => {
+  for (const name of ['brief.md', 'notes.txt', 'data.csv', 'conf.yaml', 'x.json', 'a.log', 'p.patch']) {
+    const g = plaintextGate(name)
+    expect('ok' in g).toBe(true)
+  }
+  // Case-insensitive, and a dotted name keeps only the LAST extension.
+  expect('ok' in plaintextGate('README.MD')).toBe(true)
+  expect('ok' in plaintextGate('report.final.md')).toBe(true)
+})
+
+test('known-binary types are refused by NAME with a do-not-retry message naming the format', () => {
+  const pdf = plaintextGate('invoice.pdf')
+  expect('error' in pdf).toBe(true)
+  if ('error' in pdf) {
+    expect(pdf.error).toContain('PDF')
+    expect(pdf.error).toContain('do not retry') // stops a retry loop
+    expect(pdf.error).toContain('FORWARD') // points at the capability that DOES exist
+  }
+  for (const name of ['a.docx', 'b.xlsx', 'c.zip', 'd.png', 'e.mp3', 'f.mp4', 'g.bin']) {
+    expect('error' in plaintextGate(name)).toBe(true)
+  }
+})
+
+test('an unknown or absent extension is refused (allowlist is fail-closed)', () => {
+  for (const name of ['mystery.xyz', 'noext', 'archive.7z', '.hidden']) {
+    expect('error' in plaintextGate(name)).toBe(true)
+  }
+})
+
+test('a sha-named file (what media_fetch stores) is gated by its stamped extension', () => {
+  const sha = 'a'.repeat(64)
+  expect('ok' in plaintextGate(`${sha}.md`)).toBe(true) // a fetched .md is readable
+  expect('error' in plaintextGate(`${sha}.pdf`)).toBe(true) // a fetched PDF is not
+  expect('error' in plaintextGate(sha)).toBe(true) // bare sha, no extension → refused
+})
+

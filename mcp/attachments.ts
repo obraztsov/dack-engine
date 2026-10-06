@@ -39,6 +39,38 @@ const KNOWN_BINARY: Record<string, string> = {
  * PDF/Word file is refused cleanly and can still be FORWARDED by id. Document extraction is the planned
  * extension point — teach this gate a new type and the confinement/cap/taint story is inherited unchanged.
  */
+/**
+ * Sanitize a model-supplied filename for a file the AGENT authored (the outbox write path).
+ *
+ * The name is attacker-reachable (an injected message can ask for a particular filename) AND it becomes
+ * the filename the RECIPIENT sees, so it is normalized rather than merely rejected:
+ *   - `basename()` first — no directory components, no `../` traversal;
+ *   - collapsed to `[A-Za-z0-9._-]` so nothing shell-, header- or path-surprising survives;
+ *   - no leading dot (no hidden files) and a length ceiling, extension preserved;
+ *   - must pass `plaintextGate` — the agent can only author TEXT, so it cannot stage a fake `.pdf`/`.png`
+ *     that a reader would trust by extension. Same type policy as the read side, both directions.
+ */
+export function sanitizeAttachmentName(raw: string): { name: string } | { error: string } {
+  let n = basename(raw)
+    .replace(/[^A-Za-z0-9._-]+/g, '-')
+    .replace(/-{2,}/g, '-')
+    .replace(/^[-.]+/, '') // no hidden/dot-leading names
+  if (!n || n === '.' || n === '..') return { error: `"${raw}" is not a usable filename` }
+
+  if (n.length > 80) {
+    const dot = n.lastIndexOf('.')
+    const ext = dot > 0 ? n.slice(dot) : ''
+    n = n.slice(0, 80 - ext.length).replace(/[-.]+$/, '') + ext
+  }
+  const gate = plaintextGate(n)
+  if ('error' in gate) {
+    return {
+      error: `you can only author PLAINTEXT files, and "${n}" isn't one (${gate.error.includes('not plaintext') ? 'binary type' : 'unrecognized extension'}). Use a .md / .txt / .csv / .json name.`,
+    }
+  }
+  return { name: n }
+}
+
 export function plaintextGate(name: string): { ok: true; ext: string } | { error: string } {
   const dot = name.lastIndexOf('.')
   const ext = dot > 0 ? name.slice(dot).toLowerCase() : ''

@@ -2,7 +2,7 @@ import { test, expect } from 'bun:test'
 import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync, realpathSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { resolveAttachment, plaintextGate } from './attachments'
+import { resolveAttachment, plaintextGate, sanitizeAttachmentName } from './attachments'
 
 function store(): string {
   const dir = mkdtempSync(join(tmpdir(), 'dack-attach-'))
@@ -87,5 +87,62 @@ test('a sha-named file (what media_fetch stores) is gated by its stamped extensi
   expect('ok' in plaintextGate(`${sha}.md`)).toBe(true) // a fetched .md is readable
   expect('error' in plaintextGate(`${sha}.pdf`)).toBe(true) // a fetched PDF is not
   expect('error' in plaintextGate(sha)).toBe(true) // bare sha, no extension → refused
+})
+
+// ── sanitizeAttachmentName: naming a file the AGENT authored (outbox write path) ───────────────────
+
+const okName = (raw: string) => {
+  const r = sanitizeAttachmentName(raw)
+  if ('error' in r) throw new Error(`expected ok for ${raw}: ${r.error}`)
+  return r.name
+}
+
+test('a clean plaintext name passes through unchanged', () => {
+  expect(okName('staking-explainer.md')).toBe('staking-explainer.md')
+  expect(okName('emission_spec.v2.md')).toBe('emission_spec.v2.md')
+  expect(okName('data.csv')).toBe('data.csv')
+})
+
+test('directory components are stripped — a model-supplied name cannot traverse', () => {
+  expect(okName('../../etc/passwd.md')).toBe('passwd.md')
+  expect(okName('/duck/secrets/leak.md')).toBe('leak.md')
+  expect(okName('a/b/c/brief.md')).toBe('brief.md')
+  // ...and the result is always a bare basename
+  for (const raw of ['../x.md', '/etc/x.txt', 'sub/../../x.csv']) {
+    expect(okName(raw).includes('/')).toBe(false)
+  }
+})
+
+test('surprising characters are collapsed to a safe charset', () => {
+  expect(okName('my brief; rm -rf.md')).toBe('my-brief-rm-rf.md')
+  expect(okName('re:port$(whoami).txt')).toBe('re-port-whoami-.txt')
+  expect(okName('brief\n\tv2.md')).toBe('brief-v2.md')
+})
+
+test('hidden/degenerate names: the dot-lead is stripped, and a stem-less name is refused', () => {
+  expect(okName('.hidden.md')).toBe('hidden.md') // leading dot stripped, still a valid name
+  for (const raw of [
+    '...',
+    '/',
+    'my brief; rm -rf /.md', // basename() degenerates this to ".md" → no stem left → refused
+    '.md',
+  ]) {
+    expect('error' in sanitizeAttachmentName(raw)).toBe(true)
+  }
+})
+
+test('the agent can only author TEXT — a fake binary extension is refused', () => {
+  // Staging a ".pdf"/".png" would let a text file masquerade as a document a reader trusts by extension.
+  for (const raw of ['invoice.pdf', 'chart.png', 'sheet.xlsx', 'payload.bin', 'noext', 'thing.xyz']) {
+    const r = sanitizeAttachmentName(raw)
+    expect('error' in r).toBe(true)
+    if ('error' in r) expect(r.error).toContain('PLAINTEXT')
+  }
+})
+
+test('an over-long name is truncated but keeps its extension', () => {
+  const n = okName('x'.repeat(200) + '.md')
+  expect(n.length).toBeLessThanOrEqual(80)
+  expect(n.endsWith('.md')).toBe(true)
 })
 

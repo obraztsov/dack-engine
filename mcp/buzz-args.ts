@@ -7,9 +7,16 @@
 /** Irreversible / admin verbs a chatting agent should not casually run. Matched against the first
  *  positional and the first-two ("verb subverb"). Operator override: BUZZ_CLI_DENY="" allows everything. */
 export const DEFAULT_DENY = [
-  'agents', 'workflows', 'repos', 'projects', // identity / automation / git admin
+  'agents', 'workflows', // identity + automation admin — never an agent's business
   'messages delete', 'messages edit',
+  // Channels are the org's ROOMS: creating/renaming/deleting them is an operator act (a project binds to
+  // an EXISTING channel, and `projects add-channel` drafts for owner review anyway). Joining is fine.
   'channels create', 'channels update', 'channels delete', 'channels leave',
+  // `projects` + `repos` are otherwise OPEN (operator decision 2026-10-08): an agent may create a project,
+  // announce/bind a repo, file + triage issues, and open patches/PRs — that is the point of giving a fleet
+  // a git workspace. Only the irreversible tombstone stays out of reach.
+  'projects delete',
+  'moderation', // banning/timing-out members is an operator act
 ]
 
 /**

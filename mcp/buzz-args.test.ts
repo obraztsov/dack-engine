@@ -17,7 +17,7 @@ test('REGRESSION: a flag VALUE cannot shift the positional path to bypass the de
   expect(deniedVerb(['--format', 'json', 'messages', 'delete', '--id', 'x'], DENY)).toBe('messages delete')
   expect(deniedVerb(['--format', 'compact', 'channels', 'delete'], DENY)).toBe('channels delete')
   expect(deniedVerb(['--auth-tag', '{}', 'agents', 'archive'], DENY)).toBe('agents')
-  expect(deniedVerb(['--relay', 'https://evil.example', 'repos', 'push'], DENY)).toBe('repos')
+  expect(deniedVerb(['--relay', 'https://evil.example', 'workflows', 'run'], DENY)).toBe('workflows')
   // `--flag=value` form too.
   expect(deniedVerb(['--format=json', 'channels', 'leave'], DENY)).toBe('channels leave')
   // A value-LESS flag before the verb must not hide it either (the naive backstop covers this).
@@ -36,6 +36,39 @@ test('allowed verbs pass, including ones whose PARENT has denied subverbs', () =
   expect(deniedVerb(['channels', 'list'], DENY)).toBeNull()
   expect(deniedVerb(['media', 'get', 'abc'], DENY)).toBeNull()
   expect(deniedVerb(['dms', 'open', '--pubkey', 'ff'], DENY)).toBeNull()
+})
+
+test('the git workspace is OPEN: projects, repos, issues, canvas, patches, PRs', () => {
+  // Operator decision: a fleet with a git workspace must be able to USE it. Only the irreversible
+  // tombstone (`projects delete`) and the org's rooms (channels create/update/delete) stay out.
+  for (const argv of [
+    ['projects', 'create', 'my-slug', '--channel', 'uuid'],
+    ['projects', 'list', '--owner', 'ff'],
+    ['projects', 'add-repo', '--repo', 'r'],
+    ['repos', 'create', '--id', 'r'],
+    ['repos', 'bind', '--channel', 'uuid'],
+    ['issues', 'create', '--title', 't', '--content', 'c'],
+    ['issues', 'assign', '--issue', 'e', '--assignee', 'ff'],
+    ['issues', 'status', '--issue', 'e', '--status', 'resolved'],
+    ['canvas', 'set', '--channel', 'uuid', '--content', '-'],
+    ['canvas', 'history', '--channel', 'uuid'],
+    ['patches', 'send', '--content', 'd'],
+    ['pr', 'open', '--title', 't'],
+    ['upload', 'file', 'x.md'],
+    ['mem', 'set', 'slug', 'v'],
+  ]) {
+    expect(deniedVerb(argv, DENY)).toBeNull()
+  }
+})
+
+test('still denied: the tombstone, the rooms, identity/automation, moderation', () => {
+  expect(deniedVerb(['projects', 'delete', '--slug', 's'], DENY)).toBe('projects delete')
+  expect(deniedVerb(['channels', 'create', '--name', 'n'], DENY)).toBe('channels create')
+  expect(deniedVerb(['channels', 'delete'], DENY)).toBe('channels delete')
+  expect(deniedVerb(['agents', 'draft-create'], DENY)).toBe('agents')
+  expect(deniedVerb(['moderation', 'ban', '--pubkey', 'ff'], DENY)).toBe('moderation')
+  // ...and the flag-value bypass must not resurrect any of them
+  expect(deniedVerb(['--format', 'json', 'projects', 'delete'], DENY)).toBe('projects delete')
 })
 
 test('an empty operator override disables the verb deny-list', () => {

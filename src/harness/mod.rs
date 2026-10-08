@@ -986,9 +986,11 @@ impl Harness {
                 tags.push(t.clone());
             }
         }
+        // NOT `?` — see `write_runlog`: a failed runlog write degrades to a marked ref instead of
+        // aborting the dispatch, so a transient DB lock can never swallow an answer the agent composed.
         let runlog_ref = self
             .write_runlog(prompt.state, stimulus, &out, tool_calls, step_seq, tags)
-            .await?;
+            .await;
         // Retire the digest queue — but ONLY on a cycle that could actually CONSOLIDATE it into `memory/`.
         // A digest job is two cycles: read-only Perceive READS + surfaces the queue and hands a gist to
         // the Express distill that WRITES memory. Delivery must fire on the memory-writer (the gist is
@@ -1983,6 +1985,16 @@ impl Harness {
     /// untrusted), the captured `(tool, decision)` records, and the soul-integrity verdict:
     /// any `reverted` paths make this a tagged-error entry (the tripwire alarm). Returns the
     /// `runlog_ref` the Baton points at. `run_id` is unique per `(stimulus, state)`.
+    ///
+    /// **Infallible by design — a lost RECORD must never become a lost REPLY.** This used to return
+    /// `Result` and the caller `?`'d it, so a transient `SQLITE_BUSY` on the runlog aborted the whole
+    /// dispatch *after* Perceive and *before* Express: the agent had composed an answer and the user
+    /// never got it, while the cycle vanished from the runlog entirely (invisible to any runlog-based
+    /// audit — only the harness log showed it). Observed live 2026-10-08: a buzz reply lost to
+    /// `runlog: database is locked` despite `busy_timeout=5000`, i.e. real write contention under
+    /// multithreading, not a missing pragma. The runlog is the agent's NARRATIVE, not its transport:
+    /// failing to record a cycle is a reporting fault to shout about, never a reason to drop the
+    /// outward act. On failure we log at ERROR and hand back a marked ref so the fan-out still threads.
     async fn write_runlog(
         &self,
         state: ConsciousnessState,
@@ -1991,7 +2003,7 @@ impl Harness {
         tool_calls: Vec<ToolCallRecord>,
         step_seq: usize,
         tags: Vec<String>,
-    ) -> Result<String> {
+    ) -> String {
         // A tripwire revert is reported in the HARNESS logs (`reconcile_soul`), not here — the runlog is
         // the agent's own narrative, so a cycle is `Ok` unless it genuinely errored (the dispatch-error
         // path writes its own `Outcome::Error` entry).
@@ -2019,7 +2031,20 @@ impl Harness {
             tags,
             trust: stimulus.payload_tier.name().to_string(),
         };
-        self.runlog.append(&entry).await
+        let run_id = entry.run_id.clone();
+        match self.runlog.append(&entry).await {
+            Ok(r) => r,
+            Err(e) => {
+                // LOUD, but not fatal. The cycle continues: batons still fan out and the outward act
+                // still happens — the operator just learns this run went unrecorded. The marker rides
+                // the baton's `runlog_ref` so a later reader can see WHY the trail stops here.
+                tracing::error!(
+                    "runlog append FAILED for {run_id} ({e}) — continuing the cycle: a lost record must \
+                     not become a lost reply. THIS RUN IS NOT IN THE RUNLOG."
+                );
+                format!("{run_id} (UNRECORDED: {e})")
+            }
+        }
     }
 }
 
@@ -4662,6 +4687,69 @@ mod tests {
 
     /// Tag-notes: ANY cycle (incl. read-only Perceive) may leave one, and the harness AUTO-STAMPS the
     /// note's trust from the cycle's taint (NOT model-asserted) — so provenance is unfakeable.
+    /// A runlog whose `append` always fails — stands in for the live `SQLITE_BUSY` ("database is
+    /// locked") seen under write contention.
+    struct FailingRunLog;
+    #[async_trait::async_trait]
+    impl crate::runlog::RunLogWriter for FailingRunLog {
+        async fn append(&self, _e: &crate::model::runlog::RunLogEntry) -> Result<String> {
+            Err(crate::error::DackError::Repo("runlog: database is locked".into()))
+        }
+        async fn tail(&self, _m: usize) -> Result<String> {
+            Ok(String::new())
+        }
+        async fn tail_filtered(&self, _s: Option<i64>, _m: usize, _t: Option<&str>) -> Result<String> {
+            Ok(String::new())
+        }
+        async fn append_note(&self, _k: &str, _tg: &[&str], _n: &str, _tr: &str, _ts: i64) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// REGRESSION: a failed runlog write must NOT abort the cycle.
+    ///
+    /// `write_runlog` used to return `Result` and the dispatcher `?`'d it, so a transient
+    /// `SQLITE_BUSY` killed the dispatch between Perceive and Express — the agent had composed an
+    /// answer and the user never got it, and the run vanished from the runlog so nothing in a
+    /// runlog-based audit showed the loss. Lost a live buzz reply on 2026-10-08. The runlog is the
+    /// agent's NARRATIVE, not its transport: a reporting fault must degrade, never drop the reply.
+    #[tokio::test]
+    async fn a_failed_runlog_write_degrades_instead_of_killing_the_cycle() {
+        use crate::identity::local::LocalIdentity;
+        use crate::queue::InMemoryQueue;
+        use crate::repo::git::PlainGitRepo;
+        use std::collections::HashMap;
+
+        let config = Arc::new(DackConfig::from_yaml("operator_did: \"did:x\"\n").unwrap());
+        let queue: Arc<dyn Queue> = Arc::new(InMemoryQueue::new());
+        let tmp = std::env::temp_dir().join(format!("dack-runlog-fail-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).ok();
+        let harness = Harness {
+            config: config.clone(),
+            queue: queue.clone(),
+            bus: Arc::new(Bus::new(config.clone(), queue.clone())),
+            runtime: Arc::new(RecordingRuntime { seen: std::sync::Mutex::new(Vec::new()), out: perceive_output(), usage: None }),
+            repo: Arc::new(PlainGitRepo::new(&tmp, "did:x")),
+            identity: Arc::new(LocalIdentity::resolve(HashMap::new()).unwrap()),
+            runlog: Arc::new(FailingRunLog),
+            broker: Arc::new(SecretsBroker::new_test(vec![])),
+            sessions: Default::default(),
+            mem_lock: Default::default(),
+        };
+
+        let stim = poisoned_stimulus(); // any stimulus will do — this one is already to hand
+        let got = harness
+            .write_runlog(ConsciousnessState::Perceive, &stim, &perceive_output(), vec![], 1, vec![])
+            .await;
+
+        // It RETURNS (no error to propagate) and the ref is MARKED so a reader can see the trail broke.
+        assert!(got.contains("UNRECORDED"), "ref must mark the gap, got {got:?}");
+        assert!(got.contains("database is locked"), "ref should carry the cause, got {got:?}");
+        assert!(got.starts_with("run-"), "ref keeps the run id so the baton still threads: {got:?}");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
     #[tokio::test]
     async fn honor_tag_notes_stamps_cycle_trust_from_any_state() {
         use crate::identity::local::LocalIdentity;

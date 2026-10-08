@@ -1,5 +1,5 @@
 import { test, expect } from 'bun:test'
-import { DEFAULT_DENY, deniedVerb, rejectsHostPathFlag } from './buzz-args'
+import { DEFAULT_DENY, deniedVerb, rejectsHostPathFlag, applySendDefaults, flagValue } from './buzz-args'
 
 const DENY = DEFAULT_DENY.map((d) => d.toLowerCase())
 
@@ -64,4 +64,60 @@ test('ordinary argv is untouched — the guard is shape-specific, not path-sniff
   expect(rejectsHostPathFlag(['messages', 'send', '--content', 'see /etc/passwd lol'])).toBeNull()
   // A longer flag that merely starts with a denied one must not false-match.
   expect(rejectsHostPathFlag(['messages', 'send', '--filename', 'x.md'])).toBeNull()
+})
+
+// ── applySendDefaults: the wake-scoped send defaults ──────────────────────────────────────────────
+// REGRESSION GUARD. The reply-to default used to be applied whenever the flag was absent, so a send aimed
+// at ANOTHER channel got the wake event (which lives in the WOKE channel) as its parent, and the relay
+// refused the whole event: "parent event belongs to a different channel". Every cross-channel post broke,
+// including send_file — the ducks staged documents correctly and the relay silently rejected them.
+
+const WOKE = 'c747e8d2-cccc-cccc-cccc-cclevelcclevel'
+const OTHER = 'a40b643f-rrrr-rrrr-rrrr-researchresear'
+const ENV = { replyChannel: WOKE, replyTo: 'wake-event-id' }
+
+test('a bare reply defaults to the woke channel AND threads under the wake event', () => {
+  const out = applySendDefaults(['messages', 'send', '--content', 'hi'], ENV)
+  expect(flagValue(out, '--channel')).toBe(WOKE)
+  expect(flagValue(out, '--reply-to')).toBe('wake-event-id')
+})
+
+test('CROSS-CHANNEL send gets NO reply-to (the bug that blocked every document)', () => {
+  const out = applySendDefaults(['messages', 'send', '--channel', OTHER, '--content', 'brief'], ENV)
+  expect(flagValue(out, '--channel')).toBe(OTHER) // target preserved
+  expect(out).not.toContain('--reply-to') // ← the fix: no foreign parent
+  // the same shape send_file builds (with --file) must also stay parent-free
+  const withFile = applySendDefaults(
+    ['messages', 'send', '--channel', OTHER, '--content', 'brief', '--file', '/duck/media/x.md'], ENV)
+  expect(withFile).not.toContain('--reply-to')
+})
+
+test('naming the WOKE channel explicitly still threads (it is the same conversation)', () => {
+  const out = applySendDefaults(['messages', 'send', '--channel', WOKE, '--content', 'reply'], ENV)
+  expect(flagValue(out, '--reply-to')).toBe('wake-event-id')
+  // `--channel=<id>` form too
+  const eq = applySendDefaults(['messages', 'send', `--channel=${WOKE}`, '--content', 'r'], ENV)
+  expect(flagValue(eq, '--reply-to')).toBe('wake-event-id')
+})
+
+test('an explicit reply-to from the model is never overridden', () => {
+  const out = applySendDefaults(['messages', 'send', '--reply-to', 'mine', '--content', 'x'], ENV)
+  expect(flagValue(out, '--reply-to')).toBe('mine')
+  expect(out.filter((a) => a === '--reply-to').length).toBe(1)
+})
+
+test('non-send verbs are untouched, and a wake with no scope adds nothing', () => {
+  const read = ['messages', 'get', '--channel', OTHER, '--limit', '10']
+  expect(applySendDefaults(read, ENV)).toEqual(read)
+  expect(applySendDefaults(['channels', 'list'], ENV)).toEqual(['channels', 'list'])
+  // heartbeat / self cycles carry no BUZZ_REPLY_* at all → the model's argv stands alone
+  const bare = ['messages', 'send', '--channel', OTHER, '--content', 'x']
+  expect(applySendDefaults(bare, {})).toEqual(bare)
+})
+
+test('send-diff gets the same treatment as send', () => {
+  expect(applySendDefaults(['messages', 'send-diff', '--channel', OTHER, '--content', 'd'], ENV))
+    .not.toContain('--reply-to')
+  expect(flagValue(applySendDefaults(['messages', 'send-diff', '--content', 'd'], ENV), '--reply-to'))
+    .toBe('wake-event-id')
 })

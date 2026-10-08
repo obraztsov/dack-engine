@@ -28,7 +28,7 @@ import { execFile } from 'node:child_process'
 import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { resolveAttachment } from './attachments'
-import { DEFAULT_DENY, deniedVerb, rejectsHostPathFlag } from './buzz-args'
+import { DEFAULT_DENY, deniedVerb, rejectsHostPathFlag, applySendDefaults } from './buzz-args'
 
 const BIN = process.env.BUZZ_BIN || 'dack-soul/skills/buzz/bin/buzz'
 const MEDIA_DIR = process.env.MEDIA_DIR
@@ -44,7 +44,8 @@ const asText = (v: unknown) => ({ content: [{ type: 'text' as const, text: typeo
 
 function runBuzz(rawArgs: string[]): Promise<{ ok: boolean; out?: string; error?: string; code?: number }> {
   // Strip anything that would override our injected identity/relay/format; we control those.
-  const args: string[] = []
+  // (`let`, not `const` — reassigned by `applySendDefaults` below.)
+  let args: string[] = []
   for (let i = 0; i < rawArgs.length; i++) {
     const a = rawArgs[i]
     if (a === '--relay' || a === '--private-key' || a === '--key') { i++; continue } // drop flag + its value
@@ -53,14 +54,14 @@ function runBuzz(rawArgs: string[]): Promise<{ ok: boolean; out?: string; error?
   }
   // Convenience (not a lock): default a `messages send`/`send-diff` to the channel + message that woke this
   // cycle (harness scope_env → BUZZ_REPLY_CHANNEL/BUZZ_REPLY_TO), so a reply lands in the right thread even
-  // if the model omits them. The model can still target ANY channel by passing --channel explicitly.
-  const verbs0 = args.filter((a) => !a.startsWith('-'))
-  const isSend = verbs0[0] === 'messages' && (verbs0[1] === 'send' || verbs0[1] === 'send-diff')
-  if (isSend) {
-    const has = (f: string) => args.some((a) => a === f || a === `-${f[2]}` || a.startsWith(`${f}=`))
-    if (!has('--channel') && process.env.BUZZ_REPLY_CHANNEL) args.push('--channel', process.env.BUZZ_REPLY_CHANNEL)
-    if (!has('--reply-to') && process.env.BUZZ_REPLY_TO) args.push('--reply-to', process.env.BUZZ_REPLY_TO)
-  }
+  // if the model omits them. The model can still target ANY channel by passing --channel explicitly, in
+  // which case the wake's reply-to is NOT applied (a cross-channel parent is rejected by the relay).
+  // Pure + unit-tested in `buzz-args.ts` — this defaulting is exactly what silently broke cross-channel
+  // sends, so it does not live inline any more.
+  args = applySendDefaults(args, {
+    replyChannel: process.env.BUZZ_REPLY_CHANNEL,
+    replyTo: process.env.BUZZ_REPLY_TO,
+  })
   // `--format` is a GLOBAL flag — it must come BEFORE the subcommand (buzz rejects it after). Prepend it
   // LAST, after the verb-based logic above has read the positional verbs.
   if (!args.some((a) => a === '--format')) args.unshift('--format', 'json')
@@ -148,8 +149,10 @@ server.registerTool(
     }
     const ch = channel || process.env.BUZZ_REPLY_CHANNEL
     if (!ch) return asText({ ok: false, error: 'no channel: this wake carries no reply channel, so pass `channel` explicitly' })
+    // Always pass --channel explicitly; `runBuzz`/`applySendDefaults` then threads the wake's reply-to ONLY
+    // when `ch` IS the woke channel. (This used to be guarded here and then re-defaulted inside runBuzz —
+    // which appended a cross-channel parent and made every send_file to another channel fail at the relay.)
     const args = ['messages', 'send', '--channel', ch, '--content', text, '--file', a.path]
-    if (!channel && process.env.BUZZ_REPLY_TO) args.push('--reply-to', process.env.BUZZ_REPLY_TO)
     const r = await runBuzz(args)
     console.error(`[buzz-cli] send_file ${r.ok ? 'ok' : 'FAILED'} name=${a.name} ch=${ch.slice(0, 8)}…`)
     return asText(r)

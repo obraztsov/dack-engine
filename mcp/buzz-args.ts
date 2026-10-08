@@ -78,6 +78,48 @@ export const HOST_PATH_FLAGS: Record<string, string> = {
   '-o': 'media_fetch',
 }
 
+/** Read a flag's value out of argv, supporting both `--flag value` and `--flag=value`. */
+export function flagValue(args: string[], flag: string): string | undefined {
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === flag) return args[i + 1]
+    if (args[i].startsWith(`${flag}=`)) return args[i].slice(flag.length + 1)
+  }
+  return undefined
+}
+
+/**
+ * Apply the wake-scoped SEND defaults to a `messages send`/`send-diff` argv (a convenience, never a lock —
+ * the model may target any channel explicitly).
+ *
+ * `--channel` defaults to the channel that woke us. `--reply-to` is the subtle one: it threads the new
+ * message under the WAKE EVENT, and that event lives in the woke channel. Defaulting it on a send aimed at a
+ * DIFFERENT channel produces a cross-channel parent, which the relay rejects outright —
+ * "parent event belongs to a different channel". That broke every cross-channel post (delegating a brief to
+ * `research` from a `c-level`/`general` wake) INCLUDING `send_file`, so documents never left: the duck
+ * staged correctly, called send_file correctly, and the relay refused the event. So only thread when this
+ * send actually targets the woke channel.
+ */
+export function applySendDefaults(
+  args: string[],
+  env: { replyChannel?: string; replyTo?: string },
+): string[] {
+  const positional = args.filter((a) => !a.startsWith('-'))
+  const isSend = positional[0] === 'messages' && (positional[1] === 'send' || positional[1] === 'send-diff')
+  if (!isSend) return args
+
+  const has = (f: string) => args.some((a) => a === f || a.startsWith(`${f}=`))
+  const out = [...args]
+  const explicitChannel = has('--channel')
+  if (!explicitChannel && env.replyChannel) out.push('--channel', env.replyChannel)
+
+  // Thread only when the target IS the woke channel (either defaulted above, or named explicitly as the
+  // same id). Cross-channel ⇒ no parent, or the relay rejects the whole event.
+  const target = explicitChannel ? flagValue(args, '--channel') : env.replyChannel
+  const targetsWokeChannel = !!env.replyChannel && target === env.replyChannel
+  if (!has('--reply-to') && targetsWokeChannel && env.replyTo) out.push('--reply-to', env.replyTo)
+  return out
+}
+
 /** Returns the offending flag + the tool to use instead, or null. Handles `--flag=value` too. */
 export function rejectsHostPathFlag(args: string[]): { flag: string; use: string } | null {
   for (const a of args) {

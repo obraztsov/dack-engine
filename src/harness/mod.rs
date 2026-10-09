@@ -373,8 +373,11 @@ impl Harness {
         // for — a silently-failed wake is a user the agent never answered. Spawned + timeboxed so
         // a down router can never slow the consciousness loop.
         if let Some(url) = self.config.notify_url.clone() {
-            let title = format!("cycle failed: {}", snap.id);
-            let body = format!("{err}");
+            // Title names the CLASS (the duty), not the instance: the router dedups on severity+title,
+            // so `cycle failed: <stimulus-id>` made every occurrence unique and a repeating fault would
+            // page once per wake. The exact id + cause go in the body.
+            let title = format!("cycle failed: {}", snap.source);
+            let body = format!("{err}\n(stimulus {})", snap.id);
             tokio::spawn(async move {
                 let _ = tokio::time::timeout(
                     std::time::Duration::from_secs(5),
@@ -659,7 +662,12 @@ impl Harness {
         // (or a housekeeping cycle that silently no-op'd). Fire-and-forget to the notify router, timeboxed.
         if entry_notify_on_silent && !acted_outward_any && !produced_baton_any {
             if let Some(url) = self.config.notify_url.clone() {
-                let title = format!("silent cycle: {}", stimulus.id);
+                // The TITLE must be stable across occurrences: the router dedups on
+                // `severity|title|body`, so putting the (unique) stimulus id in the title made every
+                // silent cycle its own key — a duck stuck in a silent loop would page the operator once
+                // per wake, forever. Keyed on the PROMPT instead, repeats inside the dedup window
+                // collapse; the id still rides the body for diagnosis.
+                let title = format!("silent cycle: {entry_prompt_id}");
                 let body = format!(
                     "a cycle entering `{entry_prompt_id}` produced zero outward actions and zero batons — a reply may have died in a thought (stimulus {})",
                     stimulus.id

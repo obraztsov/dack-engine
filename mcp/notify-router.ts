@@ -96,13 +96,25 @@ function buzzSend(channel: string, text: string): boolean {
   return proc.exitCode === 0
 }
 
+/**
+ * Dedup identity of a notification: the CLASS (severity + source + title), **not** the body.
+ *
+ * The body carries per-occurrence detail (a stimulus id, an error string). Including it made every
+ * notification its own key, so the dedup window never collapsed anything — a duck stuck in a failing
+ * loop paged the operator once per wake, forever. Producers therefore keep `title` stable for a
+ * recurring condition (the duty/prompt that failed) and put the varying detail in `body`.
+ */
+export function dedupKey(n: Notification): string {
+  return `${n.severity}|${n.source ?? ''}|${n.title ?? ''}`
+}
+
 async function deliver(n: Notification): Promise<{ delivered: boolean; suppressed?: string; via?: string[] }> {
   const now = Date.now() / 1000
   const connectors = cfg.severity_routes[n.severity] ?? ['log']
   const wire = connectors.filter((c) => c !== 'log') // 'log' is the jsonl (always written by the caller)
   if (wire.length === 0) return { delivered: false }
 
-  const key = `${n.severity}|${n.title}|${n.body}`
+  const key = dedupKey(n)
   const last = recent.get(key)
   if (last && now - last < cfg.dedup_window_sec) return { delivered: false, suppressed: 'duplicate' }
 

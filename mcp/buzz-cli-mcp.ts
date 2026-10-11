@@ -24,17 +24,13 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
-import { execFile } from 'node:child_process'
 import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { resolveAttachment } from './attachments'
+import { execBuzz, stripIdentityFlags, BUZZ_BIN, BUZZ_RELAY, type BuzzResult } from './buzz-exec'
 import { DEFAULT_DENY, deniedVerb, rejectsHostPathFlag, applySendDefaults } from './buzz-args'
 
-const BIN = process.env.BUZZ_BIN || 'dack-soul/skills/buzz/bin/buzz'
 const MEDIA_DIR = process.env.MEDIA_DIR
-const RELAY = process.env.BUZZ_RELAY_URL || ''
-const TIMEOUT_MS = (Number(process.env.BUZZ_CLI_TIMEOUT_SEC) || 45) * 1000
-const MAX_OUT = 64 * 1024 // cap returned bytes so a huge query can't blow the context
 
 // Verb deny-list + host-path flag guard are pure argv policy — see `buzz-args.ts` (unit-tested there).
 const DENY = (process.env.BUZZ_CLI_DENY ?? DEFAULT_DENY.join(','))
@@ -42,58 +38,15 @@ const DENY = (process.env.BUZZ_CLI_DENY ?? DEFAULT_DENY.join(','))
 
 const asText = (v: unknown) => ({ content: [{ type: 'text' as const, text: typeof v === 'string' ? v : JSON.stringify(v) }] })
 
-function runBuzz(rawArgs: string[]): Promise<{ ok: boolean; out?: string; error?: string; code?: number }> {
-  // Strip anything that would override our injected identity/relay/format; we control those.
-  // (`let`, not `const` — reassigned by `applySendDefaults` below.)
-  let args: string[] = []
-  for (let i = 0; i < rawArgs.length; i++) {
-    const a = rawArgs[i]
-    if (a === '--relay' || a === '--private-key' || a === '--key') { i++; continue } // drop flag + its value
-    if (a.startsWith('--relay=') || a.startsWith('--private-key=') || a.startsWith('--key=')) continue
-    args.push(a)
-  }
-  // Convenience (not a lock): default a `messages send`/`send-diff` to the channel + message that woke this
-  // cycle (harness scope_env → BUZZ_REPLY_CHANNEL/BUZZ_REPLY_TO), so a reply lands in the right thread even
-  // if the model omits them. The model can still target ANY channel by passing --channel explicitly, in
-  // which case the wake's reply-to is NOT applied (a cross-channel parent is rejected by the relay).
-  // Pure + unit-tested in `buzz-args.ts` — this defaulting is exactly what silently broke cross-channel
-  // sends, so it does not live inline any more.
-  args = applySendDefaults(args, {
+function runBuzz(rawArgs: string[]): Promise<BuzzResult> {
+  // Identity/relay flags stripped, then the wake-scoped send defaults (pure, unit-tested in buzz-args.ts —
+  // that defaulting is exactly what silently broke cross-channel sends). Spawning itself is shared with
+  // the read-only server via `execBuzz` so hardening is written once.
+  const args = applySendDefaults(stripIdentityFlags(rawArgs), {
     replyChannel: process.env.BUZZ_REPLY_CHANNEL,
     replyTo: process.env.BUZZ_REPLY_TO,
   })
-  // `--format` is a GLOBAL flag — it must come BEFORE the subcommand (buzz rejects it after). Prepend it
-  // LAST, after the verb-based logic above has read the positional verbs.
-  if (!args.some((a) => a === '--format')) args.unshift('--format', 'json')
-
-  const key = process.env.BUZZ_PRIVATE_KEY
-  if (!key) return Promise.resolve({ ok: false, error: 'BUZZ_PRIVATE_KEY not set — identity unavailable' })
-  if (!RELAY) return Promise.resolve({ ok: false, error: 'BUZZ_RELAY_URL not set' })
-
-  return new Promise((resolve) => {
-    execFile(
-      BIN,
-      args,
-      {
-        env: { PATH: process.env.PATH, BUZZ_PRIVATE_KEY: key, BUZZ_RELAY_URL: RELAY },
-        timeout: TIMEOUT_MS,
-        maxBuffer: MAX_OUT,
-        windowsHide: true,
-      },
-      (err, stdout, stderr) => {
-        const out = (stdout || '').slice(0, MAX_OUT)
-        if (err) {
-          // buzz-cli emits JSON errors on stderr; surface them but never the argv/env.
-          const msg = (stderr || (err as Error).message || 'buzz failed').slice(0, 2000)
-          console.error(`[buzz-cli] FAILED verb=${args.filter((a) => !a.startsWith('-')).slice(0, 2).join(' ')} code=${(err as any).code}`)
-          resolve({ ok: false, error: msg, code: (err as any).code })
-        } else {
-          console.error(`[buzz-cli] ok verb=${args.filter((a) => !a.startsWith('-')).slice(0, 2).join(' ')}`)
-          resolve({ ok: true, out: out || (stderr || '').slice(0, MAX_OUT) })
-        }
-      },
-    )
-  })
+  return execBuzz(args, 'buzz-cli')
 }
 
 const server = new McpServer({ name: 'buzz-cli', version: '0.1.0' })
@@ -197,4 +150,4 @@ server.registerTool(
 )
 
 await server.connect(new StdioServerTransport())
-console.error(`[buzz-cli] ready — bin=${BIN} relay=${RELAY || '(unset)'} deny=[${DENY.join(',')}]`)
+console.error(`[buzz-cli] ready — bin=${BUZZ_BIN} relay=${BUZZ_RELAY || '(unset)'} deny=[${DENY.join(',')}]`)

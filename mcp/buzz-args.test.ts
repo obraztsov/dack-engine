@@ -154,3 +154,45 @@ test('send-diff gets the same treatment as send', () => {
   expect(flagValue(applySendDefaults(['messages', 'send-diff', '--content', 'd'], ENV), '--reply-to'))
     .toBe('wake-event-id')
 })
+
+// ── readOnlyVerb: the Perceive allowlist (fail-closed) ─────────────────────────────────────────────
+import { readOnlyVerb } from './buzz-args'
+
+test('read verbs pass the allowlist and return their verb path', () => {
+  expect(readOnlyVerb(['messages', 'thread', '--channel', 'c', '--event', 'e'])).toBe('messages thread')
+  expect(readOnlyVerb(['--format', 'json', 'projects', 'list', '--owner', 'ff'])).toBe('projects list')
+  expect(readOnlyVerb(['issues', 'get', '--event', 'e'])).toBe('issues get')
+  expect(readOnlyVerb(['canvas', 'history', '--channel', 'c'])).toBe('canvas history')
+  expect(readOnlyVerb(['channels', 'members', '--channel', 'c'])).toBe('channels members')
+})
+
+test('every WRITE verb is refused — an allowlist, not a deny-list', () => {
+  for (const argv of [
+    ['messages', 'send', '--content', 'x'],
+    ['messages', 'send-diff', '--content', 'x'],
+    ['canvas', 'set', '--channel', 'c', '--content', 'x'],
+    ['canvas', 'restore', '--channel', 'c', '--revision', 'r'],
+    ['issues', 'create', '--title', 't', '--content', 'c'],
+    ['issues', 'status', '--issue', 'i', '--status', 'resolved'],
+    ['issues', 'assign', '--issue', 'i', '--assignee', 'a'],
+    ['projects', 'create', 's'],
+    ['repos', 'create', '--id', 'r'],
+    ['upload', 'file', 'x'],
+    ['mem', 'set', 'k', 'v'],
+    ['media', 'get', 'sha'], // fetches bytes to disk — not a context read
+    ['channels', 'join', '--channel', 'c'],
+    ['agents', 'archive'],
+    ['nonsense'],
+  ]) {
+    expect(readOnlyVerb(argv)).toBeNull()
+  }
+})
+
+test('the flag-value bypass cannot smuggle a write past the read allowlist', () => {
+  // naive parse would read ["json","messages","get"] → "json messages" (not allowed) → refused anyway;
+  // the dangerous direction is a WRITE hidden behind a flag value: both parses must agree it is a read.
+  expect(readOnlyVerb(['--format', 'json', 'messages', 'send', '--content', 'x'])).toBeNull()
+  expect(readOnlyVerb(['--auth-tag', '{}', 'canvas', 'set', '--channel', 'c', '--content', 'x'])).toBeNull()
+  // ...and a legitimately-prefixed read still passes
+  expect(readOnlyVerb(['--format', 'compact', 'messages', 'get', '--channel', 'c'])).toBe('messages get')
+})

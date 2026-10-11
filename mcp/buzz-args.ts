@@ -136,3 +136,52 @@ export function rejectsHostPathFlag(args: string[]): { flag: string; use: string
   }
   return null
 }
+
+/** The positional verb path with flag arity accounted for — exported for the read allowlist. */
+export function verbPath(args: string[]): string[] {
+  return positionalsAritySafe(args)
+}
+
+/**
+ * READ-ONLY allowlist for the `buzz-read` server (Perceive). An ALLOWLIST, not a deny-list: Perceive is
+ * "explore and collect context", and a tool that can also act there would let an injected message turn a
+ * read into a post. Anything not listed is refused, including every send/create/set/status/assign verb.
+ * Matched on "verb subverb" first, then bare verb (for single-level verbs).
+ */
+export const READ_ALLOW = new Set([
+  'messages get', 'messages thread', 'messages search',
+  'channels list', 'channels get', 'channels search', 'channels members',
+  'canvas get', 'canvas history',
+  'issues list', 'issues get',
+  'projects list', 'projects get',
+  'repos list', 'repos get',
+  'patches list', 'patches get',
+  'pr list', 'pr get',
+  'users get',
+  'feed get',
+  'mem ls', 'mem get',
+])
+
+/** Every verb word in the buzz CLI that MUTATES. Used as a backstop scan over the naive positional path:
+ *  the only way a write can hide from the arity-aware parse is behind an unknown value-less flag, and in
+ *  that case the naive path still contains the real verb word. (Cost: a read whose free-text argument is
+ *  itself a write word, e.g. `messages search --query send`, is refused — acceptable for Perceive.) */
+const WRITE_WORDS = new Set([
+  'send', 'send-diff', 'edit', 'delete', 'vote', 'set', 'restore', 'create', 'update', 'status', 'assign',
+  'unassign', 'open', 'join', 'leave', 'archive', 'unarchive', 'add-member', 'remove-member', 'set-add-policy',
+  'topic', 'purpose', 'add-repo', 'remove-repo', 'add-channel', 'bind', 'protect', 'default-branch', 'upload',
+  'file', 'rm', 'patch', 'set-profile', 'publish', 'draft-create', 'draft-update', 'ban', 'unban', 'timeout',
+  'untimeout', 'resolve', 'add', 'remove',
+])
+
+/** Returns the verb path if it is read-only, else null. Fail-closed two ways: the arity-aware path must be
+ *  on `READ_ALLOW`, AND the naive path (every non-flag token) must contain no write word — so an unknown
+ *  value-less flag can never make the arity parse swallow a write verb unseen. */
+export function readOnlyVerb(args: string[]): string | null {
+  const verbs = positionalsAritySafe(args)
+  const path = `${(verbs[0] || '').toLowerCase()} ${(verbs[1] || '').toLowerCase()}`.trim()
+  if (!READ_ALLOW.has(path)) return null
+  const naive = args.filter((a) => !a.startsWith('-')).map((a) => a.toLowerCase())
+  if (naive.some((tok) => WRITE_WORDS.has(tok))) return null
+  return path
+}

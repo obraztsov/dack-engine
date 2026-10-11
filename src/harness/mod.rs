@@ -1009,6 +1009,28 @@ impl Harness {
                 }
             }
         }
+        // NARRATED ACTION detector. An Express step exists to ACT. One that made zero outward tool calls and
+        // handed off no baton either did nothing — or, worse, DESCRIBED doing something it never called
+        // (live 2026-10-11: a sweep's Express ran only Read/Glob and its thought said "Closed the issue…
+        // Posted pointer"; a peer then recorded that as fact — the gossip amplifier in one hop). The
+        // swallowed-answer detector cannot see this: the cycle produced a baton in Perceive. So mark the
+        // entry (`express-no-outward`, queryable) and tell the operator; dedup keys on the prompt, so a
+        // chatty no-op rail pages once per window, not once per wake.
+        if prompt.state == ConsciousnessState::Express && !recorder.acted_outward() && out.fan_out().is_empty() {
+            tags.push("express-no-outward".to_string());
+            tracing::warn!(
+                "express step `{}` made NO outward tool call and handed off nothing ({}) — if its thought claims an action, that action did not happen",
+                prompt.id, stimulus.id
+            );
+            if let Some(url) = self.config.notify_url.clone() {
+                let title = format!("express without outward act: {}", prompt.id);
+                let head: String = out.thought.chars().take(240).collect();
+                let body = format!("Express made zero outward tool calls and emitted no baton. If the thought below claims an action, it did NOT happen.\n(stimulus {})\nthought: {head}", stimulus.id);
+                tokio::spawn(async move {
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), notify_post(&url, "alert", &title, &body)).await;
+                });
+            }
+        }
         // NOT `?` — see `write_runlog`: a failed runlog write degrades to a marked ref instead of
         // aborting the dispatch, so a transient DB lock can never swallow an answer the agent composed.
         let runlog_ref = self

@@ -24,6 +24,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
 import { execBuzz, stripIdentityFlags, BUZZ_BIN, BUZZ_RELAY } from './buzz-exec'
 import { readOnlyVerb, rejectsHostPathFlag, READ_ALLOW } from './buzz-args'
+import { registerOwnRepliesTool } from './buzz-thread'
 
 const asText = (v: unknown) => ({ content: [{ type: 'text' as const, text: typeof v === 'string' ? v : JSON.stringify(v) }] })
 
@@ -57,6 +58,10 @@ server.registerTool(
     return asText(await execBuzz(clean, 'buzz-read'))
   },
 )
+
+// Same `own_replies` as buzz-cli: Perceive can decline a reply baton before it exists when it sees it
+// already answered and nothing new arrived. Read-only by construction.
+registerOwnRepliesTool(server, 'buzz-read')
 
 await server.connect(new StdioServerTransport())
 console.error(`[buzz-read] ready — bin=${BUZZ_BIN} relay=${BUZZ_RELAY || '(unset)'} allow=${READ_ALLOW.size} read verbs`)

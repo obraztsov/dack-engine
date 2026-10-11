@@ -29,6 +29,7 @@ import { join } from 'node:path'
 import { resolveAttachment } from './attachments'
 import { execBuzz, stripIdentityFlags, BUZZ_BIN, BUZZ_RELAY, type BuzzResult } from './buzz-exec'
 import { DEFAULT_DENY, deniedVerb, rejectsHostPathFlag, applySendDefaults } from './buzz-args'
+import { registerOwnRepliesTool } from './buzz-thread'
 
 const MEDIA_DIR = process.env.MEDIA_DIR
 
@@ -148,6 +149,10 @@ server.registerTool(
     return asText({ ok: true, attachment_id: name, hint: 'read it with read_attachment, or forward it with send_file' })
   },
 )
+
+// "What did I already say here?" — read-only; the anti-duplicate INFORMATION the express step reads before
+// replying in a thread it may have spoken in (no output filter — the model decides). Shared with buzz-read.
+registerOwnRepliesTool(server, 'buzz-cli')
 
 await server.connect(new StdioServerTransport())
 console.error(`[buzz-cli] ready — bin=${BUZZ_BIN} relay=${BUZZ_RELAY || '(unset)'} deny=[${DENY.join(',')}]`)

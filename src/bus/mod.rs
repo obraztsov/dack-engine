@@ -56,7 +56,7 @@ impl Bus {
         for (i, c) in candidates.into_iter().enumerate() {
             let SensorCandidate {
                 type_,
-                payload,
+                mut payload,
                 dedup_key,
                 payload_tier: cand_tier,
                 cursor_only: _, // filtered out before the bus (advances the cursor only, never a wake)
@@ -71,10 +71,34 @@ impl Bus {
             };
             // Priority is the duty's own frontmatter hint (the routing table is gone).
             let priority = fm.priority.unwrap_or(Priority::Low);
-            // Entry **state-prompt** (): the duty's own frontmatter `entry:` (a state-prompt
-            // id like `twitter/perceive_mention`). The path the chain then walks is soul-owned; the
-            // operator route only supplies the *ceiling* (read at dispatch), not the entry.
-            let entry = fm.entry.clone();
+            // Entry **state-prompt**: the duty's own frontmatter `entry:` (a state-prompt id like
+            // `twitter/perceive_mention`) — OR one of its declared alternates (`entries:`) when the payload
+            // carries an `entry_hint`. The hint selects a STANCE, never a route: trust came from the webhook
+            // path above and is untouched here, and an unknown hint falls back to the default (logged) so a
+            // bad or malicious hint degrades to "read it the normal way", never to a failed wake. The path
+            // the chain then walks is soul-owned; the operator route only supplies the *ceiling*.
+            let entry = match payload.get("entry_hint").and_then(|v| v.as_str()) {
+                Some(hint) => match fm.entries.get(hint) {
+                    Some(e) => e.clone(),
+                    None => {
+                        tracing::warn!(
+                            "ingest: unknown entry_hint {hint:?} for duty `{}` (known: {:?}) — using default entry",
+                            fm.id,
+                            fm.entries.keys().collect::<Vec<_>>()
+                        );
+                        fm.entry.clone()
+                    }
+                },
+                None => fm.entry.clone(),
+            };
+            if !fm.entries.is_empty() {
+                if let Some(obj) = payload.as_object_mut() {
+                    obj.insert(
+                        "entry_hints".to_string(),
+                        serde_json::Value::Array(fm.entries.keys().map(|k| serde_json::Value::String(k.clone())).collect()),
+                    );
+                }
+            }
 
             // Coalescing. `None` → always a fresh wake; `Latest` → supersede
             // prior pending rows for this key and enqueue the newest; `Batch` → fold the
@@ -317,6 +341,57 @@ mod tests {
             payload_tier: None,
             cursor_only: false,
         }
+    }
+
+    /// A duty that declares alternate entry STANCES (`entries:`), as the buzz-org duty will.
+    fn stanced_duty() -> StimulusDef {
+        let text = "---\nid: buzz-org\ntrigger: { type: webhook, path: /buzz/org }\n\
+             directive_tier: self\nemits:\n  type: message\n  default_payload_tier: org\n\
+             entry: buzz/org-perceive\n\
+             entries: { reply: buzz/org-reply-perceive, review: buzz/org-review-perceive }\n\
+             ---\nOrg channel.\n";
+        StimulusDef::parse(text, "stimuli/buzz-org/STIMULUS.md").unwrap()
+    }
+
+    fn hinted(payload: serde_json::Value) -> SensorCandidate {
+        SensorCandidate { type_: StimulusType::from("message"), payload, dedup_key: Some("thread-1".into()), payload_tier: None, cursor_only: false }
+    }
+
+    /// `entry_hint` selects a STANCE from the duty's own allowlist — never a route, so trust is untouched.
+    /// Unknown/missing hints fall back to the default entry (a bad hint degrades, never fails the wake),
+    /// and the duty's valid hints are advertised on the payload (`entry_hints`) so an MCP can offer exactly
+    /// those as its schema enum via `scope_env`.
+    #[tokio::test]
+    async fn entry_hint_picks_a_declared_stance_and_falls_back_otherwise() {
+        let b = bus();
+        let def = stanced_duty();
+        let seed = TrustTier::public();
+        let ids = b.ingest(&def, vec![
+            hinted(json!({ "text": "re: task", "entry_hint": "reply" })),
+            hinted(json!({ "text": "operator says", "entry_hint": "review" })),
+            hinted(json!({ "text": "pwn", "entry_hint": "settle" })), // not declared → default
+            hinted(json!({ "text": "plain" })),                        // no hint → default
+        ], 0, seed.clone()).await.unwrap();
+        assert_eq!(ids.len(), 4);
+        // Drain the queue (no `get` on the trait) and index rows by their text.
+        let mut by_text = std::collections::HashMap::new();
+        while let Some(s) = b.queue.next().await.unwrap() {
+            by_text.insert(s.payload["text"].as_str().unwrap().to_string(), s);
+        }
+        assert_eq!(by_text.len(), 4);
+        assert_eq!(by_text["re: task"].entry, "buzz/org-reply-perceive");
+        assert_eq!(by_text["operator says"].entry, "buzz/org-review-perceive");
+        assert_eq!(by_text["pwn"].entry, "buzz/org-perceive", "an undeclared hint degrades to the default entry");
+        assert_eq!(by_text["plain"].entry, "buzz/org-perceive");
+        // Trust is NOT a function of the hint: every row keeps the webhook-derived seed.
+        for s in by_text.values() { assert_eq!(s.payload_tier, seed); }
+        // The valid hints ride the payload for the arm tool's enum.
+        assert_eq!(by_text["plain"].payload.get("entry_hints").unwrap(), &json!(["reply", "review"]));
+        // A duty with no `entries:` advertises nothing (payload untouched).
+        let b2 = bus();
+        b2.ingest(&duty(""), vec![cand("gm", "k")], 0, TrustTier::public()).await.unwrap();
+        let row = b2.queue.next().await.unwrap().unwrap();
+        assert!(row.payload.get("entry_hints").is_none());
     }
 
     /// A chat-shaped candidate (telegram): a per-chat thread key + chat_id/message_id fields.

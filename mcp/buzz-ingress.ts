@@ -16,6 +16,7 @@
  * BUZZ_PRIVATE_KEY is injected by the module's `buzz_key` secret; never logged.
  */
 
+import { openRoutesStore, lookupArm } from './ingress-routes'
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
 import { join, isAbsolute, resolve as resolvePath } from 'node:path'
 
@@ -25,12 +26,17 @@ interface ChannelCfg {
   id: string
   name?: string
   trust?: string // override
+  // Per-channel wake policy: 'all' = every message by someone else wakes the duck (org rooms — so a peer's
+  // untagged question is SEEN; pair with the lane rule in the prompt so it doesn't become louder monologue);
+  // 'mention' = only @-mentions / replies to own (the global `wake_on` default).
+  wake?: 'all' | 'mention'
 }
 interface Config {
   relay: string
   buzz_bin: string
   self_pubkey: string
   harness_webhook: string // e.g. http://127.0.0.1:8799
+  routes_db: string // shared with ingress-arm-mcp: armed threads → entry_hint + tags on the wake
   poll_interval_secs: number
   discover_interval_secs: number
   cursor_file: string
@@ -59,6 +65,7 @@ const DEFAULTS: Config = {
   buzz_bin: 'skills/buzz/bin/buzz',
   self_pubkey: '',
   harness_webhook: 'http://127.0.0.1:8787',
+  routes_db: 'ingress-routes.sqlite',
   poll_interval_secs: 10,
   discover_interval_secs: 60,
   cursor_file: 'buzz-ingress.cursor',
@@ -85,6 +92,7 @@ function loadConfig(): Config {
 }
 
 const cfg = loadConfig()
+const routes = openRoutesStore(cfg.routes_db)
 const log = (...a: unknown[]) => console.error('[buzz-ingress]', ...a)
 
 // ── buzz-cli (one-shot, JSON out) ──────────────────────────────────────────────────────────────────
@@ -323,9 +331,15 @@ function discover(): void {
   }
 }
 
-async function post(ch: { id: string; name?: string }, ev: Ev, kind: 'mention' | 'reply_to_own'): Promise<void> {
+async function post(ch: { id: string; name?: string }, ev: Ev, kind: 'mention' | 'reply_to_own' | 'message'): Promise<void> {
   const tier = tierFor(ch)
   const { spine, truncated, root } = buildSpine(ev)
+  // ARMED THREAD? The duck may have told us (via ingress-arm-mcp → ingress-routes.sqlite) that replies in
+  // this thread are follow-ups on a task: open them with a stance (`entry_hint`, resolved by the harness
+  // against the duty's own `entries:` allowlist — never a route, never a trust change) and tag them so the
+  // whole exchange lands under one runlog tag. Lookup is by thread ROOT, so every reply in the thread
+  // inherits the arm, not just direct replies to our post.
+  const arm = lookupArm(routes, root)
   const attachments = parseImeta(ev) // P0: media awareness — metadata for every attachment (all mimes)
   const media = prefetchMedia(attachments) // P2: passively fetched thumb(s)/image(s) the duck SEES on wake
   prefetchDocsInto(attachments) // Slice 2: fetch non-image docs → stamp `file` (routable stored attachment)
@@ -354,6 +368,7 @@ async function post(ch: { id: string; name?: string }, ev: Ev, kind: 'mention' |
     created_at: ev.created_at,
     // Per-thread key: coalescing + sticky session fold a thread's activity into one wake.
     dedup_key: `buzz:${root}`,
+    ...(arm ? { entry_hint: arm.entry_hint, tags: arm.tags, armed: { by: arm.armed_by.slice(0, 8), expires_at: arm.expires_at } } : {}),
   }
   try {
     const r = await fetch(`${cfg.harness_webhook}/buzz/${tier}`, {
@@ -361,7 +376,7 @@ async function post(ch: { id: string; name?: string }, ev: Ev, kind: 'mention' |
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     })
-    log(`${kind} in ${ch.name ?? ch.id.slice(0, 8)} from ${ev.pubkey.slice(0, 8)} → /buzz/${tier} (${r.status})`)
+    log(`${kind} in ${ch.name ?? ch.id.slice(0, 8)} from ${ev.pubkey.slice(0, 8)} → /buzz/${tier}${arm ? ` [armed:${arm.entry_hint} ${arm.tags.join(',')}]` : ''} (${r.status})`)
   } catch (e) {
     log('forward failed:', e)
   }
@@ -383,9 +398,13 @@ async function pollChannel(ch: { id: string; name?: string }): Promise<void> {
     if (seen.has(ev.id)) continue
     const isMention = cfg.wake_on.includes('mention') && pTags(ev).includes(cfg.self_pubkey)
     const isReply = cfg.wake_on.includes('reply_to_own') && eRefs(ev).some((r) => ownIds.has(r.id))
-    if (isMention || isReply) {
+    // Per-channel 'all': in an org room every message by someone else is delivered (coalesce folds a
+    // burst into one wake). The prompt's lane rule decides whether to ANSWER; the ingress only ensures
+    // the duck SEES it — a peer's untagged question used to be invisible here.
+    const isAll = cfg.channels.find((c) => c.id === ch.id)?.wake === 'all'
+    if (isMention || isReply || isAll) {
       seen.add(ev.id)
-      await post(ch, ev, isMention ? 'mention' : 'reply_to_own')
+      await post(ch, ev, isMention ? 'mention' : isReply ? 'reply_to_own' : 'message')
     }
   }
   saveCursor()

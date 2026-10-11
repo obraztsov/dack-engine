@@ -994,6 +994,21 @@ impl Harness {
                 tags.push(t.clone());
             }
         }
+        // INGRESS TAGS: a wake may arrive pre-tagged by the channel (`payload.tags`, e.g. an armed thread
+        // carrying `issue:<id>` / `project:<slug>`), so the whole exchange about a task lands under one
+        // tag and `recall_by_tag` gives a later cycle the task's full thread. Untrusted strings used only
+        // as index keys; capped + sanitized so a hostile payload can't spray the tag space.
+        if let Some(arr) = stimulus.payload.get("tags").and_then(|v| v.as_array()) {
+            for t in arr.iter().filter_map(|v| v.as_str()).take(8) {
+                let t = t.trim();
+                if t.is_empty() || t.len() > 80 || !t.chars().all(|c| c.is_alphanumeric() || "-_:./".contains(c)) {
+                    continue;
+                }
+                if !tags.iter().any(|x| x == t) {
+                    tags.push(t.to_string());
+                }
+            }
+        }
         // NOT `?` — see `write_runlog`: a failed runlog write degrades to a marked ref instead of
         // aborting the dispatch, so a transient DB lock can never swallow an answer the agent composed.
         let runlog_ref = self

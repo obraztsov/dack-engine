@@ -82,6 +82,16 @@ pub struct StimulusFrontmatter {
     /// chain from here (the prompt's `transitions`); the operator route only sets the ceiling.
     #[serde(default = "default_entry_id")]
     pub entry: String,
+    /// **Alternate entry prompts (stances)** this duty may open, keyed by a short hint — e.g.
+    /// `entries: { reply: buzz/org-reply-perceive, review: buzz/org-review-perceive }`. An inbound
+    /// payload carrying `entry_hint: "<key>"` opens that prompt instead of `entry`; an unknown or missing
+    /// hint falls back to `entry` (logged). This is how an agent can ARM a thread with a stance ("read
+    /// replies here as follow-ups on task X") without ever touching the ROUTE: the webhook path, and so the
+    /// trust tier, stay exactly as the operator configured. The blast radius of a hint is this
+    /// operator-authored list and nothing else — the worst an injected hint can do is pick the wrong tone,
+    /// at the same trust, behind the same wall.
+    #[serde(default)]
+    pub entries: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     pub priority: Option<Priority>,
     /// **Dispatch window**: a daily UTC range `"HH:MM-HH:MM"` (may cross midnight, e.g.

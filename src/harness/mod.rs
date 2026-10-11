@@ -805,7 +805,14 @@ impl Harness {
             None => None,
         };
         let is_resume = resume.is_some();
-        let watermark = resume.as_ref().map(|(_, ts)| *ts);
+        // The runlog "while you slept" diff starts at the resumed session's `last_used`. For a FAN-OUT
+        // SIBLING that is wrong: the session was just used by an earlier step of THIS wake, so `last_used`
+        // is wall-clock AFTER the wake began, while every entry this wake writes is stamped with the wake's
+        // `received_at` — so `ts > watermark` hid the sibling's own wake from it (live 2026-10-11: express-b3
+        // could not see that express-b2 had already sent the research reply, and re-sent it). Clamp the
+        // watermark to just before the wake, so a sibling's diff covers the whole wake so far: the Perceive
+        // entry (the plan, as designed) and every earlier sibling's actions.
+        let watermark = resume.as_ref().map(|(_, ts)| sibling_watermark(*ts, stimulus.received_at));
 
         // Block order (USER message): ORIENTATION first (where am I · what may I do · what's plugged ·
         // how far this cycle walks) — the small, stable frame that grounds the model. Then the state's
@@ -2547,6 +2554,15 @@ async fn enqueue_worker_completion(queue: &Arc<dyn Queue>, spawn: &SpawnRequest,
 /// `author_id` → the payload's `author_id`, `source` → the stimulus source. Unknown dims resolve to
 /// `_`. Extensible (any number of dims, not capped). Same key ⇒ the same resumable session; the taint
 /// being part of the key keeps sessions isolated per trust level.
+/// Watermark for a resumed session's runlog diff. Normally the session's `last_used`; but when that is
+/// at/after this wake's `received_at` the session was last used by an EARLIER STEP OF THE SAME WAKE (a
+/// fan-out sibling), and the diff must cover the whole wake — every entry this wake writes carries
+/// `received_at`, so anything ≥ it would otherwise be invisible. `received_at - 1` because the query is
+/// strict (`ts > watermark`).
+fn sibling_watermark(last_used: i64, received_at: i64) -> i64 {
+    last_used.min(received_at - 1)
+}
+
 fn sticky_session_key(
     prompt_id: &str,
     taint: &TrustTier,
@@ -4793,6 +4809,20 @@ mod tests {
         assert!(got.starts_with("run-"), "ref keeps the run id so the baton still threads: {got:?}");
 
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// REGRESSION: a fan-out sibling must see its own wake in the runlog diff. express-b3 resumed the
+    /// session express-b2 had just used (last_used = wall-clock after the wake began); every entry of the
+    /// wake is stamped received_at, so `ts > last_used` hid b2's send from b3 and it re-sent the message.
+    #[test]
+    fn sibling_watermark_covers_the_whole_wake() {
+        let received_at = 1_791_737_641;
+        // previous wake's last_used, before this wake: unchanged (the normal "while you slept" diff)
+        assert_eq!(sibling_watermark(received_at - 300, received_at), received_at - 300);
+        // same-wake sibling: last_used is after the wake began → clamp so entries at received_at are visible
+        assert_eq!(sibling_watermark(received_at + 49, received_at), received_at - 1);
+        // boundary: last_used exactly at received_at would hide the wake's own entries (strict >) → clamp
+        assert_eq!(sibling_watermark(received_at, received_at), received_at - 1);
     }
 
     #[tokio::test]

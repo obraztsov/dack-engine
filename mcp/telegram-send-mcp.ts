@@ -37,6 +37,8 @@ import {
   pendingReferrals,
   markReferralApplied,
   recordSend,
+  listChats,
+  resolveChatByName,
   type MediaType,
 } from './ingress-store'
 
@@ -71,6 +73,9 @@ function loadDestinations(): Destinations {
 }
 
 const DESTS = loadDestinations()
+// Per-chat attachment store (harness-injected INGRESS_DB, absolute; shared with the ingress via WAL).
+// (Declared after the send tool but captured by its closure — tool calls only arrive post-init.)
+const ingressStore = process.env.INGRESS_DB ? openIngressStore(process.env.INGRESS_DB) : null
 const NAMES = Object.keys(DESTS.named)
 
 // Open the runlog READ-ONLY only when the known-private wildcard is enabled (the live duck never does,
@@ -105,15 +110,47 @@ function isKnownPrivateContact(chatId: number): boolean {
   }
 }
 
-/** Resolve `to` → a chat_id, or null (denied). Fail-closed at every branch. */
+/** Is this numeric chat_id sendable under the operator's allow-list? (b) allowed group, (c) known private. */
+function allowedChatId(n: number): boolean {
+  if (Object.values(DESTS.named).some((v) => Number(v) === n)) return true // a registered destination's own id
+  if (DESTS.groups.includes(n)) return true // (b) explicitly allowed group
+  if (DESTS.allow_known_private && n > 0 && isKnownPrivateContact(n)) return true // (c) known private (user) chat
+  return false
+}
+
+/** Resolve `to` → a chat_id, or null (denied). Fail-closed at every branch.
+ *  Order: (a) a registered destination NAME; a numeric chat_id under the allow-list; else a chat TITLE /
+ *  `@username` from the ingress chat index — an ALIAS only: the id it names must itself pass the same
+ *  allow-list, so a known title never grants reach the operator did not configure. */
 function resolveTarget(to: string): number | string | null {
   const t = to.trim()
   if (Object.prototype.hasOwnProperty.call(DESTS.named, t)) return DESTS.named[t] // (a) named
-  if (!/^-?\d+$/.test(t)) return null // not a name and not a numeric id → denied
-  const n = Number(t)
-  if (DESTS.groups.includes(n)) return n // (b) explicitly allowed group
-  if (DESTS.allow_known_private && n > 0 && isKnownPrivateContact(n)) return n // (c) known private (user) chat
-  return null
+  if (/^-?\d+$/.test(t)) {
+    const n = Number(t)
+    return allowedChatId(n) ? n : null
+  }
+  if (!ingressStore) return null
+  const r = resolveChatByName(ingressStore, t)
+  if (!r.ok) return null
+  const n = Number(r.chat.chat_id)
+  return Number.isFinite(n) && allowedChatId(n) ? n : null
+}
+
+/** The chats the duck may address by NAME right now (registered names + indexed chats that pass the allow-list). */
+function sendableDirectory(): string {
+  const parts: string[] = NAMES.map((n) => `"${n}"`)
+  if (ingressStore) {
+    try {
+      for (const c of listChats(ingressStore)) {
+        const n = Number(c.chat_id)
+        const label = c.title ?? (c.username ? `@${c.username}` : null)
+        if (label && Number.isFinite(n) && allowedChatId(n) && !Object.values(DESTS.named).some((v) => Number(v) === n)) parts.push(`"${label}" (${c.type})`)
+      }
+    } catch (e) {
+      console.error('[telegram-send] chat index read failed:', (e as Error).message)
+    }
+  }
+  return parts.join(', ')
 }
 
 async function tgSend(body: Record<string, unknown>): Promise<unknown> {
@@ -143,9 +180,9 @@ server.registerTool(
   'send_message',
   {
     description:
-      `Proactively send a Telegram message (NOT a reply), ≤4096 chars. \`to\` must be a registered ` +
-      `destination name${NAMES.length ? ` (${NAMES.join(', ')})` : ' (none configured)'}` +
-      `${DESTS.groups.length ? ` or an allowed group chat_id` : ''}.${privateNote} ` +
+      `Proactively send a Telegram message (NOT a reply), ≤4096 chars. \`to\` is a destination by NAME — a registered ` +
+      `name, or a known chat's title / @username that the allow-list permits${(() => { const d = sendableDirectory(); return d ? `: ${d}` : ' (none sendable yet)' })()}` +
+      `${DESTS.groups.length ? ` — or an allowed group chat_id` : ''}.${privateNote} ` +
       `A chat_id you can't justify is refused. Use this to initiate (announce, ping, follow up); to ` +
       `answer a chat that just messaged you, use the reply tool instead.`,
     inputSchema: { to: z.string().min(1), text: z.string().min(1).max(4096) },
@@ -176,9 +213,6 @@ server.registerTool(
   },
 )
 
-// Per-chat attachment store (harness-injected INGRESS_DB, absolute; shared with the ingress via WAL).
-// (Declared after the send tool but captured by its closure — tool calls only arrive post-init.)
-const ingressStore = process.env.INGRESS_DB ? openIngressStore(process.env.INGRESS_DB) : null
 
 server.registerTool(
   'set_chat_attachments',

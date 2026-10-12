@@ -28,7 +28,10 @@ import {
   recordReferral,
   parseStartParam,
   type AttachDefaults,
+  upsertChat,
+  chatDisplayName,
 } from './ingress-store'
+import { routeFor, opIds, replyMeta } from './telegram-routing'
 
 function readFirst(paths: string[]): string | null {
   for (const p of paths) {
@@ -109,26 +112,9 @@ function loadConfig(): Cfg {
 }
 
 /** The effective operator id set: the `operator_ids` list, else the legacy single `operator_user_id`. */
-function opIds(cfg: Cfg): number[] {
-  return cfg.operator_ids?.length ? cfg.operator_ids : cfg.operator_user_id != null ? [cfg.operator_user_id] : []
-}
-
-/** Resolve a message's webhook path by precedence: operator → trusted group → chat-type split → public.
- *  `chatType` is Telegram's `chat.type` (`private` | `group` | `supergroup` | `channel`). */
-function routeFor(
-  cfg: Cfg,
-  fromId: number | null,
-  chatId: number,
-  chatType: string,
-): { path: string; why: string } {
-  if (fromId != null && opIds(cfg).includes(fromId)) return { path: cfg.op_path, why: 'OP→org' }
-  const group = cfg.groups[String(chatId)]
-  if (group) return { path: group, why: `group→${group}` } // an explicitly trusted group wins
-  // OPT-IN chat-type split (unset → falls through to pub_path, the current single-webhook behavior).
-  if (chatType === 'private' && cfg.dm_path) return { path: cfg.dm_path, why: 'dm' }
-  if (chatType !== 'private' && cfg.group_path) return { path: cfg.group_path, why: 'group' }
-  return { path: cfg.pub_path, why: 'pub' }
-}
+// Routing precedence (`routeFor`) + reply attribution (`replyMeta`) live in `telegram-routing.ts`, pure and
+// unit-tested: a CONFIGURED GROUP wins over the operator id — the operator talking in the fleet group is
+// group context, not an operator instruction.
 
 const cfg = loadConfig()
 const token = loadToken()
@@ -353,10 +339,20 @@ bot.on('message', async (ctx) => {
     const ref = recordReferral(store, String(fromId), startParam, m.from?.username ?? null, String(m.chat.id))
     console.error(`[tg-ingress] referral param="${startParam}" from ${fromId} (@${m.from?.username ?? '?'}) seen#${ref.seen_count}`)
   }
+  // Chat index: remember this chat's title / @username so the duck can address it by NAME (telegram-send).
+  try {
+    upsertChat(store, { chat_id: String(m.chat.id), type: m.chat.type, title: chatDisplayName(m.chat, m.from), username: m.chat.type === 'private' ? (m.from?.username ?? null) : ((m.chat as any).username ?? null) })
+  } catch (e) {
+    console.error('[tg-ingress] chat index write failed:', (e as Error).message)
+  }
+  // Reply attribution (from the parent Telegram embeds in the update — no mirror): `in_reply_to` + `reply_to`
+  // {who wrote it, is_self, clip}. Absent on a non-reply, so every existing payload stays byte-identical.
+  const reply = replyMeta(m, (ctx as any).me?.id ?? bot.botInfo?.id)
   const body = {
     chat_id: m.chat.id,
     message_id: m.message_id,
     text,
+    ...(reply ?? {}),
     from_username: m.from?.username ?? null,
     from_user_id: fromId,
     chat_type: m.chat.type,

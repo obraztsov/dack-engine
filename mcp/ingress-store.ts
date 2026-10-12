@@ -63,6 +63,14 @@ export function openIngressStore(path: string): Database {
       'chars INTEGER NOT NULL, error TEXT)',
   )
   db.exec('CREATE INDEX IF NOT EXISTS idx_send_audit_chat ON send_audit (chat_id, at)')
+  // CHAT INDEX: every chat the bot has seen a message in (title / @username / type), upserted by the ingress,
+  // so `telegram-send` can take a chat by NAME. An alias layer only — the destination allow-list still
+  // decides what is sendable; a known title never grants reach.
+  db.exec(
+    'CREATE TABLE IF NOT EXISTS chats ' +
+      '(chat_id TEXT PRIMARY KEY, type TEXT NOT NULL, title TEXT, username TEXT, ' +
+      'first_seen_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL, msg_count INTEGER NOT NULL DEFAULT 0)',
+  )
   return db
 }
 
@@ -273,4 +281,40 @@ export function markReferralApplied(
     .query('UPDATE referrals SET applied_at = ? WHERE user_id = ? AND applied_at IS NULL')
     .run(now, userId)
   return res.changes > 0
+}
+
+// ── chat index ──────────────────────────────────────────────────────────────────────────────────────
+
+export type ChatRow = { chat_id: string; type: string; title: string | null; username: string | null; first_seen_at: number; last_seen_at: number; msg_count: number }
+
+/** A Telegram chat's display name: a group's title, or a private chat's @username / first name. */
+export function chatDisplayName(chat: any, from?: any): string | null {
+  if (chat?.title) return String(chat.title)
+  if (chat?.type === 'private') return from?.username ? `@${from.username}` : [from?.first_name, from?.last_name].filter(Boolean).join(' ') || null
+  return null
+}
+
+export function upsertChat(db: Database, c: { chat_id: string; type: string; title: string | null; username: string | null }, now = Math.floor(Date.now() / 1000)): void {
+  db.query(
+    'INSERT INTO chats (chat_id, type, title, username, first_seen_at, last_seen_at, msg_count) VALUES (?, ?, ?, ?, ?, ?, 1) ' +
+      'ON CONFLICT(chat_id) DO UPDATE SET type = excluded.type, title = COALESCE(excluded.title, chats.title), ' +
+      'username = COALESCE(excluded.username, chats.username), last_seen_at = excluded.last_seen_at, msg_count = chats.msg_count + 1',
+  ).run(c.chat_id, c.type, c.title, c.username, now, now)
+}
+
+export function listChats(db: Database): ChatRow[] {
+  return db.query('SELECT * FROM chats ORDER BY last_seen_at DESC').all() as ChatRow[]
+}
+
+/**
+ * A chat by NAME: its title (groups) or `@username` (private chats / channels), case-insensitive, exact.
+ * Ambiguous ⇒ refused (two groups titled "General"), unknown ⇒ null. Numeric ids are not resolved here.
+ */
+export function resolveChatByName(db: Database, ref: string): { ok: true; chat: ChatRow } | { ok: false; error: string } {
+  const want = ref.trim().toLowerCase()
+  const bare = want.replace(/^@/, '')
+  const rows = listChats(db).filter((c) => (c.title ?? '').toLowerCase() === want || (c.username ?? '').toLowerCase() === bare)
+  if (rows.length === 1) return { ok: true, chat: rows[0] }
+  if (rows.length > 1) return { ok: false, error: `"${ref}" names ${rows.length} chats — use the chat_id` }
+  return { ok: false, error: `no known chat named "${ref}"` }
 }

@@ -1,6 +1,10 @@
 import { test, expect } from 'bun:test'
 import {
   openIngressStore,
+  upsertChat,
+  listChats,
+  resolveChatByName,
+  chatDisplayName,
   attachmentKind,
   attachmentsAllowed,
   setChatAttachment,
@@ -159,4 +163,21 @@ test('send audit: records every attempt (ok + failed), queryable per chat, newes
   // a long error is truncated, not rejected (audit must never break the send path)
   recordSend(db, { via: 'reply', chatId: '555', ok: false, chars: 1, error: 'x'.repeat(5000) }, 1003)
   expect((recentSends(db, '555')[0].error ?? '').length).toBeLessThanOrEqual(500)
+})
+
+test('chat index: titles/@usernames resolve to chat ids (alias only), counts accumulate, ambiguity refuses', () => {
+  const db = openIngressStore(':memory:')
+  upsertChat(db, { chat_id: '-5416963964', type: 'supergroup', title: 'Looper fleet', username: null }, 1000)
+  upsertChat(db, { chat_id: '-5416963964', type: 'supergroup', title: 'Looper fleet', username: null }, 1001)
+  upsertChat(db, { chat_id: '80375347', type: 'private', title: '@ilia_xbt', username: 'ilia_xbt' }, 1002)
+  upsertChat(db, { chat_id: '555', type: 'private', title: null, username: null }, 1003) // a user with no username
+  expect(listChats(db).find((c) => c.chat_id === '-5416963964')?.msg_count).toBe(2)
+  expect(resolveChatByName(db, 'looper FLEET')).toMatchObject({ ok: true, chat: { chat_id: '-5416963964' } })
+  expect(resolveChatByName(db, '@ilia_xbt')).toMatchObject({ ok: true, chat: { chat_id: '80375347' } })
+  expect(resolveChatByName(db, 'ilia_xbt')).toMatchObject({ ok: true })
+  expect(resolveChatByName(db, 'nobody')).toMatchObject({ ok: false })
+  upsertChat(db, { chat_id: '-77', type: 'group', title: 'Looper fleet', username: null }, 1004)
+  expect(resolveChatByName(db, 'Looper fleet')).toMatchObject({ ok: false }) // two groups, same title
+  expect(chatDisplayName({ type: 'private' }, { first_name: 'Ann', last_name: 'B' })).toBe('Ann B')
+  expect(chatDisplayName({ type: 'supergroup', title: 'T' })).toBe('T')
 })

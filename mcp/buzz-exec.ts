@@ -35,7 +35,10 @@ export function stripIdentityFlags(rawArgs: string[]): string[] {
 }
 
 /** Run the binary with already-policy-checked argv. `tag` labels the stderr log line. */
-export function execBuzz(args: string[], tag = 'buzz'): Promise<BuzzResult> {
+export function execBuzz(args: string[], tag = 'buzz', opts: { maxOut?: number } = {}): Promise<BuzzResult> {
+  // `maxOut` is for a caller that DIGESTS the output locally and never hands it to the model (own_replies
+  // reads a whole thread to pick out a few posts): the default cap protects the context, not the host.
+  const maxOut = opts.maxOut ?? MAX_OUT
   if (!args.some((a) => a === '--format')) args = ['--format', 'json', ...args]
   const key = process.env.BUZZ_PRIVATE_KEY
   if (!key) return Promise.resolve({ ok: false, error: 'BUZZ_PRIVATE_KEY not set — identity unavailable' })
@@ -45,16 +48,16 @@ export function execBuzz(args: string[], tag = 'buzz'): Promise<BuzzResult> {
     execFile(
       BUZZ_BIN,
       args,
-      { env: { PATH: process.env.PATH, BUZZ_PRIVATE_KEY: key, BUZZ_RELAY_URL: BUZZ_RELAY }, timeout: TIMEOUT_MS, maxBuffer: MAX_OUT, windowsHide: true },
+      { env: { PATH: process.env.PATH, BUZZ_PRIVATE_KEY: key, BUZZ_RELAY_URL: BUZZ_RELAY }, timeout: TIMEOUT_MS, maxBuffer: maxOut, windowsHide: true },
       (err, stdout, stderr) => {
-        const out = (stdout || '').slice(0, MAX_OUT)
+        const out = (stdout || '').slice(0, maxOut)
         if (err) {
           const msg = (stderr || (err as Error).message || 'buzz failed').slice(0, 2000)
           console.error(`[${tag}] FAILED verb=${verb} code=${(err as any).code}`)
           resolve({ ok: false, error: msg, code: (err as any).code })
         } else {
           console.error(`[${tag}] ok verb=${verb}`)
-          resolve({ ok: true, out: out || (stderr || '').slice(0, MAX_OUT) })
+          resolve({ ok: true, out: out || (stderr || '').slice(0, maxOut) })
         }
       },
     )

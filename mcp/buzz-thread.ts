@@ -83,6 +83,7 @@ export function ownRepliesSummary(
 }
 
 const asText = (v: unknown) => ({ content: [{ type: 'text' as const, text: typeof v === 'string' ? v : JSON.stringify(v) }] })
+const THREAD_MAX_OUT = 8 * 1024 * 1024 // 8MB: digested locally, never returned raw
 
 /** Register the `own_replies` tool on a server. Same code on both Buzz servers so the two cannot drift. */
 export function registerOwnRepliesTool(server: McpServer, tag: string): void {
@@ -107,7 +108,10 @@ export function registerOwnRepliesTool(server: McpServer, tag: string): void {
       const ch = channel || process.env.BUZZ_REPLY_CHANNEL
       if (!root) return asText({ ok: false, error: 'no thread: this wake carries no thread root, so pass `thread_root`' })
       if (!ch) return asText({ ok: false, error: 'no channel: this wake carries no channel, so pass `channel`' })
-      const r = await execBuzz(['messages', 'thread', '--channel', ch, '--event', root], tag)
+      // A busy thread (a worker's progress stream) is far bigger than the 64KB the generic tools cap stdout
+      // at — and that cap exists to protect the CONTEXT, which this tool never hands the raw thread to. Day-1
+      // live: the research thread overflowed it and the tool failed exactly when it was needed most.
+      const r = await execBuzz(['messages', 'thread', '--channel', ch, '--event', root], tag, { maxOut: THREAD_MAX_OUT })
       if (!r.ok) return asText(r)
       const evs = parseThreadEvents(r.out ?? '')
       if (!evs.length) return asText({ ok: false, error: 'thread unreadable or empty (is `channel` the channel this thread lives in?)' })

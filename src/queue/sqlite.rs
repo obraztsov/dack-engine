@@ -205,7 +205,10 @@ impl Queue for SqliteQueue {
     async fn next_eligible(&self, busy: &[String]) -> Result<Option<Stimulus>> {
         let now = chrono::Utc::now().timestamp();
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction().map_err(db)?;
+        // IMMEDIATE, not DEFERRED: this transaction reads (the claim query) and then writes, and SQLite
+        // will not run the busy handler on a read→write upgrade — a second process on the same queue
+        // file would turn a millisecond of contention into an instant "database is locked".
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(db)?;
         // Debounce gate: skip a row still within its coalesce window (`pop_after > now`) so a chat's
         // messages keep folding into it; an immediate row (`pop_after IS NULL`) is always eligible.
         // Axis-1: exclude rows whose `dedup_key` is already in flight (`busy`); a null-key row (a cron

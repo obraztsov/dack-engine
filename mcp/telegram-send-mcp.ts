@@ -80,6 +80,7 @@ if (DESTS.allow_known_private && process.env.RUNLOG_DB) {
   try {
     db = new Database(process.env.RUNLOG_DB)
     db.exec('PRAGMA query_only=ON')
+    db.exec('PRAGMA busy_timeout=5000')
   } catch (e) {
     console.error('[telegram-send] runlog open failed (known-private DISABLED, fail-closed):', e)
     db = null

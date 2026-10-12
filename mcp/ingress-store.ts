@@ -38,6 +38,9 @@ export const ATTACH_DEFAULTS: Record<MediaType, Record<AttachKind, boolean>> = {
 export function openIngressStore(path: string): Database {
   const db = new Database(path)
   if (path !== ':memory:') db.exec('PRAGMA journal_mode = WAL')
+  // Two processes write this file (the ingress module + an MCP tool). bun's default busy timeout is
+  // 0, so a millisecond of overlap would throw "database is locked" instead of waiting.
+  db.exec('PRAGMA busy_timeout = 5000')
   db.exec(
     'CREATE TABLE IF NOT EXISTS chat_attachments ' +
       '(chat_id TEXT NOT NULL, media TEXT NOT NULL, allowed INTEGER NOT NULL, updated_at INTEGER, ' +

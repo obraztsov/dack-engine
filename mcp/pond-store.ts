@@ -28,6 +28,9 @@ const HANDLE_RE = /\bH-[a-z0-9]{12}\b/g
 export function openPondStore(path: string): Database {
   const db = new Database(path)
   if (path !== ':memory:') db.exec('PRAGMA journal_mode = WAL')
+  // Two processes write this file (the ingress module + an MCP tool). bun's default busy timeout is
+  // 0, so a millisecond of overlap would throw "database is locked" instead of waiting.
+  db.exec('PRAGMA busy_timeout = 5000')
   db.exec(
     'CREATE TABLE IF NOT EXISTS pond_handles ' +
       '(handle TEXT PRIMARY KEY, value TEXT NOT NULL, owner TEXT NOT NULL, kind TEXT NOT NULL, ' +

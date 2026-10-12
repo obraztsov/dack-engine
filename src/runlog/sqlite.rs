@@ -7,6 +7,13 @@
 //! makes it `Send + Sync`; the SQL calls are brief and never `.await` while the lock is held. WAL +
 //! `busy_timeout` let the recall MCP readers run concurrently with the harness writer.
 //!
+//! Every multi-statement write opens `BEGIN IMMEDIATE` ([`write_tx`]), never the default DEFERRED: a
+//! deferred transaction that SELECTs first and then writes has to UPGRADE a read lock, and SQLite
+//! refuses to run the busy handler on an upgrade (it could deadlock two upgraders), so any other
+//! connection holding the write lock for even a millisecond surfaced as an instant "database is
+//! locked" and a LOST record (live 2026-10-12, twice). IMMEDIATE takes the write lock up front, where
+//! `busy_timeout` applies — a short hold by someone else is a short wait, not a failure.
+//!
 //! Denormalization: each entry stores its structured fields (`thought` / `sent` / `incoming` / `trust`
 //! / tags) AND a pre-rendered `heading` + `safe_body` (the render MINUS the untrusted raw fence) so the
 //! Rust context reads are a plain `SELECT` while the FTS + the MCP reads work off the columns.
@@ -15,14 +22,52 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 
 use super::{EntryMetaRecord, RunLogWriter, RunlogStats, TagNoteRecord};
 use crate::error::{DackError, Result};
 use crate::model::runlog::{Outcome, RunLogEntry, ToolCallRecord};
 
 fn db(e: rusqlite::Error) -> DackError {
-    DackError::Runlog(e.to_string())
+    // Keep the extended result code: "database is locked" alone cannot tell a writer holding the lock
+    // (BUSY=5) from a stale snapshot (BUSY_SNAPSHOT=517) or a reader mid-recovery (BUSY_RECOVERY=261).
+    match &e {
+        rusqlite::Error::SqliteFailure(f, _) => DackError::Runlog(format!("{e} [sqlite {}]", f.extended_code)),
+        _ => DackError::Runlog(e.to_string()),
+    }
+}
+
+/// A write transaction that takes the lock FIRST (`BEGIN IMMEDIATE`), so a busy database makes it
+/// wait out `busy_timeout` rather than fail on the read→write upgrade. Held for milliseconds.
+fn write_tx(conn: &mut Connection) -> Result<Transaction<'_>> {
+    conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(db)
+}
+
+/// Who else has this database open right now (Linux `/proc` scan, same PID namespace)? Called only on
+/// a lock error, so a recurrence names the other holder instead of leaving us to guess (2026-10-12 we
+/// could not: the two lost records left nothing behind but the words "database is locked").
+fn other_holders(path: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else { return out };
+    let me = std::process::id();
+    let Ok(procs) = std::fs::read_dir("/proc") else { return out };
+    for d in procs.flatten() {
+        let Ok(pid) = d.file_name().to_string_lossy().parse::<u32>() else { continue };
+        if pid == me {
+            continue;
+        }
+        let Ok(fds) = std::fs::read_dir(d.path().join("fd")) else { continue };
+        let holds = fds.flatten().any(|fd| {
+            std::fs::read_link(fd.path())
+                .map(|t| t.file_name().map(|f| f.to_string_lossy().starts_with(name.as_str())).unwrap_or(false))
+                .unwrap_or(false)
+        });
+        if holds {
+            let cmd = std::fs::read_to_string(d.path().join("cmdline")).unwrap_or_default().replace('\0', " ");
+            out.push(format!("pid {pid}: {}", cmd.trim().chars().take(120).collect::<String>()));
+        }
+    }
+    out
 }
 
 /// `ts` (unix secs) → `YYYY-MM-DD` (UTC) — the retention/day-stats bucket.
@@ -73,6 +118,8 @@ CREATE INDEX IF NOT EXISTS idx_tag_notes_kind_ts ON tag_notes(kind, ts);
 
 pub struct SqliteRunLog {
     conn: Mutex<Connection>,
+    /// The file (None in-memory) — only for naming the other lock holder in an error.
+    path: Option<std::path::PathBuf>,
 }
 
 /// The rendered parts of an entry, computed once at append time.
@@ -104,14 +151,15 @@ pub struct ImportedEntry {
 
 impl SqliteRunLog {
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        Self::init(Connection::open(path).map_err(db)?)
+        let path = path.as_ref().to_path_buf();
+        Self::init(Connection::open(&path).map_err(db)?, Some(path))
     }
 
     pub fn open_in_memory() -> Result<Self> {
-        Self::init(Connection::open_in_memory().map_err(db)?)
+        Self::init(Connection::open_in_memory().map_err(db)?, None)
     }
 
-    fn init(conn: Connection) -> Result<Self> {
+    fn init(conn: Connection, path: Option<std::path::PathBuf>) -> Result<Self> {
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA busy_timeout=5000;
@@ -119,7 +167,7 @@ impl SqliteRunLog {
         )
         .map_err(db)?;
         conn.execute_batch(SCHEMA).map_err(db)?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self { conn: Mutex::new(conn), path })
     }
 
     // ── new query surface (used by context-assembly co-tags + the B2 recall MCPs / tests) ──
@@ -226,7 +274,7 @@ impl SqliteRunLog {
         let day = day_of(e.ts);
         let sent_json = serde_json::to_string(&e.sent).unwrap_or_else(|_| "[]".into());
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction().map_err(db)?;
+        let tx = write_tx(&mut conn)?;
         let exists: Option<i64> = tx
             .query_row("SELECT rowid FROM entries WHERE run_id = ?1", params![e.run_id], |r| r.get(0))
             .optional()
@@ -266,7 +314,7 @@ impl SqliteRunLog {
     /// `(tag, note, ts)` so a re-run doesn't duplicate.
     pub fn import_note(&self, tag: &str, note: &str, trust: &str, ts: i64) -> Result<bool> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction().map_err(db)?;
+        let tx = write_tx(&mut conn)?;
         let dup: i64 = tx
             .query_row(
                 "SELECT COUNT(*) FROM tag_notes n JOIN note_tags nt ON nt.note_id = n.id
@@ -298,7 +346,7 @@ impl SqliteRunLog {
         let sent_json = serde_json::to_string(&r.sent).unwrap_or_else(|_| "[]".into());
         use rusqlite::OptionalExtension;
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction().map_err(db)?;
+        let tx = write_tx(&mut conn)?;
         // A retry may re-append the same run_id: drop the prior row (cascades `entry_tags`) + its FTS row
         // first, so we never orphan a stale FTS entry (standalone fts5 has no FK to cascade it).
         if let Some(old) = tx
@@ -466,7 +514,15 @@ fn dedup_consecutive(lines: &[String]) -> Vec<String> {
 #[async_trait]
 impl RunLogWriter for SqliteRunLog {
     async fn append(&self, entry: &RunLogEntry) -> Result<String> {
-        self.insert(entry)?;
+        if let Err(e) = self.insert(entry) {
+            let msg = e.to_string();
+            if msg.contains("locked") || msg.contains("busy") {
+                let holders = self.path.as_deref().map(other_holders).unwrap_or_default();
+                let who = if holders.is_empty() { "none visible".to_string() } else { holders.join("; ") };
+                return Err(DackError::Runlog(format!("{msg} — other holders: {who}")));
+            }
+            return Err(e);
+        }
         Ok(format!("runlog#{}", entry.run_id))
     }
 
@@ -708,7 +764,7 @@ impl RunLogWriter for SqliteRunLog {
         timestamp: i64,
     ) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction().map_err(db)?;
+        let tx = write_tx(&mut conn)?;
         tx.execute(
             "INSERT INTO tag_notes (kind, note, trust, ts, delivered_at) VALUES (?1, ?2, ?3, ?4, NULL)",
             params![kind, note, trust, timestamp],
@@ -760,6 +816,36 @@ mod tests {
             timestamp: ts,
             tags: tags.iter().map(|s| s.to_string()).collect(),
             trust: trust.into(),
+        }
+    }
+
+    /// A SHORT write by another connection (a second `dack` process, a reader re-syncing a torn wal-index
+    /// header) must make `append` WAIT (busy_timeout), never fail. Live 2026-10-12: two records were lost
+    /// to "database is locked" because the insert ran a SELECT inside a DEFERRED transaction and then
+    /// tried to upgrade it — SQLite refuses to invoke the busy handler on a read→write upgrade (it could
+    /// deadlock), so the 5s timeout never applied. Fails on the old code in 0.3s; passes with IMMEDIATE.
+    #[tokio::test]
+    async fn append_waits_out_a_concurrent_writer_instead_of_failing() {
+        let path = std::env::temp_dir().join(format!("dack-runlog-lock-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let rl = SqliteRunLog::open(&path).unwrap();
+        rl.append(&entry("warm", 1, "public", &["t"], "warm", "{}")).await.unwrap();
+        // Another connection holds the write lock for 300ms — far shorter than busy_timeout.
+        let other = Connection::open(&path).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE; INSERT INTO entry_tags (run_id, tag, ts) VALUES ('warm','held',1);").unwrap();
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            other.execute_batch("COMMIT").unwrap();
+        });
+        let t0 = std::time::Instant::now();
+        let r = rl.append(&entry("run-b", 2, "public", &["t"], "contended", "{}")).await;
+        holder.join().unwrap();
+        assert!(r.is_ok(), "append must wait for the other writer, got: {:?}", r.err());
+        assert!(t0.elapsed() >= std::time::Duration::from_millis(250), "append should have waited for the lock");
+        let n: i64 = rl.conn.lock().unwrap().query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 2);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
     }
 

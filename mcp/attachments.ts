@@ -8,7 +8,7 @@
  * escapes and require a regular file. So an outbound send can only ever reach a file the harness already
  * stored, not an arbitrary host path. Shared by every egress channel so the confinement is written once.
  */
-import { basename, join } from 'node:path'
+import { basename, join, isAbsolute } from 'node:path'
 import { statSync, realpathSync } from 'node:fs'
 
 export type ResolvedAttachment = { path: string; name: string } | { error: string }
@@ -100,4 +100,41 @@ export function resolveAttachment(mediaDir: string | undefined, id: string): Res
   } catch {
     return { error: `attachment "${name}" not found in the store` }
   }
+}
+
+/**
+ * Resolve a model-supplied WORKSPACE path to a real file: `ref` is relative to `WORKSPACE_DIR`
+ * (`inbox/telegram/-54/97-spec.md`, `outbox/brief.md`, `repos/x/docs/a.md`) or absolute UNDER it. realpath +
+ * prefix check (a symlink out of the workspace is refused), regular file only. The returned `name` is the
+ * basename the recipient sees.
+ */
+export function resolveWorkspaceFile(workspaceDir: string | undefined, ref: string): ResolvedAttachment {
+  if (!workspaceDir) return { error: 'WORKSPACE_DIR not set — the workspace is unavailable' }
+  const r = (ref ?? '').trim()
+  if (!r || r === '.' || r === '..') return { error: 'empty path' }
+  try {
+    const rootReal = realpathSync(workspaceDir)
+    const candidate = isAbsolute(r) ? r : join(workspaceDir, r)
+    const real = realpathSync(candidate)
+    if (real !== rootReal && !real.startsWith(rootReal + '/')) return { error: `"${r}" is outside your workspace (${workspaceDir})` }
+    if (!statSync(real).isFile()) return { error: `"${r}" is not a regular file` }
+    return { path: real, name: basename(real) }
+  } catch {
+    return { error: `"${r}" not found in your workspace (${workspaceDir}); paths are relative to it, e.g. inbox/… or outbox/…` }
+  }
+}
+
+/**
+ * Resolve something SENDABLE: a workspace path first (the duck's own files, inbox documents, repo files);
+ * else a bare basename in the legacy media store (images the channel stored). One resolver for every
+ * egress tool (buzz `send_file`, telegram `reply_document`, email, the generic buzz `--file`).
+ */
+export function resolveSendable(workspaceDir: string | undefined, mediaDir: string | undefined, ref: string): ResolvedAttachment {
+  const ws = resolveWorkspaceFile(workspaceDir, ref)
+  if (!('error' in ws)) return ws
+  if (!ref.includes('/') && mediaDir) {
+    const m = resolveAttachment(mediaDir, ref)
+    if (!('error' in m)) return m
+  }
+  return ws
 }

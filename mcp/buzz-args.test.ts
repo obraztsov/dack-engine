@@ -1,5 +1,5 @@
 import { test, expect } from 'bun:test'
-import { DEFAULT_DENY, deniedVerb, rejectsHostPathFlag, applySendDefaults, flagValue, resolveChannelFlags } from './buzz-args'
+import { DEFAULT_DENY, deniedVerb, rejectsHostPathFlag, applySendDefaults, flagValue, resolveChannelFlags, confineHostPathFlags } from './buzz-args'
 
 const DENY = DEFAULT_DENY.map((d) => d.toLowerCase())
 
@@ -214,4 +214,14 @@ test('resolveChannelFlags: names → ids on every --channel form, ids annotated,
   // other flags and a dangling --channel are left alone
   expect(resolveChannelFlags(['issues', 'list', '--repo-id', 'research'], lookup)).toMatchObject({ ok: true, args: ['issues', 'list', '--repo-id', 'research'] })
   expect(resolveChannelFlags(['channels', 'get', '--channel'], lookup)).toMatchObject({ ok: true, args: ['channels', 'get', '--channel'] })
+})
+
+test('confineHostPathFlags: read flags resolve inside the workspace, outside refuses the whole argv, --output stays refused', () => {
+  const resolve = (ref: string) => (ref.startsWith('outbox/') ? { path: `/duck/workspace/${ref}` } : { error: `"${ref}" is outside your workspace` })
+  const r1 = confineHostPathFlags(['messages', 'send', '--content', 'x', '--file', 'outbox/a.pdf'], resolve)
+  expect(r1).toMatchObject({ ok: true, args: ['messages', 'send', '--content', 'x', '--file', '/duck/workspace/outbox/a.pdf'], files: ['/duck/workspace/outbox/a.pdf'] })
+  expect(confineHostPathFlags(['patches', 'send', '--patch-file=outbox/p.patch'], resolve)).toMatchObject({ ok: true, args: ['patches', 'send', '--patch-file=/duck/workspace/outbox/p.patch'] })
+  expect(confineHostPathFlags(['pr', 'open', '--body-file', '/etc/passwd'], resolve)).toMatchObject({ ok: false })
+  expect(confineHostPathFlags(['media', 'get', 'abc', '-o', 'outbox/x'], resolve)).toMatchObject({ ok: false }) // a WRITE flag: media_fetch owns it
+  expect(confineHostPathFlags(['messages', 'send', '--content', 'no files'], resolve)).toMatchObject({ ok: true, files: [] })
 })

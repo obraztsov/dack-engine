@@ -137,6 +137,8 @@ function buzzMediaGet(ref: string, outPath: string): boolean {
 }
 
 const mediaDirAbs = () => (isAbsolute(cfg.media_dir) ? cfg.media_dir : resolvePath(process.cwd(), cfg.media_dir))
+// The agent WORKSPACE (harness-injected, absolute): documents land in its `inbox/`. Falls back beside the cwd.
+const WORKSPACE_DIR = process.env.WORKSPACE_DIR ?? resolvePath(process.cwd(), 'workspace')
 
 /** P2 passive awareness: prefetch a thumb (or full image) of each attachment into the harness media dir and
  *  return `payload.media` entries the engine's media store confines + carries onto the goal turn (so the duck
@@ -232,22 +234,27 @@ const EXT_FOR_MIME: Record<string, string> = {
 /** Prefetch NON-image documents into the store: fetch full bytes (Blossom authed) and STAMP `file` (the
  *  stored basename) onto each fetched attachment entry, so a Buzz-received document becomes a routable stored
  *  attachment (channel-agnostic with telegram). Mutates the entries; no-op unless `media_prefetch_docs`. */
-function prefetchDocsInto(attachments: MediaMeta[]): void {
+function prefetchDocsInto(attachments: MediaMeta[], channelName?: string): void {
   if (!cfg.media_prefetch_docs || attachments.length === 0) return
-  const dir = mediaDirAbs()
+  // Documents land in the duck's WORKSPACE inbox: `inbox/buzz/<channel>/<sha12>-<filename>` — a path the duck
+  // can `Read` (wall-gated, trust-capped) or `send_file` on; `file` is that workspace-relative path.
+  const chan = (channelName ?? 'channel').replace(/[^A-Za-z0-9._-]+/g, '-').slice(0, 60) || 'channel'
+  const dir = join(WORKSPACE_DIR, 'inbox', 'buzz', chan)
   try {
     mkdirSync(dir, { recursive: true })
   } catch {
-    /* harness ensures it at boot */
+    /* harness ensures the workspace at boot */
   }
   for (const a of attachments.slice(0, cfg.media_max_per_message)) {
     if (!a.sha || a.mime.startsWith('image/')) continue // images ride prefetchMedia (the vision lane)
     const ext = (a.filename?.includes('.') ? '.' + a.filename.split('.').pop() : EXT_FOR_MIME[a.mime]) ?? '.bin'
-    const file = `${a.sha}${ext.toLowerCase().replace(/[^a-z0-9.]/g, '')}`
-    const outPath = join(dir, file)
+    const safe = (a.filename ?? '').replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^[-.]+/, '').slice(0, 100)
+    const file = safe || `${a.sha}${ext.toLowerCase().replace(/[^a-z0-9.]/g, '')}`
+    const name = `${a.sha.slice(0, 12)}-${file}`
+    const outPath = join(dir, name)
     if (existsSync(outPath) || buzzMediaGet(a.sha, outPath)) {
-      a.file = file
-      log('prefetched doc', `${a.sha.slice(0, 12)}… (${a.mime}) → media dir`)
+      a.file = `inbox/buzz/${chan}/${name}`
+      log('prefetched doc', `${a.sha.slice(0, 12)}… (${a.mime}) → ${a.file}`)
     }
   }
 }
@@ -361,7 +368,7 @@ async function post(ch: { id: string; name?: string }, ev: Ev, kind: 'mention' |
   const arm = lookupArm(routes, root)
   const attachments = parseImeta(ev) // P0: media awareness — metadata for every attachment (all mimes)
   const media = prefetchMedia(attachments) // P2: passively fetched thumb(s)/image(s) the duck SEES on wake
-  prefetchDocsInto(attachments) // Slice 2: fetch non-image docs → stamp `file` (routable stored attachment)
+  prefetchDocsInto(attachments, ch.name) // fetch non-image docs into the workspace inbox → stamp `file` (a workspace path)
   const body = {
     channel: { id: ch.id, name: ch.name ?? null },
     trigger: kind,

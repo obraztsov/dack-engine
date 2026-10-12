@@ -17,7 +17,7 @@ import { z } from 'zod'
 import { readFileSync } from 'node:fs'
 import { openIngressStore, setChatAttachment, getReferral, recordSend, type MediaType } from './ingress-store'
 import { openPondStore, restoreHandles, spliceHandles } from './pond-store'
-import { resolveAttachment } from './attachments'
+import { resolveSendable } from './attachments'
 
 // Per-chat attachment store — the harness injects INGRESS_DB (absolute). Absent ⇒ the toggle is
 // unavailable (returns an error); `reply` still works.
@@ -124,16 +124,18 @@ server.registerTool(
   'reply_document',
   {
     description:
-      'Send a FILE (a document — PDF/docx/… — or any stored attachment) to the Telegram chat that woke you. ' +
-      '`attachment_id` names a file already in your attachment store (e.g. one a client sent you, or one produced ' +
-      'for you) — you cannot attach an arbitrary path or a file you were never given. Optional short caption. The ' +
+      'Send a FILE from your WORKSPACE to the Telegram chat that woke you — a document you received (`inbox/…`, ' +
+      'the `file` of an `attachments` entry), one you wrote (`outbox/report.md`), or a file in a cloned repo. ' +
+      '`path` is relative to your workspace; an arbitrary host path is refused. Optional short caption. The ' +
       'destination is fixed to your chat, same as reply.',
-    inputSchema: { attachment_id: z.string().min(1).max(256), caption: z.string().max(1024).optional() },
+    inputSchema: { path: z.string().min(1).max(512).optional(), attachment_id: z.string().min(1).max(256).optional(), caption: z.string().max(1024).optional() },
   },
-  async ({ attachment_id, caption }: { attachment_id: string; caption?: string }) => {
+  async ({ path, attachment_id, caption }: { path?: string; attachment_id?: string; caption?: string }) => {
     const chat = process.env.TELEGRAM_REPLY_CHAT
     if (!chat) return asText({ ok: false, error: 'no source chat in scope — this cycle was not woken by Telegram' })
-    const res = resolveAttachment(process.env.MEDIA_DIR, attachment_id)
+    const ref = path || attachment_id
+    if (!ref) return asText({ ok: false, error: 'give `path` (relative to your workspace)' })
+    const res = resolveSendable(process.env.WORKSPACE_DIR, process.env.MEDIA_DIR, ref)
     if ('error' in res) return asText({ ok: false, error: res.error })
     const replyTo = process.env.TELEGRAM_REPLY_TO
     const at = Math.floor(Date.now() / 1000)

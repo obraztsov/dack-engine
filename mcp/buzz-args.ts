@@ -81,8 +81,47 @@ export function deniedVerb(args: string[], deny: string[]): string | null {
 export const HOST_PATH_FLAGS: Record<string, string> = {
   '--file': 'send_file',
   '-f': 'send_file',
+  '--patch-file': 'send_file',
+  '--body-file': 'send_file',
   '--output': 'media_fetch',
   '-o': 'media_fetch',
+}
+
+/** Host-path flags that READ a file to publish it. With a workspace, their value is CONFINED (resolved inside
+ *  `WORKSPACE_DIR`, else refused) instead of the flag being refused outright. `--output`/`-o` (a WRITE) stays
+ *  refused — `media_fetch` owns the only write path. */
+export const WORKSPACE_READ_FLAGS = new Set(['--file', '-f', '--patch-file', '--body-file'])
+
+export type ConfinedArgs = { ok: true; args: string[]; files: string[] } | { ok: false; error: string }
+
+/**
+ * Rewrite every workspace-read flag value (`--file x`, `--file=x`, repeated) through `resolve` — a workspace
+ * path becomes its real absolute path, anything else refuses the WHOLE command (nothing is sent). A write
+ * flag (`--output`/`-o`) refuses as before. Pure over `resolve`, tested without a filesystem.
+ */
+export function confineHostPathFlags(
+  args: string[],
+  resolve: (ref: string) => { path: string } | { error: string },
+): ConfinedArgs {
+  const out: string[] = []
+  const files: string[] = []
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]
+    const eq = a.startsWith('--') ? a.indexOf('=') : -1
+    const bare = eq > 0 ? a.slice(0, eq) : a
+    if (!(bare in HOST_PATH_FLAGS)) { out.push(a); continue }
+    if (!WORKSPACE_READ_FLAGS.has(bare)) {
+      return { ok: false, error: `"${bare}" writes to a host path and is not allowed here — use the \`${HOST_PATH_FLAGS[bare]}\` tool. (Nothing was sent.)` }
+    }
+    const ref = eq > 0 ? a.slice(eq + 1) : args[i + 1]
+    if (ref === undefined) { out.push(a); continue }
+    const r = resolve(ref)
+    if ('error' in r) return { ok: false, error: `${bare}: ${r.error} (nothing was sent)` }
+    files.push(r.path)
+    if (eq > 0) out.push(`${bare}=${r.path}`)
+    else { out.push(bare, r.path); i++ }
+  }
+  return { ok: true, args: out, files }
 }
 
 /** Read a flag's value out of argv, supporting both `--flag value` and `--flag=value`. */

@@ -19,7 +19,7 @@ import { z } from 'zod'
 import { readFileSync } from 'node:fs'
 import { basename } from 'node:path'
 import { openIngressStore, recordSend } from './ingress-store'
-import { resolveAttachment } from './attachments'
+import { resolveSendable } from './attachments'
 
 const ingressStore = process.env.INGRESS_DB ? openIngressStore(process.env.INGRESS_DB) : null
 const asText = (v: unknown) => ({ content: [{ type: 'text' as const, text: JSON.stringify(v) }] })
@@ -61,16 +61,18 @@ server.registerTool(
     inputSchema: {
       subject: z.string().max(200).optional(),
       text: z.string().min(1).max(20000),
-      attachment_id: z.string().max(256).optional(),
+      attachment_id: z.string().max(256).optional(), // legacy alias of `path`
+      path: z.string().max(512).optional(), // a file in your WORKSPACE (inbox/…, outbox/…, repos/…)
     },
   },
-  async ({ subject, text, attachment_id }: { subject?: string; text: string; attachment_id?: string }) => {
+  async ({ subject, text, attachment_id, path }: { subject?: string; text: string; attachment_id?: string; path?: string }) => {
+    const attachment_ref = path || attachment_id
     const to = process.env.EMAIL_REPLY_TO
     if (!to) return asText({ ok: false, error: 'no source email in scope — this cycle was not woken by an email' })
     const subj = subject ?? (process.env.EMAIL_SUBJECT ? `Re: ${process.env.EMAIL_SUBJECT}` : '(no subject)')
     let att: { path: string; name: string } | undefined
-    if (attachment_id) {
-      const r = resolveAttachment(process.env.MEDIA_DIR, attachment_id)
+    if (attachment_ref) {
+      const r = resolveSendable(process.env.WORKSPACE_DIR, process.env.MEDIA_DIR, attachment_ref)
       if ('error' in r) return asText({ ok: false, error: r.error })
       att = r
     }

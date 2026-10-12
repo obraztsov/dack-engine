@@ -1,8 +1,8 @@
 import { test, expect } from 'bun:test'
-import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync, realpathSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync, realpathSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { resolveAttachment, plaintextGate, sanitizeAttachmentName } from './attachments'
+import { resolveAttachment, plaintextGate, sanitizeAttachmentName, resolveWorkspaceFile, resolveSendable } from './attachments'
 
 function store(): string {
   const dir = mkdtempSync(join(tmpdir(), 'dack-attach-'))
@@ -146,3 +146,31 @@ test('an over-long name is truncated but keeps its extension', () => {
   expect(n.endsWith('.md')).toBe(true)
 })
 
+
+test('workspace paths: relative or absolute UNDER the workspace resolve; outside, missing, dirs and symlink escapes refuse', () => {
+  const base = mkdtempSync(join(tmpdir(), 'dack-ws-'))
+  const ws = join(base, 'workspace')
+  mkdirSync(join(ws, 'inbox/telegram/-54'), { recursive: true })
+  mkdirSync(join(ws, 'outbox'), { recursive: true })
+  writeFileSync(join(ws, 'inbox/telegram/-54/97-spec.md'), 'spec')
+  writeFileSync(join(ws, 'outbox/brief.md'), 'brief')
+  writeFileSync(join(base, 'dack.config.yaml'), 'secret')
+  symlinkSync(join(base, 'dack.config.yaml'), join(ws, 'outbox/cfg.yaml'))
+  const ok1 = resolveWorkspaceFile(ws, 'inbox/telegram/-54/97-spec.md')
+  expect('path' in ok1 && ok1.name).toBe('97-spec.md')
+  const ok2 = resolveWorkspaceFile(ws, join(ws, 'outbox/brief.md'))
+  expect('path' in ok2).toBe(true)
+  for (const bad of ['../dack.config.yaml', join(base, 'dack.config.yaml'), 'outbox/cfg.yaml', 'outbox', 'nope.md', '']) {
+    const r = resolveWorkspaceFile(ws, bad)
+    expect('error' in r).toBe(true)
+  }
+  expect('error' in resolveWorkspaceFile(undefined, 'outbox/brief.md')).toBe(true)
+  // sendable: workspace first, then a bare basename in the legacy media store (images), never a media path
+  const media = join(base, 'media')
+  mkdirSync(media)
+  writeFileSync(join(media, 'photo.jpg'), 'img')
+  expect('path' in resolveSendable(ws, media, 'outbox/brief.md')).toBe(true)
+  expect('path' in resolveSendable(ws, media, 'photo.jpg')).toBe(true)
+  expect('error' in resolveSendable(ws, media, '../media/photo.jpg')).toBe(true)
+  rmSync(base, { recursive: true, force: true })
+})

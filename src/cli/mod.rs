@@ -598,8 +598,16 @@ async fn run(config_path: &str) -> Result<()> {
         // `openclaude-bridge/`, `secrets/`, and the adapter configs the module commands reference).
         // A module may override per-entry via `cwd:`.
         let module_cwd = std::env::current_dir().unwrap_or_else(|_| repo_root.clone());
-        let supervisor =
-            ModuleSupervisor::new(config.modules.clone(), broker.clone(), sandbox, module_cwd);
+        // Every module sees the harness-owned dirs as ABSOLUTE env (an ingress drops documents into the
+        // workspace inbox, images into the media store) — never a guessed cwd-relative path.
+        let base_env: std::collections::BTreeMap<String, String> = [
+            ("WORKSPACE_DIR".to_string(), crate::workspace::dir(&config.workspace.dir).to_string_lossy().into_owned()),
+            ("MEDIA_DIR".to_string(), crate::media::dir(&config.media_dir).to_string_lossy().into_owned()),
+        ]
+        .into_iter()
+        .collect();
+        let supervisor = ModuleSupervisor::new(config.modules.clone(), broker.clone(), sandbox, module_cwd)
+            .with_base_env(base_env);
         let sd = shutdown_rx.clone();
         tokio::spawn(async move { supervisor.run(sd).await });
     }

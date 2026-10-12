@@ -18,6 +18,7 @@
  */
 import { Bot } from 'grammy'
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
+import { dirname, resolve as resolvePath } from 'node:path'
 import {
   openIngressStore,
   attachmentKind,
@@ -121,6 +122,8 @@ const token = loadToken()
 const bot = new Bot(token)
 // The ingress's own SQLite store (per-chat attachment permissions; future ingress state). In /duck.
 const store = openIngressStore(cfg.ingress_db)
+// The agent WORKSPACE (harness-injected, absolute): documents land in its `inbox/`. Falls back beside the cwd.
+const WORKSPACE_DIR = process.env.WORKSPACE_DIR ?? resolvePath(process.cwd(), 'workspace')
 
 // Telegram bot download ceiling (~20MB); MiMo also caps an image at 50MB. Oversized → skipped.
 const MAX_MEDIA_BYTES = 20 * 1024 * 1024
@@ -174,12 +177,24 @@ async function downloadDocument(doc: any, m: any): Promise<{ file: string; mime:
     const mime = String(doc.mime_type ?? 'application/octet-stream')
     const origName = String(doc.file_name ?? '')
     const ext = (origName.includes('.') ? origName.split('.').pop()! : 'bin').toLowerCase().replace(/[^a-z0-9]/g, '') || 'bin'
-    const name = `${m.chat.id}_${m.message_id}_${doc.file_unique_id}.${ext}`
-    mkdirSync(cfg.media_dir, { recursive: true })
-    writeFileSync(`${cfg.media_dir}/${name}`, buf)
     const kind = mime.startsWith('image/') ? 'image' : 'file'
-    console.error(`[tg-ingress] stored ${kind} ${name} (${buf.length}b, ${mime}) for msg ${m.message_id}`)
-    return { file: name, mime, filename: origName || name, size: buf.length, kind }
+    if (kind === 'image') {
+      // An image-as-file rides the VISION lane: the media store, basename ref (unchanged).
+      const name = `${m.chat.id}_${m.message_id}_${doc.file_unique_id}.${ext}`
+      mkdirSync(cfg.media_dir, { recursive: true })
+      writeFileSync(`${cfg.media_dir}/${name}`, buf)
+      console.error(`[tg-ingress] stored image ${name} (${buf.length}b, ${mime}) for msg ${m.message_id}`)
+      return { file: name, mime, filename: origName || name, size: buf.length, kind }
+    }
+    // A DOCUMENT lands in the duck's WORKSPACE inbox under its own name: `inbox/telegram/<chat>/<msg>-<name>`.
+    // `file` is the workspace-relative path the duck can `Read` (wall-gated, trust-capped) or send back.
+    const safeName = (origName || `document.${ext}`).replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^[-.]+/, '').slice(0, 120) || `document.${ext}`
+    const rel = `inbox/telegram/${m.chat.id}/${m.message_id}-${safeName}`
+    const abs = `${WORKSPACE_DIR}/${rel}`
+    mkdirSync(dirname(abs), { recursive: true })
+    writeFileSync(abs, buf)
+    console.error(`[tg-ingress] stored document ${rel} (${buf.length}b, ${mime}) for msg ${m.message_id}`)
+    return { file: rel, mime, filename: origName || safeName, size: buf.length, kind }
   } catch (e) {
     console.error('[tg-ingress] document download failed:', e)
     return null

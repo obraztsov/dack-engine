@@ -36,6 +36,7 @@ pub struct ModuleSupervisor {
     /// Default working directory for modules that don't pin their own `cwd:` — the harness process's
     /// cwd (the engine working tree holding `openclaude-bridge/`, `secrets/`, adapter configs).
     default_cwd: PathBuf,
+    base_env: std::collections::BTreeMap<String, String>,
 }
 
 impl ModuleSupervisor {
@@ -45,7 +46,15 @@ impl ModuleSupervisor {
         sandbox: Arc<dyn Sandbox>,
         default_cwd: PathBuf,
     ) -> Self {
-        Self { modules, broker, sandbox, default_cwd }
+        Self { modules, broker, sandbox, default_cwd, base_env: Default::default() }
+    }
+
+    /// Harness-derived env every module sees UNDER its own `env:` (a module may override): the absolute
+    /// `WORKSPACE_DIR` (where an ingress drops inbound documents) and `MEDIA_DIR` (images), so a channel
+    /// adapter never guesses the harness's cwd-relative dirs.
+    pub fn with_base_env(mut self, base_env: std::collections::BTreeMap<String, String>) -> Self {
+        self.base_env = base_env;
+        self
     }
 
     /// Spawn a supervisor task per enabled module; resolve when the shutdown watch flips (after the
@@ -64,6 +73,7 @@ impl ModuleSupervisor {
                 broker: self.broker.clone(),
                 sandbox: self.sandbox.clone(),
                 cwd,
+                base_env: self.base_env.clone(),
             };
             started.push(module.name.clone());
             handles.push(tokio::spawn(task.supervise(shutdown.clone())));
@@ -93,6 +103,7 @@ struct SupervisedModule {
     broker: Arc<SecretsBroker>,
     sandbox: Arc<dyn Sandbox>,
     cwd: PathBuf,
+    base_env: std::collections::BTreeMap<String, String>,
 }
 
 /// The result of one spawn→wait cycle, telling the loop how to set the next backoff.
@@ -140,7 +151,8 @@ impl SupervisedModule {
         // start, so a rotated token is picked up on restart). A secret-resolution failure is
         // non-fatal here — the module starts without it (and likely fails fast, which the backoff
         // loop already handles); we don't want one broken provider to silently stop the channel.
-        let mut env = self.module.env.clone();
+        let mut env = self.base_env.clone();
+        env.extend(self.module.env.clone());
         match self.broker.env_for(&self.module.secrets).await {
             Ok(secret_env) => env.extend(secret_env),
             Err(e) => tracing::warn!("module `{name}` secrets unresolved ({e}) — starting without"),

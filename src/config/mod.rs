@@ -190,6 +190,52 @@ fn default_media_dir() -> String {
 fn default_media_retention_days() -> u64 {
     7
 }
+fn default_workspace_dir() -> String {
+    "workspace".into()
+}
+fn default_workspace_trust() -> String {
+    "org".into()
+}
+fn default_workspace_inbox_retention_days() -> u64 {
+    30
+}
+
+/// The agent **WORKSPACE** — one harness-owned scratch directory per duck, BESIDE the soul (never inside
+/// the git tree), where documents land (`inbox/`), the duck authors files, and Buzz repos are cloned
+/// (`repos/`). Wall-controlled like the soul: read-only in Perceive, writable in Express/Settle/Reflect.
+/// Two trust knobs close the gaps a shared directory opens (design: docs/design/workspace-and-documents.md):
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceConfig {
+    /// Harness-cwd-relative (or absolute) directory. Default `workspace` (`/duck/workspace` in a container).
+    #[serde(default = "default_workspace_dir")]
+    pub dir: String,
+    /// TOUCHING the workspace (any read or write under it) caps the cycle's trust at this tier AFTER the
+    /// step — the same post-step taint a public MCP applies. Files arrive from many provenances (a stranger's
+    /// document, an org clone, the duck's own draft) and provenance does not survive the duck's edits, so one
+    /// directory carries one tier. Default `org`; lower it to `public` for a duck whose inbox is the open
+    /// world. `self` is REFUSED at load: untrusted bytes land here, it is never self-trust.
+    #[serde(default = "default_workspace_trust")]
+    pub read_trust_cap: String,
+    /// The minimum cycle trust that may WRITE into the workspace (pre-call gate, like `memory_write_min_trust`).
+    /// Default `org`: a stranger's Telegram message cannot plant a file here.
+    #[serde(default = "default_workspace_trust")]
+    pub write_min_trust: String,
+    /// `inbox/` retention: files older than N days are swept (boot + the GC tick). `0` ⇒ keep. Only the inbox
+    /// — what the duck made or cloned is its own to remove. Default 30.
+    #[serde(default = "default_workspace_inbox_retention_days")]
+    pub inbox_retention_days: u64,
+}
+
+impl Default for WorkspaceConfig {
+    fn default() -> Self {
+        Self {
+            dir: default_workspace_dir(),
+            read_trust_cap: default_workspace_trust(),
+            write_min_trust: default_workspace_trust(),
+            inbox_retention_days: default_workspace_inbox_retention_days(),
+        }
+    }
+}
 
 fn default_reflect_interval() -> i64 {
     86_400 // one day — a sane self-modification cadence; the operator may loosen or `0` to disable.
@@ -709,6 +755,9 @@ pub struct DackConfig {
     /// forever. Bounds disk like the runlog. Default 7.
     #[serde(default = "default_media_retention_days")]
     pub media_retention_days: u64,
+    /// The agent workspace (see [`WorkspaceConfig`]). Always present; defaults are safe.
+    #[serde(default)]
+    pub workspace: WorkspaceConfig,
     /// **Load-shedding cap**: the max PENDING queue depth before the OLDEST `Low`-priority
     /// items are evicted (Normal+ is the protected floor, never shed; every eviction is logged).
     /// Protects a busy duck from a runaway low-priority fan-out backlog. `None` = unbounded.
@@ -1046,6 +1095,11 @@ impl DackConfig {
 
     pub fn from_yaml(text: &str) -> Result<Self> {
         let cfg: Self = serde_yaml::from_str(text).map_err(DackError::from)?;
+        if cfg.workspace.read_trust_cap == "self" {
+            return Err(DackError::Config(
+                "workspace.read_trust_cap may not be `self`: untrusted bytes land in the workspace, it is never self-trust (use `org` or `public`)".into(),
+            ));
+        }
         if cfg.runtime.worker_sandbox.is_some() {
             tracing::warn!("config: `runtime.worker_sandbox` is deprecated and ignored — in-duck workers were removed (delegation is to Buzz agents); delete the block");
         }
@@ -1181,6 +1235,17 @@ impl DackConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_defaults_are_org_and_self_cap_is_refused() {
+        let base = "operator_did: did:key:z1\nsoul_repo: ./soul\n";
+        let c = DackConfig::from_yaml(base).expect("minimal config parses");
+        assert_eq!(c.workspace.dir, "workspace");
+        assert_eq!((c.workspace.read_trust_cap.as_str(), c.workspace.write_min_trust.as_str(), c.workspace.inbox_retention_days), ("org", "org", 30));
+        let lowered = DackConfig::from_yaml(&format!("{base}workspace: {{ read_trust_cap: public }}\n")).unwrap();
+        assert_eq!(lowered.workspace.read_trust_cap, "public");
+        assert!(DackConfig::from_yaml(&format!("{base}workspace: {{ read_trust_cap: self }}\n")).is_err(), "self is never a workspace tier");
+    }
 
     const SAMPLE: &str = r#"
 operator_did: "did:key:z6MkOperator"

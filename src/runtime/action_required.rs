@@ -74,6 +74,23 @@ pub struct StatePolicyResponder {
     /// resolved `${MEDIA_OUT}`). `None` ⇒ a media-producing command is denied (nowhere safe to write). Set by
     /// the harness from `config.media_dir`; shared with the incoming-media store so the bridge reads it back.
     pub media_dir: Option<PathBuf>,
+    /// The agent WORKSPACE roots (absolute; harness-owned, beside the soul). A file write under one is
+    /// allowed in any state whose scope admits `FileWrite` (no `writable_dirs` entry needed — it is not the
+    /// soul) but only when `workspace_writable`; a read under one is allowed and MARKS the invocation as
+    /// having touched the workspace (the harness caps the cycle's trust after the step). Empty ⇒ no workspace.
+    pub workspace_roots: Vec<PathBuf>,
+    /// May this cycle WRITE into the workspace? `lattice.permits(cycle_trust, workspace.write_min_trust)`.
+    pub workspace_writable: bool,
+    /// Extra roots a builtin READ may target besides the soul and the workspace — the runtime's own spill
+    /// dir (the SDK writes an oversized tool result to `~/.openclaude/projects/…/tool-results/` and the
+    /// model reads it back; that is legitimate). Anything outside soul ∪ workspace ∪ these is denied.
+    pub extra_read_roots: Vec<PathBuf>,
+    /// Confine builtin file READS to soul ∪ workspace ∪ extra roots. On by the harness; off (`false`)
+    /// only for unit tests without a repo root, where paths are soul-relative by construction.
+    pub confine_reads: bool,
+    /// Set when any allowed call targeted a workspace root this invocation (read OR write) — interior-mutable
+    /// like `outward_seen`; the harness reads it after the step to apply `workspace.read_trust_cap`.
+    workspace_touched: std::sync::atomic::AtomicBool,
     /// `(tool, input)` fingerprints of OUTWARD actions (Post / SettleTx) that ran this invocation —
     /// tracked so [`acted_outward`](Self::acted_outward) can gate the timeout-retry path (never re-run
     /// a wake that already posted/traded → no double-post on a re-run). Duplicates are NOT blocked: a
@@ -101,6 +118,11 @@ impl StatePolicyResponder {
             reply_scope: Default::default(),
             broker: None,
             media_dir: None,
+            workspace_roots: Vec::new(),
+            workspace_writable: false,
+            extra_read_roots: Vec::new(),
+            confine_reads: false,
+            workspace_touched: Default::default(),
             outward_seen: Default::default(),
         }
     }
@@ -125,8 +147,29 @@ impl StatePolicyResponder {
             reply_scope: Default::default(),
             broker: None,
             media_dir: None,
+            workspace_roots: Vec::new(),
+            workspace_writable: false,
+            extra_read_roots: Vec::new(),
+            confine_reads: false,
+            workspace_touched: Default::default(),
             outward_seen: Default::default(),
         }
+    }
+
+    /// Bind the agent workspace: the roots (absolute), whether THIS cycle may write there, and the extra
+    /// read roots (the runtime's spill dir). Turns on read confinement: a builtin read must then target
+    /// the soul, a workspace, or an extra root.
+    pub fn with_workspace(mut self, roots: Vec<PathBuf>, writable: bool, extra_read_roots: Vec<PathBuf>) -> Self {
+        self.workspace_roots = roots.into_iter().map(|r| normalize_lexical(&r)).collect();
+        self.workspace_writable = writable;
+        self.extra_read_roots = extra_read_roots.into_iter().map(|r| normalize_lexical(&r)).collect();
+        self.confine_reads = true;
+        self
+    }
+
+    /// Did any allowed call this invocation read or write under a workspace root?
+    pub fn touched_workspace(&self) -> bool {
+        self.workspace_touched.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Bind the soul-repo root so live (absolute) write targets are relativized against it
@@ -283,6 +326,52 @@ impl StatePolicyResponder {
         })
     }
 
+    /// The absolute, `..`-collapsed form of a tool path (relative paths are soul-relative — the model's cwd).
+    /// If the path (or its nearest existing ancestor) exists, it is canonicalized so a planted SYMLINK cannot
+    /// point a read or write out of a root the lexical form appeared to be inside.
+    fn absolutize(&self, target: &str) -> Option<PathBuf> {
+        let t = Path::new(target);
+        let abs = if t.is_absolute() {
+            normalize_lexical(t)
+        } else {
+            normalize_lexical(&self.repo_root.as_ref()?.join(t))
+        };
+        Some(canonical_or_lexical(&abs))
+    }
+
+    /// Is `target` under one of the workspace roots? (`Some(root)` when it is.)
+    fn workspace_root_of(&self, target: &str) -> Option<&PathBuf> {
+        if self.workspace_roots.is_empty() {
+            return None;
+        }
+        let abs = self.absolutize(target)?;
+        self.workspace_roots.iter().find(|r| abs.starts_with(canonical_or_lexical(r)))
+    }
+
+    /// Read confinement: a builtin file read may target the soul, a workspace root, or an extra read root.
+    /// Without a repo root (unit tests) a relative path is accepted; with one, anything else is outside.
+    fn read_target_allowed(&self, target: &str) -> bool {
+        if !self.confine_reads {
+            return true;
+        }
+        let Some(abs) = self.absolutize(target) else {
+            return Path::new(target).is_relative(); // no repo root: relative paths are soul-relative by construction
+        };
+        if let Some(root) = &self.repo_root {
+            if abs.starts_with(canonical_or_lexical(&normalize_lexical(root))) {
+                return true;
+            }
+        }
+        if self.workspace_roots.iter().any(|r| abs.starts_with(canonical_or_lexical(r))) {
+            return true;
+        }
+        self.extra_read_roots.iter().any(|r| abs.starts_with(canonical_or_lexical(r)))
+    }
+
+    fn mark_workspace_touched(&self) {
+        self.workspace_touched.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Resolve a write `target` to a **repo-relative, `..`-collapsed** path, or `None` if it
     /// escapes the soul repo. With a `repo_root`, an absolute target is relativized against
     /// it (and a `..`-escape above the root fails `strip_prefix`); without one (unit tests),
@@ -365,8 +454,44 @@ impl ActionResponder for StatePolicyResponder {
             ));
         }
 
-        // (2) Write-gating: a file write must sit under the state's writable_dirs.
+        // (1.7) Builtin file READS are confined to the soul ∪ the workspace ∪ the runtime's spill dir —
+        // `../dack.config.yaml`, `/duck/secrets`, another agent's host path are not the duck's to read. A
+        // read under the workspace is allowed and MARKS the invocation (the harness caps trust after the step).
+        if class == ToolClass::Read && is_builtin_file_read(&req.tool) {
+            if let Some(path) = &target_path {
+                if self.workspace_root_of(path).is_some() {
+                    self.mark_workspace_touched();
+                } else if !self.read_target_allowed(path) {
+                    return ActionDecision::Deny(format!(
+                        "`{path}` is outside your tree — you may read your soul (your working dir){}; another \
+                         machine's path, the harness config and its secrets are not yours to open.",
+                        if self.workspace_roots.is_empty() { String::new() } else {
+                            format!(" and your workspace ({})", self.workspace_roots.iter().map(|r| r.display().to_string()).collect::<Vec<_>>().join(", "))
+                        }
+                    ));
+                }
+            }
+        }
+
+        // (2) Write-gating: a file write must sit under the state's writable_dirs — or under the agent
+        //     WORKSPACE (beside the soul; its own trust gate, see 2c).
         if class == ToolClass::FileWrite {
+            // (2c) Workspace write: allowed in any state whose scope admits FileWrite (Perceive never does),
+            // but only for a cycle trusted at least `workspace.write_min_trust` — a stranger's message must not
+            // plant a file the duck will later read as its own. Marks the touch (the cap applies after).
+            if let Some(path) = &target_path {
+                if self.workspace_root_of(path).is_some() {
+                    if !self.workspace_writable {
+                        return ActionDecision::Deny(
+                            "the workspace is writable only by a trusted (org+) cycle — this one isn't. \
+                             Leave a note on your baton; do the write on a trusted wake."
+                                .into(),
+                        );
+                    }
+                    self.mark_workspace_touched();
+                    return ActionDecision::Allow;
+                }
+            }
             match &target_path {
                 Some(path) if self.write_target_allowed(path) => {
                     // (2a) Long-term memory gate: `memory/` is the duck's LONG-TERM memory, writable only
@@ -441,6 +566,36 @@ impl ActionResponder for StatePolicyResponder {
 fn is_delegation_tool(tool: &str) -> bool {
     let bare = tool.rsplit("__").next().unwrap_or(tool);
     bare.eq_ignore_ascii_case("Agent") || bare.eq_ignore_ascii_case("Task")
+}
+
+/// A builtin FILE read (as opposed to an MCP read-tier tool or a non-file builtin like `ToolSearch`).
+fn is_builtin_file_read(tool: &str) -> bool {
+    matches!(tool, "Read" | "FileRead" | "Grep" | "Glob" | "LS" | "NotebookRead")
+}
+
+/// Canonicalize the path, or — if it does not exist yet (a write target) — its nearest existing ancestor
+/// plus the remaining lexical tail; purely lexical when nothing exists. Follows symlinks on the existing
+/// part, so a symlink planted inside a root cannot alias a path outside it.
+fn canonical_or_lexical(p: &Path) -> PathBuf {
+    if let Ok(c) = std::fs::canonicalize(p) {
+        return c;
+    }
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = p.to_path_buf();
+    while let Some(parent) = cur.parent() {
+        if let Some(name) = cur.file_name() {
+            tail.push(name.to_os_string());
+        }
+        if let Ok(c) = std::fs::canonicalize(parent) {
+            let mut out = c;
+            for t in tail.iter().rev() {
+                out.push(t);
+            }
+            return out;
+        }
+        cur = parent.to_path_buf();
+    }
+    p.to_path_buf()
 }
 
 /// Lexically resolve `.`/`..` segments **without touching the filesystem** (a write target
@@ -655,6 +810,89 @@ mod tests {
         let post = req("mcp__twitter__post", json!({"text": "hi"}));
         assert!(matches!(r.decide(&post).await, ActionDecision::Allow));
         assert!(r.acted_outward(), "an allowed post is an outward action");
+    }
+
+    /// The WORKSPACE (beside the soul): a write there is allowed in an act state for a trusted cycle, denied
+    /// for an untrusted one, never in Perceive (no FileWrite in scope); a read there is allowed in every state
+    /// and MARKS the invocation (the harness caps trust after the step).
+    #[tokio::test]
+    async fn workspace_write_needs_trust_and_any_touch_is_marked() {
+        let ws = std::env::temp_dir().join(format!("dack-ws-wall-{}", std::process::id()));
+        std::fs::create_dir_all(ws.join("inbox")).unwrap();
+        let soul = std::env::temp_dir().join(format!("dack-soul-wall-{}", std::process::id()));
+        std::fs::create_dir_all(&soul).unwrap();
+        let (post, settle) = caps();
+        let trusted = StatePolicyResponder::with_capabilities(default_spec(ConsciousnessState::Express), post.clone(), settle.clone())
+            .with_repo_root(&soul)
+            .with_workspace(vec![ws.clone()], true, vec![]);
+        let draft = ws.join("outbox/draft.md").to_string_lossy().into_owned();
+        assert!(matches!(trusted.decide(&req("Write", json!({"file_path": draft, "contents": "x"}))).await, ActionDecision::Allow));
+        assert!(trusted.touched_workspace(), "a workspace write marks the touch");
+        // the soul's own rules are untouched: memory/ still writable, skills/ still not
+        assert!(matches!(trusted.decide(&req("Write", json!({"file_path": soul.join("memory/x.md").to_string_lossy(), "contents": "x"}))).await, ActionDecision::Allow));
+        assert!(matches!(trusted.decide(&req("Write", json!({"file_path": soul.join("skills/x.md").to_string_lossy(), "contents": "x"}))).await, ActionDecision::Deny(_)));
+
+        let untrusted = StatePolicyResponder::with_capabilities(default_spec(ConsciousnessState::Express), post.clone(), settle.clone())
+            .with_repo_root(&soul)
+            .with_workspace(vec![ws.clone()], false, vec![]);
+        match untrusted.decide(&req("Write", json!({"file_path": draft, "contents": "x"}))).await {
+            ActionDecision::Deny(m) => assert!(m.contains("trusted (org+)"), "{m}"),
+            other => panic!("untrusted cycle must not write the workspace: {other:?}"),
+        }
+        assert!(!untrusted.touched_workspace(), "a DENIED write is not a touch");
+        // reading is allowed regardless of write trust — and marks
+        let inbox = ws.join("inbox/doc.md").to_string_lossy().into_owned();
+        assert!(matches!(untrusted.decide(&req("Read", json!({"file_path": inbox}))).await, ActionDecision::Allow));
+        assert!(untrusted.touched_workspace());
+
+        // Perceive: read-only by scope — a workspace write is denied like any write, a read is fine
+        let perceive = StatePolicyResponder::with_capabilities(default_spec(ConsciousnessState::Perceive), post, settle)
+            .with_repo_root(&soul)
+            .with_workspace(vec![ws.clone()], true, vec![]);
+        assert!(matches!(perceive.decide(&req("Write", json!({"file_path": draft, "contents": "x"}))).await, ActionDecision::Deny(_)));
+        assert!(matches!(perceive.decide(&req("Grep", json!({"pattern": "x", "path": ws.to_string_lossy()}))).await, ActionDecision::Allow));
+        assert!(perceive.touched_workspace());
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&soul);
+    }
+
+    /// Builtin reads are CONFINED: the soul, the workspace and the runtime's spill dir are readable;
+    /// the harness config, secrets, another machine's path and `/etc` are not. Relative paths stay
+    /// soul-relative; a pathless Grep (cwd = soul) is untouched. Nothing marks the workspace.
+    #[tokio::test]
+    async fn builtin_reads_are_confined_to_soul_workspace_and_spill_dir() {
+        let base = std::env::temp_dir().join(format!("dack-rd-{}", std::process::id()));
+        let soul = base.join("dack-soul");
+        let ws = base.join("workspace");
+        let spill = base.join("home/.openclaude");
+        for d in [&soul, &ws, &spill] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let (post, settle) = caps();
+        let r = StatePolicyResponder::with_capabilities(default_spec(ConsciousnessState::Perceive), post, settle)
+            .with_repo_root(&soul)
+            .with_workspace(vec![ws.clone()], false, vec![spill.clone()]);
+        let p = |x: &std::path::Path| x.to_string_lossy().into_owned();
+        for ok in [p(&soul.join("memory/goals.md")), "memory/goals.md".to_string(), p(&spill.join("projects/x/tool-results/1.txt")), p(&ws.join("repos/a/README.md"))] {
+            assert!(matches!(r.decide(&req("Read", json!({"file_path": ok}))).await, ActionDecision::Allow), "{ok} must be readable");
+        }
+        for bad in [p(&base.join("dack.config.yaml")), p(&base.join("secrets/buzz.key")), "/opt/data/looper-onboarding/docs/VERDICT.md".to_string(), "/etc/passwd".to_string(), "../dack.config.yaml".to_string()] {
+            match r.decide(&req("Read", json!({"file_path": bad}))).await {
+                ActionDecision::Deny(m) => assert!(m.contains("outside your tree"), "{bad}: {m}"),
+                other => panic!("{bad} must be denied, got {other:?}"),
+            }
+        }
+        assert!(matches!(r.decide(&req("Grep", json!({"pattern": "todo"}))).await, ActionDecision::Allow), "pathless grep runs in the soul");
+        assert!(r.touched_workspace(), "the workspace read above marked the touch");
+        // symlink escape: a link INSIDE the workspace pointing at the config is followed and refused
+        #[cfg(unix)]
+        {
+            std::fs::write(base.join("dack.config.yaml"), "secret: 1").unwrap();
+            std::os::unix::fs::symlink(base.join("dack.config.yaml"), ws.join("cfg.yaml")).unwrap();
+            let r2 = StatePolicyResponder::new(default_spec(ConsciousnessState::Perceive)).with_repo_root(&soul).with_workspace(vec![ws.clone()], false, vec![]);
+            assert!(matches!(r2.decide(&req("Read", json!({"file_path": p(&ws.join("cfg.yaml"))}))).await, ActionDecision::Deny(_)), "a symlink out of the workspace is followed and refused");
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// When the duck reaches for an `Agent`/`Task` tool to delegate — the strong coding-agent prior —

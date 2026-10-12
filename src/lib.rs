@@ -56,5 +56,6 @@ pub mod state;
 pub mod state_prompt;
 pub mod stimuli;
 pub mod webserver;
+pub mod workspace;
 
 pub use error::{DackError, Result};

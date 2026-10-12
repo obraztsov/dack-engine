@@ -19,8 +19,10 @@ use serde_json::Value;
 use crate::config::CapabilityPrefix;
 use crate::state::ToolClass;
 
-/// Returns `(class, target_path)`. `target_path` is `Some` only for file-write tools,
-/// extracted from the input so the responder can check it against `writable_dirs`.
+/// Returns `(class, target_path)`. `target_path` is `Some` for file-WRITE tools (checked against
+/// `writable_dirs`) and for builtin file-READ tools that name a path (`file_path` / `path` — the Read
+/// target or a Grep/Glob search root), so the responder can confine reads to the soul ∪ the workspace
+/// and notice a workspace touch. A pathless Grep/Glob (cwd = the soul) carries `None`.
 pub fn classify_tool(
     tool: &str,
     input: &Value,
@@ -68,7 +70,7 @@ pub fn classify_tool(
             if targets_private_dir(input) {
                 return (ToolClass::Other, None);
             }
-            (ToolClass::Read, None)
+            (ToolClass::Read, extract_path(input))
         }
 
         // NETWORK egress — reaches an arbitrary external URL / a search provider. Its OWN class
@@ -152,7 +154,13 @@ mod tests {
 
     #[test]
     fn reads_and_writes_classify() {
-        assert_eq!(classify_tool("Grep", &json!({}), &settle(), &post(), &read()).0, ToolClass::Read);
+        assert_eq!(classify_tool("Grep", &json!({}), &settle(), &post(), &read()), (ToolClass::Read, None));
+        // a builtin read CARRIES its path (confinement + the workspace touch); a pathless Grep carries None
+        assert_eq!(
+            classify_tool("Read", &json!({"file_path": "/duck/workspace/inbox/x.md"}), &settle(), &post(), &read()),
+            (ToolClass::Read, Some("/duck/workspace/inbox/x.md".into()))
+        );
+        assert_eq!(classify_tool("Glob", &json!({"pattern": "**/*.md", "path": "/duck/workspace"}), &settle(), &post(), &read()).1, Some("/duck/workspace".into()));
         let (c, p) = classify_tool("Write", &json!({"file_path": "memory/log.md"}), &settle(), &post(), &read());
         assert_eq!(c, ToolClass::FileWrite);
         assert_eq!(p.as_deref(), Some("memory/log.md"));

@@ -151,6 +151,15 @@ impl Harness {
                 tracing::info!("media GC: dropped {removed} media file(s) >{}d", self.config.media_retention_days);
             }
         }
+        // The agent WORKSPACE (beside the soul): ensure `inbox/ outbox/ repos/` exist, sweep stale inbox files.
+        {
+            let root = self.workspace_root();
+            crate::workspace::ensure_dirs(&root);
+            let removed = crate::workspace::gc_inbox(&root, self.config.workspace.inbox_retention_days, chrono::Utc::now().timestamp());
+            if removed > 0 {
+                tracing::info!("workspace inbox GC: dropped {removed} file(s) >{}d", self.config.workspace.inbox_retention_days);
+            }
+        }
         // Downtime → character: a restart enqueues a self-tier "back online" wake
         // that Perceives then Expresses (the duck may comment on having been away).
         self.enqueue_back_online().await;
@@ -809,6 +818,7 @@ impl Harness {
         let mut blocks = vec![orientation_block(
             prompt,
             &self.soul_root(),
+            Some((&self.workspace_root(), spec.tool_scope.allows(crate::state::ToolClass::FileWrite), &self.config.workspace.read_trust_cap)),
             &mcp_servers,
             &unavailable,
             cycle_trust,
@@ -948,9 +958,20 @@ impl Harness {
                 }
             }
         }
-        // Taint by ACTUAL access: the trust degradation from the tools this step really called.
+        // Taint by ACTUAL access: the trust degradation from the tools this step really called — and, when
+        // the step read or wrote the WORKSPACE, the configured cap (one directory, one tier: a public
+        // document and an org clone sit side by side and provenance does not survive the duck's edits).
         let tool_calls = recorder.take();
-        let accessed = self.accessed_trust(&tool_calls);
+        let mut accessed = self.accessed_trust(&tool_calls);
+        if recorder.touched_workspace() {
+            let cap = TrustTier::from(self.config.workspace.read_trust_cap.as_str());
+            let lattice = self.config.lattice();
+            accessed = Some(match accessed {
+                Some(a) => lattice.meet(&a, &cap),
+                None => cap,
+            });
+            tracing::debug!("step touched the workspace → trust capped at {}", self.config.workspace.read_trust_cap);
+        }
         // Honor the structured memory line (gated to a write-capable state); free-form tool writes
         // to memory/ are caught by the sweep. Then reconcile + author the runlog.
         let ctx = prompt.context();
@@ -1387,6 +1408,12 @@ impl Harness {
         // Protected memory files (e.g. `memory/INDEX.md`, injected into every context) are Reflect-only —
         // the wall denies a non-Reflect cycle writing them (same rule as prompts/stimuli/SOUL.md).
         responder.protected_paths = self.config.protected_memory_paths.clone();
+        // The agent WORKSPACE: writable only by a cycle trusted ≥ `workspace.write_min_trust`; any touch is
+        // marked and capped after the step (`workspace.read_trust_cap`). Builtin reads are confined to the
+        // soul ∪ the workspace ∪ the runtime's own spill dir (the SDK parks oversized tool results under
+        // `~/.openclaude/…/tool-results/` and the model reads them back — legitimate).
+        let ws_writable = self.config.lattice().permits(cycle_trust, &TrustTier::from(self.config.workspace.write_min_trust.as_str()));
+        responder = responder.with_workspace(vec![self.workspace_root()], ws_writable, runtime_spill_dirs());
         // Dry-run (testing): the wall denies these tool prefixes so the agent composes-but-doesn't-execute.
         responder.dry_run_block = self.config.dry_run.active_block();
         RecordingResponder::wrap(responder)
@@ -1528,6 +1555,9 @@ impl Harness {
                         "MEDIA_DIR".to_string(),
                         crate::media::dir(&self.config.media_dir).to_string_lossy().into_owned(),
                     );
+                    // Every MCP server also sees WORKSPACE_DIR (ABSOLUTE): the agent workspace, where file-sending
+                    // tools resolve a path and buzz-git clones. Benign for servers that don't use it.
+                    extra_env.insert("WORKSPACE_DIR".to_string(), self.workspace_root().to_string_lossy().into_owned());
                     for (var, field) in &server.scope_env {
                         // Reserved field `dedup_key` resolves to the Stimulus's conversation key (not a
                         // payload field) — the platform-agnostic conversation TAG (telegram chat_id /
@@ -1994,6 +2024,11 @@ impl Harness {
         TrustTier::from(self.config.memory_write_min_trust.as_str())
     }
 
+    /// The agent workspace root (absolute), from `config.workspace.dir`.
+    fn workspace_root(&self) -> PathBuf {
+        crate::workspace::dir(&self.config.workspace.dir)
+    }
+
     /// Apply `AgentOutput.tag_notes` → the SHORT-TERM tag-notes catalogue. Any cycle may leave notes
     /// (incl. read-only Perceive) — they are harness-authored breadcrumbs, NOT a long-term `memory/`
     /// write. The harness AUTO-STAMPS each note's `trust` from the cycle's taint (`cycle_trust`), so
@@ -2298,6 +2333,18 @@ enum StepInput {
 /// fan-out sibling), and the diff must cover the whole wake — every entry this wake writes carries
 /// `received_at`, so anything ≥ it would otherwise be invisible. `received_at - 1` because the query is
 /// strict (`ts > watermark`).
+/// Directories the RUNTIME itself writes and the model legitimately reads back — the OpenClaude SDK parks an
+/// oversized tool result under `$HOME/.openclaude/projects/<cwd>/<session>/tool-results/` and tells the model
+/// to `Read` it. Builtin reads are otherwise confined to the soul ∪ the workspace.
+fn runtime_spill_dirs() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(home) = std::env::var("HOME") {
+        out.push(PathBuf::from(&home).join(".openclaude"));
+        out.push(PathBuf::from(&home).join(".claude"));
+    }
+    out
+}
+
 fn sibling_watermark(last_used: i64, received_at: i64) -> i64 {
     last_used.min(received_at - 1)
 }
@@ -2449,6 +2496,7 @@ fn trust_abbrev(trust: &str) -> &str {
 fn orientation_block(
     prompt: &StatePrompt,
     soul_root: &std::path::Path,
+    workspace: Option<(&std::path::Path, bool, &str)>,
     mcp_servers: &BTreeMap<String, serde_json::Value>,
     unavailable: &[UnavailableMcp],
     cycle_trust: &TrustTier,
@@ -2485,10 +2533,19 @@ fn orientation_block(
     // Live facts only — SOUL.md says how to use them (navigation, the one-outward-action rule, …).
     // `now` is AUTHORITATIVE and lives here (sent on every message, fresh + resume) so a resumed
     // session never reads a stale clock — unlike the SDK's memoized date, which freezes at bridge start.
+    // The workspace line: where it is, whether THIS state may write it, and the price of touching it.
+    let workspace_line = match workspace {
+        Some((root, writable, cap)) => format!(
+            "\nworkspace: {} ({}; inbox/ = documents sent to you, repos/ = cloned Buzz repos; reading or writing anything in it caps this cycle's trust at `{cap}` for the next steps)",
+            root.display(),
+            if writable { "read-write here" } else { "READ-ONLY here — write it from an act state" }
+        ),
+        None => String::new(),
+    };
     let body = format!(
         "now: {} (authoritative — this is the real current time)\n\
          state: {:?} (prompt `{}`)\n\
-         working_dir: {}\n\
+         working_dir: {}{}\n\
          capabilities_this_step: {}{}\n\
          cycle_trust: {} -> may reach up to: {:?}\n\
          next_steps: see the allowed-transitions block.",
@@ -2496,6 +2553,7 @@ fn orientation_block(
         prompt.state,
         prompt.id,
         soul_root.display(),
+        workspace_line,
         caps,
         unavailable_line,
         cycle_trust.name(),
@@ -2691,6 +2749,11 @@ impl RecordingResponder {
     /// safety check). Valid even when the bridge later hung, since the wall recorded it in real time.
     fn acted_outward(&self) -> bool {
         self.inner.acted_outward()
+    }
+
+    /// Did this invocation read or write the agent workspace? (→ the post-step trust cap)
+    fn touched_workspace(&self) -> bool {
+        self.inner.touched_workspace()
     }
 }
 
@@ -4317,19 +4380,33 @@ mod tests {
             BTreeMap::from([("recall".to_string(), serde_json::json!({})), ("cove-read".to_string(), serde_json::json!({}))]);
 
         // Nothing missing → no unavailable line at all; both servers listed as capabilities.
-        let clean = orientation_block(&p, Path::new("/soul"), &servers, &[], &TrustTier::self_(), ConsciousnessState::Reflect);
+        let clean = orientation_block(&p, Path::new("/soul"), None, &servers, &[], &TrustTier::self_(), ConsciousnessState::Reflect);
         assert!(clean.body.contains("capabilities_this_step: mcp__cove-read__*, mcp__recall__*"));
         assert!(!clean.body.contains("unavailable_this_step"), "no line when nothing is missing");
 
         // cove-read flagged unavailable → named with reason + the do-not-invent-names guard, AND
         // DROPPED from capabilities_this_step (never listed as both available and unavailable).
         let un = vec![UnavailableMcp { name: "cove-read".into(), reason: "connection failed".into() }];
-        let flagged = orientation_block(&p, Path::new("/soul"), &servers, &un, &TrustTier::self_(), ConsciousnessState::Reflect);
+        let flagged = orientation_block(&p, Path::new("/soul"), None, &servers, &un, &TrustTier::self_(), ConsciousnessState::Reflect);
         assert!(flagged.body.contains("unavailable_this_step: cove-read (connection failed)"), "{}", flagged.body);
         assert!(flagged.body.contains("do NOT attempt"));
         assert!(flagged.body.contains("capabilities_this_step: mcp__recall__*"), "{}", flagged.body);
         assert!(!flagged.body.contains("mcp__cove-read__*"), "a flagged server is not also listed available: {}", flagged.body);
         assert!(flagged.trusted, "orientation is harness-authored/trusted");
+    }
+
+    #[test]
+    fn orientation_block_names_the_workspace_and_its_price() {
+        use std::path::Path;
+        let p = StatePrompt::parse("perceive", "---\nstate: perceive\n---\nx").unwrap();
+        let servers = BTreeMap::new();
+        let ro = orientation_block(&p, Path::new("/soul"), Some((Path::new("/duck/workspace"), false, "org")), &servers, &[], &TrustTier::self_(), ConsciousnessState::Reflect);
+        assert!(ro.body.contains("workspace: /duck/workspace (READ-ONLY here"), "{}", ro.body);
+        assert!(ro.body.contains("caps this cycle's trust at `org`"));
+        let rw = orientation_block(&p, Path::new("/soul"), Some((Path::new("/duck/workspace"), true, "public")), &servers, &[], &TrustTier::self_(), ConsciousnessState::Reflect);
+        assert!(rw.body.contains("read-write here") && rw.body.contains("`public`"));
+        let none = orientation_block(&p, Path::new("/soul"), None, &servers, &[], &TrustTier::self_(), ConsciousnessState::Reflect);
+        assert!(!none.body.contains("workspace:"));
     }
 
     /// Reply targeting (firebreak): `resolve_scope_override` returns the in-batch item a `reply_to`

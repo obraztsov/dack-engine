@@ -481,7 +481,10 @@ impl Harness {
         // Swallowed-answer op-notification (opt-in on the ENTRY prompt's frontmatter): if this cycle
         // produces NOTHING — zero outward tool calls across every step AND zero batons — the reply likely
         // died in a thought (or a housekeeping cycle silently no-op'd). Track across the whole dispatch.
-        let entry_notify_on_silent = current.notify_on_silent;
+        let entry_notify_on_silent = match self.duty_notify_on_silent(&stimulus.source).await {
+            Some(v) => v, // the duty says so (a group duty may silence a shared DM prompt's alert)
+            None => current.notify_on_silent,
+        };
         let entry_prompt_id = current.id.clone();
         let mut acted_outward_any = false;
         let mut produced_baton_any = false;
@@ -1267,6 +1270,20 @@ impl Harness {
 
     /// Read + parse a state-prompt by id (`prompts/<id>.md`) live from the soul repo (Reflect edits
     /// take effect next wake). Errors if the file is missing/empty or its frontmatter is malformed.
+    /// The firing duty's own `notify_on_silent` (its `STIMULUS.md` frontmatter), if it declares one.
+    /// Read from the soul at dispatch, so no queue column and no payload field is needed; a duty without
+    /// a file (cron-less internal sources, tests) simply yields `None` ⇒ the prompt's flag applies.
+    async fn duty_notify_on_silent(&self, source: &str) -> Option<bool> {
+        let path = format!("stimuli/{source}/STIMULUS.md");
+        let bytes = self.repo.read_file(&RepoPath(path)).await.ok()?;
+        if bytes.is_empty() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        let (yaml, _) = crate::stimuli::split_frontmatter(&text).ok()?;
+        serde_yaml::from_str::<crate::stimuli::StimulusFrontmatter>(yaml).ok()?.notify_on_silent
+    }
+
     async fn resolve_state_prompt(&self, id: &str) -> Result<StatePrompt> {
         let path = StatePrompt::repo_path(id);
         let bytes = self.repo.read_file(&RepoPath(path.clone())).await?;

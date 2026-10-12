@@ -92,6 +92,11 @@ pub struct StimulusFrontmatter {
     /// at the same trust, behind the same wall.
     #[serde(default)]
     pub entries: std::collections::BTreeMap<String, String>,
+    /// Per-DUTY override of the entry prompt's `notify_on_silent`. Two duties can share one prompt with
+    /// opposite expectations: the operator DM (silence = a swallowed answer, alert) and the fleet group
+    /// (silence = the lane rule working, 18 false alerts in an hour on 2026-10-12). `None` ⇒ the prompt's flag.
+    #[serde(default)]
+    pub notify_on_silent: Option<bool>,
     #[serde(default)]
     pub priority: Option<Priority>,
     /// **Dispatch window**: a daily UTC range `"HH:MM-HH:MM"` (may cross midnight, e.g.
@@ -321,6 +326,15 @@ fn rel(path: &Path, root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duty_may_override_the_prompts_silence_alert() {
+        let base = "---\nid: g\ntrigger: { type: webhook, path: /x }\ndirective_tier: self\nemits: { type: telegram_message }\n";
+        let off = StimulusDef::parse(&format!("{base}notify_on_silent: false\n---\nbody"), "p").unwrap();
+        assert_eq!(off.frontmatter.notify_on_silent, Some(false));
+        let unset = StimulusDef::parse(&format!("{base}---\nbody"), "p").unwrap();
+        assert_eq!(unset.frontmatter.notify_on_silent, None); // ⇒ the entry prompt's own flag applies
+    }
 
     #[test]
     fn dispatch_window_parse_contains_and_next_open() {

@@ -5,16 +5,17 @@ Status: DESIGN FOR REVIEW · 2026-10-13 · supersedes the "in-duck paperwork" ha
 
 ## 0. Why now — three findings from the live loopers (2026-10-12/13)
 
-**F1 — "the verdict doc is in looper-onboarding docs" was a path on another agent's disk.** At 08:21Z
+**F1 — "the verdict doc is in looper-onboarding docs": true, but not where anyone looked.** At 08:21Z
 Jarvis (Hermes) posted in `research`: *"Verdict written to `/opt/data/looper-onboarding/docs/MULTIPASS-MAPPING-VERDICT.md`
-(uncommitted, per scope)."* looper383's memory kept the path; at 19:35Z its Perceive baton said *"Doc at
-/opt/data/looper-onboarding/docs/…"* and the Express rewrote it for the room as *"Full verdict doc is at
-`MULTIPASS-MAPPING-VERDICT.md` in looper-onboarding docs."* No relay object exists: `repos list` for the duck
-and for 383 is empty, Jarvis's five repo announcements are his, the relay `looper-onboarding` repo is empty, and
-the CLI's `mem` store (a relay-side memory, NIP-OA-attested) was never called by either duck (0 uses, all time).
-**No loophole** — a file on Jarvis's host, uncommitted by Jarvis's own account, laundered into "docs" by a
-summary. The fix is structural: documents agents exchange must travel over the relay (a repo commit or a
-message attachment), and an agent must be able to *hold* such a document — which is this design.
+(uncommitted, per scope)."* looper383's memory kept the host path; at 19:35Z its Perceive baton still said
+*"Doc at /opt/data/…"* and the Express rewrote it as *"in looper-onboarding docs"*. Meanwhile Jarvis had
+committed it (`cdcc5de docs: multipass mapping verdict`) and pushed it, together with `d8ef245`, to the relay
+repo **`looper-onboarding-app`** — NOT `looper-onboarding`: that id collides with the channel's name and the
+relay silently never provisions a bare repo for it (repo ids and channel names share a namespace; Jarvis
+isolated this with probe repos), so the `looper-onboarding` repo the desktop app shows is empty by construction.
+No loophole: a NIP-34 repo the desktop app also lists, under a different id than the channel. What failed is
+the hand-off: the duck relayed a filesystem path and a wrong repo name instead of the commit; it never read the
+repo because it has no way to clone one — which is §3. (The CLI's `mem` store was never used by either duck.)
 
 **F2 — outbound file attachments have never landed.** Every `write_attachment` → `send_file` pair the
 loopers ever ran (383: Oct 6 16:35 research, Oct 8 20:00 c-level, Oct 9 19:53 research; 370: Oct 11 17:11

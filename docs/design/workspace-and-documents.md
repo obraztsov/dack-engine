@@ -1,6 +1,6 @@
 # Agent workspace, documents over Buzz, and the end of in-duck workers
 
-Status: DESIGN FOR REVIEW · 2026-10-13 · supersedes the "in-duck paperwork" half of
+Status: DECIDED + SHIPPED (phases 0–5, 2026-10-13; see §9) · supersedes the "in-duck paperwork" half of
 `document-attachments.md` (its constraints C1/C2 and the Hermes-via-Buzz recommendation still hold).
 
 ## 0. Why now — three findings from the live loopers (2026-10-12/13)
@@ -251,3 +251,20 @@ Phase 4 is independent of 1–3 and can go first if you prefer the deletion out 
 - **D. Git identity:** commits authored as `Looper #<id> <looper-<id>@<relay-host>>` with a `Buzz-Pubkey:` trailer; pushes only to origin.
 - **E. Aliases:** keep `write_attachment`/`read_attachment` one release, or remove with the workers.
 - **F. Phase order:** 0→1→2→3→4→5 as above, or workers-first.
+
+## 9. What shipped (2026-10-13)
+
+| phase | commit(s) | live |
+|---|---|---|
+| 4 workers removed | engine `292f568`, soul-template `c4b0551`, duck-loop `a4d905a`, looper-template `e0766ca` | both loopers |
+| 0 send test | two probes from looper370: the buzz CLI refuses text uploads client-side (see §7 row 0) | — |
+| 1 workspace + wall + trust | engine `d4f4da7` (`src/workspace.rs`, `WorkspaceConfig`, wall roots/confinement/touch-cap, orientation line, `WORKSPACE_DIR`) | both loopers (`/duck/workspace/{inbox,outbox,repos}`) |
+| 2 documents | engine `f3ee688` (workspace paths in every egress tool, inbox routing in both ingresses, confined `--file`/`--patch-file`/`--body-file`, module base env) | both loopers |
+| 3 buzz-git | engine `95b5d52` + `63cce46` (`nip98.ts`, `buzz-git.ts`, `buzz-git-mcp.ts`); live clone of `looper-onboarding-app` verified from a container with a duck key | registered on both loopers (`tier: post`, `trust: org`, `min_trust: org`) |
+| 5 prompts + retirement | looper-template `5ca59ae`, engine `545c000` (outbox + media-read servers deleted); configs patched (media/outbox out, buzz-git in) | souls 383 `1be5f76`, 370 `fb4bf09` |
+
+Decisions taken: A1 (beside the soul), defaults org/org/30d, read confinement on, git identity = the Buzz
+key (`buzz:<pubkey12>` + `Buzz-Pubkey:` trailer), aliases dropped with the workers, workers first.
+Relay facts learned in phase 3: one NIP-98 header per git invocation (two → 400), the relay ignores the
+`method` tag, `u` must be the repo base URL. Open: the buzz CLI's text-upload refusal (pond project);
+`skills::confine_attachment` (Rust skill egress) still resolves media-store basenames only.

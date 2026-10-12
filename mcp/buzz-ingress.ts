@@ -16,14 +16,16 @@
  * BUZZ_PRIVATE_KEY is injected by the module's `buzz_key` secret; never logged.
  */
 
-import { openRoutesStore, lookupArm } from './ingress-routes'
+import { openRoutesStore, lookupArm, upsertChannels } from './ingress-routes'
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
 import { join, isAbsolute, resolve as resolvePath } from 'node:path'
 
 // ── config ───────────────────────────────────────────────────────────────────────────────────────
 
 interface ChannelCfg {
-  id: string
+  // Match by `id` OR by `name` (case-insensitive): an operator writes `{ name: "marketing", trust: "org" }`
+  // and never copies a UUID; the relay is the authority on which id that name has today.
+  id?: string
   name?: string
   trust?: string // override
   // Per-channel wake policy: 'all' = every message by someone else wakes the duck (org rooms — so a peer's
@@ -314,8 +316,13 @@ function rememberOwn(id: string): void {
 
 // ── trust ──────────────────────────────────────────────────────────────────────────────────────────
 
+/** The operator's config entry for a relay channel — by id, or by name (case-insensitive). */
+function cfgFor(ch: { id: string; name?: string }): ChannelCfg | undefined {
+  return cfg.channels.find((c) => (c.id && c.id === ch.id) || (!c.id && c.name && ch.name && c.name.toLowerCase() === ch.name.toLowerCase()))
+}
+
 function tierFor(ch: { id: string; name?: string }): string {
-  const ov = cfg.channels.find((c) => c.id === ch.id)?.trust
+  const ov = cfgFor(ch)?.trust
   if (ov) return ov
   return (ch.name ?? '').toLowerCase() === 'dm' ? cfg.dm_default_trust : cfg.default_trust
 }
@@ -327,9 +334,21 @@ function discover(): void {
   const list = buzz(['channels', 'list'])
   if (Array.isArray(list)) {
     channels = list.map((c: any) => ({ id: c.channel_id, name: c.name }))
-    log(`watching ${channels.length} channel(s): ${channels.map((c) => c.name ?? c.id.slice(0, 8)).join(', ')}`)
+    // Publish the CHANNEL INDEX (name ⇄ id + the trust this config assigns) for the Buzz MCPs, which resolve
+    // `--channel <name>` against it — the duck addresses rooms by name, never by a remembered UUID.
+    try {
+      upsertChannels(routes, channels.map((c) => ({ id: c.id, name: c.name ?? c.id.slice(0, 8), trust: tierFor(c), configured: !!cfgFor(c) })))
+    } catch (e) {
+      log('channel index write failed:', (e as Error).message)
+    }
+    const unmatched = cfg.channels.filter((c) => !c.id && c.name && !channels.some((ch) => ch.name?.toLowerCase() === c.name!.toLowerCase()))
+    if (unmatched.length) log(`config names the relay does not list (not a member yet?): ${unmatched.map((c) => c.name).join(', ')}`)
+    const summary = channels.map((c) => `${c.name ?? c.id.slice(0, 8)}:${tierFor(c)}${cfgFor(c) ? '' : '?'}`).join(', ')
+    if (summary !== lastSummary) log(`watching ${channels.length} channel(s): ${summary}`)
+    lastSummary = summary
   }
 }
+let lastSummary = ''
 
 async function post(ch: { id: string; name?: string }, ev: Ev, kind: 'mention' | 'reply_to_own' | 'message'): Promise<void> {
   const tier = tierFor(ch)
@@ -401,7 +420,7 @@ async function pollChannel(ch: { id: string; name?: string }): Promise<void> {
     // Per-channel 'all': in an org room every message by someone else is delivered (coalesce folds a
     // burst into one wake). The prompt's lane rule decides whether to ANSWER; the ingress only ensures
     // the duck SEES it — a peer's untagged question used to be invisible here.
-    const isAll = cfg.channels.find((c) => c.id === ch.id)?.wake === 'all'
+    const isAll = cfgFor(ch)?.wake === 'all'
     if (isMention || isReply || isAll) {
       seen.add(ev.id)
       await post(ch, ev, isMention ? 'mention' : isReply ? 'reply_to_own' : 'message')

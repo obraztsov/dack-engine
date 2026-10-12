@@ -127,6 +127,32 @@ export function applySendDefaults(
   return out
 }
 
+export type ChannelLookup = (ref: string) => { ok: true; id: string; name: string | null; trust: string | null; configured: boolean } | { ok: false; error: string }
+export type ResolvedChannels = { ok: true; args: string[]; channels: { id: string; name: string | null; trust: string | null; configured: boolean }[] } | { ok: false; error: string }
+
+/**
+ * Rewrite every `--channel <ref>` / `--channel=<ref>` through the channel index: a NAME becomes its id, an
+ * id passes through (annotated), an unknown name REFUSES the whole command (nothing is sent). Pure over
+ * `lookup`, so it is tested without a database. Flags with other names (`--repo-id`, …) are untouched.
+ */
+export function resolveChannelFlags(args: string[], lookup: ChannelLookup): ResolvedChannels {
+  const out: string[] = []
+  const channels: ResolvedChannels extends { ok: true; channels: infer C } ? C : never = []
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]
+    const inline = a.startsWith('--channel=')
+    if (a !== '--channel' && !inline) { out.push(a); continue }
+    const ref = inline ? a.slice('--channel='.length) : args[i + 1]
+    if (ref === undefined) { out.push(a); continue }
+    const r = lookup(ref)
+    if (!r.ok) return { ok: false, error: r.error }
+    channels.push({ id: r.id, name: r.name, trust: r.trust, configured: r.configured })
+    if (inline) out.push(`--channel=${r.id}`)
+    else { out.push('--channel', r.id); i++ }
+  }
+  return { ok: true, args: out, channels }
+}
+
 /** Returns the offending flag + the tool to use instead, or null. Handles `--flag=value` too. */
 export function rejectsHostPathFlag(args: string[]): { flag: string; use: string } | null {
   for (const a of args) {

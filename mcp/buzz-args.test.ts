@@ -1,5 +1,5 @@
 import { test, expect } from 'bun:test'
-import { DEFAULT_DENY, deniedVerb, rejectsHostPathFlag, applySendDefaults, flagValue } from './buzz-args'
+import { DEFAULT_DENY, deniedVerb, rejectsHostPathFlag, applySendDefaults, flagValue, resolveChannelFlags } from './buzz-args'
 
 const DENY = DEFAULT_DENY.map((d) => d.toLowerCase())
 
@@ -195,4 +195,23 @@ test('the flag-value bypass cannot smuggle a write past the read allowlist', () 
   expect(readOnlyVerb(['--auth-tag', '{}', 'canvas', 'set', '--channel', 'c', '--content', 'x'])).toBeNull()
   // ...and a legitimately-prefixed read still passes
   expect(readOnlyVerb(['--format', 'compact', 'messages', 'get', '--channel', 'c'])).toBe('messages get')
+})
+
+test('resolveChannelFlags: names → ids on every --channel form, ids annotated, unknown name refuses the whole argv', () => {
+  const lookup = (ref: string) =>
+    ref === 'research' ? { ok: true as const, id: 'A-ID', name: 'research', trust: 'org', configured: true }
+    : ref === 'A-ID' || ref === 'B-ID' ? { ok: true as const, id: ref, name: ref === 'B-ID' ? 'marketing' : 'research', trust: 'org', configured: true }
+    : { ok: false as const, error: `no channel named "${ref}"` }
+  const r1 = resolveChannelFlags(['messages', 'send', '--channel', 'research', '--content', 'hi'], lookup)
+  expect(r1).toMatchObject({ ok: true, args: ['messages', 'send', '--channel', 'A-ID', '--content', 'hi'] })
+  if (r1.ok) expect(r1.channels[0]).toMatchObject({ id: 'A-ID', name: 'research' })
+  const r2 = resolveChannelFlags(['canvas', 'get', '--channel=research'], lookup)
+  expect(r2).toMatchObject({ ok: true, args: ['canvas', 'get', '--channel=A-ID'] })
+  const r3 = resolveChannelFlags(['messages', 'send', '--channel', 'B-ID', '--content', 'x'], lookup)
+  if (r3.ok) expect(r3.channels[0].name).toBe('marketing') // the id the live duck guessed, now labelled
+  const r4 = resolveChannelFlags(['messages', 'send', '--channel', 'reserch', '--content', 'x'], lookup)
+  expect(r4.ok).toBe(false)
+  // other flags and a dangling --channel are left alone
+  expect(resolveChannelFlags(['issues', 'list', '--repo-id', 'research'], lookup)).toMatchObject({ ok: true, args: ['issues', 'list', '--repo-id', 'research'] })
+  expect(resolveChannelFlags(['channels', 'get', '--channel'], lookup)).toMatchObject({ ok: true, args: ['channels', 'get', '--channel'] })
 })

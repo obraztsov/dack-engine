@@ -27,6 +27,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
 import { openRoutesStore, armThread, sanitizeTags } from './ingress-routes'
 import { execBuzz } from './buzz-exec'
+import { openChannelIndex, resolveOne } from './buzz-channels'
 
 const DB = process.env.INGRESS_ROUTES_DB
 const SELF = (process.env.BUZZ_SELF_PUBKEY ?? '').trim()
@@ -82,8 +83,11 @@ server.registerTool(
   async ({ thread_root, entry_hint, tags, channel, ttl_hours }: { thread_root: string; entry_hint: string; tags: string[]; channel?: string; ttl_hours?: number }) => {
     if (!DB) return asText({ ok: false, error: 'INGRESS_ROUTES_DB not set' })
     if (!ENTRIES.length) return asText({ ok: false, error: 'no stances available on this wake — nothing to arm' })
-    const ch = channel || process.env.BUZZ_REPLY_CHANNEL
-    if (!ch) return asText({ ok: false, error: 'no channel: pass `channel` explicitly' })
+    const want = channel || process.env.BUZZ_REPLY_CHANNEL
+    if (!want) return asText({ ok: false, error: 'no channel: pass `channel` explicitly' })
+    const rc = resolveOne(openChannelIndex(DB), want) // a channel NAME or id
+    if (!rc.ok) return asText({ ok: false, error: rc.error })
+    const ch = rc.id
     const member = await weAreInThread(ch, thread_root)
     if (!member.ok) {
       console.error(`[ingress-arm] REFUSED root=${thread_root.slice(0, 8)} — ${member.why}`)

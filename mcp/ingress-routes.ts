@@ -10,6 +10,12 @@
  * "wrong tone at the same trust", nothing more.
  *
  * Rows expire (TTL) — a stale arm is how a routing bug becomes a mystery. Lookup purges lazily.
+ *
+ * The same file carries the CHANNEL INDEX (`channels`): the ingress upserts every channel the relay lists
+ * (id, name, the trust its config assigns) on each discovery, and the Buzz MCPs resolve `--channel <name>`
+ * against it — so the duck addresses rooms by NAME. The relay stays the authority on names; this is a
+ * cache, refreshed every discover interval. Why: 2026-10-12 a duck forwarded an org brief "to research"
+ * with the one UUID it had seen recently — marketing's. A UUID is not a thing a mind remembers; a name is.
  */
 import { Database } from 'bun:sqlite'
 
@@ -30,7 +36,66 @@ export function openRoutesStore(path: string): Database {
     armed_at    INTEGER NOT NULL,
     expires_at  INTEGER NOT NULL
   )`)
+  db.exec(`CREATE TABLE IF NOT EXISTS channels (
+    id         TEXT PRIMARY KEY,
+    name       TEXT NOT NULL,
+    trust      TEXT NOT NULL,
+    configured INTEGER NOT NULL DEFAULT 0,
+    seen_at    INTEGER NOT NULL
+  )`)
   return db
+}
+
+// ── channel index ──────────────────────────────────────────────────────────────────────────────────
+
+export type ChannelRow = { id: string; name: string; trust: string; configured: boolean; seen_at: number }
+export type ChannelRef =
+  | { ok: true; id: string; name: string | null; trust: string | null; configured: boolean }
+  | { ok: false; error: string; known: string[] }
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+/** A relay channel id (uuid) or another opaque id (a DM channel, 64-hex) — passed through, never "resolved". */
+export const looksLikeChannelId = (v: string): boolean => UUID_RE.test(v) || /^[0-9a-f]{16,}$/i.test(v)
+
+/** Replace the index with what the relay lists now (a channel that vanished from the relay vanishes here). */
+export function upsertChannels(db: Database, rows: { id: string; name: string; trust: string; configured: boolean }[], now = Math.floor(Date.now() / 1000)): void {
+  const tx = db.transaction((rs: typeof rows) => {
+    db.run('DELETE FROM channels')
+    const q = db.query('INSERT INTO channels (id, name, trust, configured, seen_at) VALUES (?, ?, ?, ?, ?)')
+    for (const r of rs) q.run(r.id, r.name, r.trust, r.configured ? 1 : 0, now)
+  })
+  tx(rows)
+}
+
+export function listChannels(db: Database): ChannelRow[] {
+  return (db.query('SELECT * FROM channels ORDER BY configured DESC, name').all() as any[]).map((r) => ({ ...r, configured: !!r.configured }))
+}
+
+/**
+ * Resolve what the model wrote for a channel: an id passes through (annotated with its name when indexed);
+ * anything else must match exactly ONE indexed name (case-insensitive, surrounding `#` tolerated). Unknown
+ * or ambiguous ⇒ refused with the directory — a name that matches nothing is a typo or a hallucination,
+ * never a judgment call, and the relay would reject it anyway (as a 400 the model cannot read).
+ */
+export function resolveChannel(db: Database, ref: string): ChannelRef {
+  const rows = listChannels(db)
+  if (looksLikeChannelId(ref)) {
+    const r = rows.find((c) => c.id.toLowerCase() === ref.toLowerCase())
+    return { ok: true, id: ref, name: r?.name ?? null, trust: r?.trust ?? null, configured: !!r?.configured }
+  }
+  const want = ref.trim().replace(/^#/, '').toLowerCase()
+  const hits = rows.filter((c) => c.name.toLowerCase() === want)
+  const known = rows.map((c) => c.name)
+  if (hits.length === 1) return { ok: true, id: hits[0].id, name: hits[0].name, trust: hits[0].trust, configured: hits[0].configured }
+  if (hits.length > 1) return { ok: false, error: `channel name "${ref}" is ambiguous (${hits.length} channels share it) — use the id`, known }
+  return { ok: false, error: `no channel named "${ref}" — known channels: ${known.join(', ') || '(index empty — the ingress has not discovered yet)'}`, known }
+}
+
+/** One line for a tool description: the rooms this duck can name, configured (org) ones first. */
+export function channelDirectoryLine(db: Database): string {
+  const rows = listChannels(db)
+  if (!rows.length) return ''
+  return rows.map((c) => `${c.name} (${c.trust}${c.configured ? '' : ', unconfigured'})`).join(' · ')
 }
 
 const TAG_RE = /^[A-Za-z0-9][A-Za-z0-9\-_:./]{0,79}$/

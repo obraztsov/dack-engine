@@ -28,8 +28,9 @@ import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { resolveAttachment } from './attachments'
 import { execBuzz, stripIdentityFlags, BUZZ_BIN, BUZZ_RELAY, type BuzzResult } from './buzz-exec'
-import { DEFAULT_DENY, deniedVerb, rejectsHostPathFlag, applySendDefaults } from './buzz-args'
+import { DEFAULT_DENY, deniedVerb, rejectsHostPathFlag, applySendDefaults, resolveChannelFlags, flagValue } from './buzz-args'
 import { registerOwnRepliesTool } from './buzz-thread'
+import { openChannelIndex, resolveOne } from './buzz-channels'
 
 const MEDIA_DIR = process.env.MEDIA_DIR
 
@@ -39,15 +40,36 @@ const DENY = (process.env.BUZZ_CLI_DENY ?? DEFAULT_DENY.join(','))
 
 const asText = (v: unknown) => ({ content: [{ type: 'text' as const, text: typeof v === 'string' ? v : JSON.stringify(v) }] })
 
-function runBuzz(rawArgs: string[]): Promise<BuzzResult> {
-  // Identity/relay flags stripped, then the wake-scoped send defaults (pure, unit-tested in buzz-args.ts —
-  // that defaulting is exactly what silently broke cross-channel sends). Spawning itself is shared with
-  // the read-only server via `execBuzz` so hardening is written once.
-  const args = applySendDefaults(stripIdentityFlags(rawArgs), {
+// The channel directory (names ⇄ ids) the ingress maintains. Opened once per server (one server per step).
+const CHANNELS = openChannelIndex()
+
+async function runBuzz(rawArgs: string[]): Promise<BuzzResult & { channel?: unknown }> {
+  // Identity/relay flags stripped; `--channel <name>` resolved to its id through the ingress index (an
+  // unknown name refuses the whole command — nothing is sent to a guessed room); then the wake-scoped send
+  // defaults (pure, unit-tested in buzz-args.ts — that defaulting is exactly what silently broke
+  // cross-channel sends). Spawning itself is shared with the read-only server via `execBuzz`.
+  let clean = stripIdentityFlags(rawArgs)
+  if (CHANNELS) {
+    const r = resolveChannelFlags(clean, CHANNELS.lookup)
+    if (!r.ok) {
+      console.error(`[buzz-cli] REFUSED unresolved channel: ${r.error.slice(0, 120)}`)
+      return { ok: false, error: `${r.error} (nothing was sent)` }
+    }
+    clean = r.args
+  }
+  const args = applySendDefaults(clean, {
     replyChannel: process.env.BUZZ_REPLY_CHANNEL,
     replyTo: process.env.BUZZ_REPLY_TO,
   })
-  return execBuzz(args, 'buzz-cli')
+  const res = await execBuzz(args, 'buzz-cli')
+  // A send comes back labelled with WHERE it went (id + name + trust), so a wrong room is visible to the
+  // duck that chose it instead of being narrated as success ("forwarded to research" — it was marketing).
+  const positional = args.filter((a) => !a.startsWith('-'))
+  const target = flagValue(args, '--channel')
+  if (positional[0] === 'messages' && positional[1]?.startsWith('send') && target && CHANNELS) {
+    return { ...res, channel: CHANNELS.describe(target) }
+  }
+  return res
 }
 
 const server = new McpServer({ name: 'buzz-cli', version: '0.1.0' })
@@ -62,7 +84,10 @@ server.registerTool(
       'Common ops: messages send|get|thread|search · channels list|get|search|join · dms list|open|send · ' +
       'users get|set-profile · media get · feed get · social publish. To reply where you were woken, send to ' +
       "the wake's `conversation` channel with `--reply-to` its `in_reply_to`. This tool is org-trust only; " +
-      'a few irreversible/admin verbs (delete, leave, agents/workflows/repos/projects) are blocked.',
+      'a few irreversible/admin verbs (delete, leave, agents/workflows/repos/projects) are blocked.' +
+      (CHANNELS?.directory
+        ? ` Address channels by NAME: \`--channel research\` (a name is resolved to its id; an unknown name is refused, nothing sent). Channels: ${CHANNELS.directory}.`
+        : ''),
     inputSchema: { args: z.array(z.string().min(1)).min(1).max(40) },
   },
   async ({ args }: { args: string[] }) => {
@@ -88,7 +113,7 @@ server.registerTool(
       'Send a STORED file to a Buzz channel (the confined counterpart of `messages send --file`). ' +
       '`attachment_id` is the `file` basename from an `attachments` entry in a wake payload — never a path; ' +
       'only files the harness already stored can leave, so you cannot attach an arbitrary host file. ' +
-      'Defaults to the channel + message that woke you; pass `channel` to post elsewhere.',
+      'Defaults to the channel + message that woke you; pass `channel` (a channel NAME or id) to post elsewhere.',
     inputSchema: {
       attachment_id: z.string().min(1).max(512),
       text: z.string().min(1).max(8000),
@@ -101,14 +126,18 @@ server.registerTool(
       console.error(`[buzz-cli] send_file DENIED id=${JSON.stringify(attachment_id)} — ${a.error}`)
       return asText({ ok: false, error: a.error })
     }
-    const ch = channel || process.env.BUZZ_REPLY_CHANNEL
-    if (!ch) return asText({ ok: false, error: 'no channel: this wake carries no reply channel, so pass `channel` explicitly' })
+    const want = channel || process.env.BUZZ_REPLY_CHANNEL
+    if (!want) return asText({ ok: false, error: 'no channel: this wake carries no reply channel, so pass `channel` explicitly' })
+    const rc = resolveOne(CHANNELS, want)
+    if (!rc.ok) return asText({ ok: false, error: `${rc.error} (nothing was sent)` })
+    const ch = rc.id
     // Always pass --channel explicitly; `runBuzz`/`applySendDefaults` then threads the wake's reply-to ONLY
     // when `ch` IS the woke channel. (This used to be guarded here and then re-defaulted inside runBuzz —
     // which appended a cross-channel parent and made every send_file to another channel fail at the relay.)
     const args = ['messages', 'send', '--channel', ch, '--content', text, '--file', a.path]
     const r = await runBuzz(args)
-    console.error(`[buzz-cli] send_file ${r.ok ? 'ok' : 'FAILED'} name=${a.name} ch=${ch.slice(0, 8)}…`)
+    console.error(`[buzz-cli] send_file ${r.ok ? 'ok' : 'FAILED'} name=${a.name} ch=${rc.name ?? ch.slice(0, 8)}`)
+    if (r.ok && CHANNELS) return asText({ ...r, channel: CHANNELS.describe(ch) })
     return asText(r)
   },
 )

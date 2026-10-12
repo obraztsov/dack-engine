@@ -18,6 +18,7 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
 import { execBuzz } from './buzz-exec'
+import { openChannelIndex, resolveOne } from './buzz-channels'
 
 export type ThreadEv = { id: string; pubkey: string; content: string; created_at: number; tags?: string[][] }
 
@@ -95,7 +96,7 @@ export function registerOwnRepliesTool(server: McpServer, tag: string): void {
         'What YOU already said in a Buzz thread, and what others posted since — read this BEFORE replying in a ' +
         'thread you may have spoken in (a wake on a progress ping, a follow-up, a resumed thread), so you do not ' +
         'answer the same question twice. Defaults to the thread that woke you; pass `thread_root` (the `root` of a ' +
-        'wake, or the id you got when you posted) for another. Returns your last replies, when you last spoke, and ' +
+        'wake, or the id you got when you posted) for another; `channel` takes a channel NAME or id. Returns your last replies, when you last spoke, and ' +
         'the messages from others AFTER that — the only thing a new reply could be answering. Read-only.',
       inputSchema: {
         thread_root: z.string().regex(/^[0-9a-f]{64}$/, 'a 64-hex event id').optional(),
@@ -105,9 +106,12 @@ export function registerOwnRepliesTool(server: McpServer, tag: string): void {
     async ({ thread_root, channel }: { thread_root?: string; channel?: string }) => {
       if (!SELF) return asText({ ok: false, error: 'BUZZ_SELF_PUBKEY not set — cannot tell your posts apart' })
       const root = thread_root || process.env.BUZZ_THREAD_ROOT
-      const ch = channel || process.env.BUZZ_REPLY_CHANNEL
+      const want = channel || process.env.BUZZ_REPLY_CHANNEL
       if (!root) return asText({ ok: false, error: 'no thread: this wake carries no thread root, so pass `thread_root`' })
-      if (!ch) return asText({ ok: false, error: 'no channel: this wake carries no channel, so pass `channel`' })
+      if (!want) return asText({ ok: false, error: 'no channel: this wake carries no channel, so pass `channel`' })
+      const rc = resolveOne(openChannelIndex(), want)
+      if (!rc.ok) return asText({ ok: false, error: rc.error })
+      const ch = rc.id
       // A busy thread (a worker's progress stream) is far bigger than the 64KB the generic tools cap stdout
       // at — and that cap exists to protect the CONTEXT, which this tool never hands the raw thread to. Day-1
       // live: the research thread overflowed it and the tool failed exactly when it was needed most.

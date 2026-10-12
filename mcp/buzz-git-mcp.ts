@@ -61,9 +61,10 @@ function git(args: string[], cwd: string, remote?: string): Promise<GitResult> {
   const k = key()
   const auth: string[] = []
   if (remote && k instanceof Uint8Array) {
-    // One signed event for this invocation: `u` = the repo BASE url (what the relay verifies), fresh nonce.
+    // ONE signed event for this invocation, scoped to this remote: `u` = the repo BASE url (what the relay
+    // verifies — the request URL fails), fresh nonce. The relay does not check `method` (probed 2026-10-13:
+    // GET and POST events both pass for info/refs + upload-pack); TWO headers (one per method) made it 400.
     auth.push('-c', `http.${remote}.extraHeader=Authorization: ${nip98Header(nip98Event(k, remote, 'GET'))}`)
-    auth.push('-c', `http.${remote}/.extraHeader=Authorization: ${nip98Header(nip98Event(k, remote, 'POST'))}`)
   }
   const argv = [...gitHardening(IDENTITY), ...auth, ...args]
   return new Promise((resolveP) => {

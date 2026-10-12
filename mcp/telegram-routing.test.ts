@@ -3,12 +3,14 @@ import { routeFor, replyMeta } from './telegram-routing'
 
 const cfg = { operator_ids: [80375347], operator_user_id: null, op_path: '/telegram/op', pub_path: '/telegram/pub', groups: { '-5416963964': '/telegram/trusted' } }
 
-test('routing: a configured group wins over the operator id; operator DMs and unconfigured chats still go op', () => {
-  expect(routeFor(cfg, 80375347, -5416963964, 'supergroup')).toMatchObject({ path: '/telegram/trusted' }) // the 2026-10-12 noise case
-  expect(routeFor(cfg, 80375347, 80375347, 'private')).toMatchObject({ path: '/telegram/op' })
-  expect(routeFor(cfg, 80375347, -1004351143165, 'supergroup')).toMatchObject({ path: '/telegram/op' }) // operator in an UNconfigured group
+test('routing: in a GROUP the chat decides (operator included); the operator id counts only in a private chat', () => {
+  expect(routeFor(cfg, 80375347, -5416963964, 'supergroup')).toMatchObject({ path: '/telegram/trusted' }) // operator in the fleet group
+  expect(routeFor(cfg, 80375347, -1004351143165, 'supergroup')).toMatchObject({ path: '/telegram/pub' }) // operator in the PUBLIC group — public-tier, by decision
+  expect(routeFor(cfg, 80375347, 80375347, 'private')).toMatchObject({ path: '/telegram/op' }) // operator DM
+  expect(routeFor(cfg, 7898354400, 7898354400, 'private')).toMatchObject({ path: '/telegram/pub' }) // stranger DM, no dm_path
+  expect(routeFor({ ...cfg, dm_path: '/telegram/dm' }, 7898354400, 7898354400, 'private')).toMatchObject({ path: '/telegram/dm' })
   expect(routeFor(cfg, 7898354400, -1004351143165, 'supergroup')).toMatchObject({ path: '/telegram/pub' })
-  expect(routeFor({ ...cfg, group_path: '/telegram/group' }, 7898354400, -1004351143165, 'supergroup')).toMatchObject({ path: '/telegram/group' })
+  expect(routeFor({ ...cfg, group_path: '/telegram/group' }, 80375347, -1004351143165, 'supergroup')).toMatchObject({ path: '/telegram/group' })
 })
 
 test('reply attribution: the parent inside the update names whom a message answers, and whether that is us', () => {

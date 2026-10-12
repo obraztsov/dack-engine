@@ -26,20 +26,26 @@ export function opIds(cfg: RouteCfg): number[] {
 }
 
 /**
- * Resolve a message's webhook path by precedence: configured group → operator → chat-type split → public.
+ * Resolve a message's webhook path: THE CHAT decides in a group, the SENDER only in a private chat.
  *
- * A CONFIGURED GROUP wins over the operator id: the operator talking inside the fleet group is group
- * context (the room sees it, the reply goes to the room), not an operator instruction — routing it to the
- * operator path woke both ducks on every line the operator exchanged with a third party there (18 silent-
- * cycle alerts in one hour, 2026-10-12). Operator DMs and unconfigured chats still take the operator path.
+ * A group message routes by its group — a configured one to its path, any other to `group_path`/`pub_path`
+ * — whoever wrote it, the operator included. The operator talking in a room is room context: the room
+ * sees it, the reply goes to the room, and in a PUBLIC room the words are public-tier (operator decision
+ * 2026-10-12: "I'm ok with the trust semantic of a public group being a public group — it's even ok for
+ * me to larp there"). Routing the operator's lines to the operator path instead woke both ducks on every
+ * exchange with a third party (18 silent-cycle alerts in one hour) and made a public room an org-trust
+ * surface. Operator authority travels through DMs and the configured fleet group. The duck still SEES who
+ * wrote it (`from_username`) — only the trust/entry comes from the chat.
  */
 export function routeFor(cfg: RouteCfg, fromId: number | null, chatId: number, chatType: string): { path: string; why: string } {
-  const group = cfg.groups[String(chatId)]
-  if (group) return { path: group, why: `group→${group}` }
+  if (chatType !== 'private') {
+    const group = cfg.groups[String(chatId)]
+    if (group) return { path: group, why: `group→${group}` }
+    return cfg.group_path ? { path: cfg.group_path, why: 'group' } : { path: cfg.pub_path, why: 'pub' }
+  }
   if (fromId != null && opIds(cfg).includes(fromId)) return { path: cfg.op_path, why: 'OP→org' }
-  // OPT-IN chat-type split (unset → falls through to pub_path, the current single-webhook behavior).
-  if (chatType === 'private' && cfg.dm_path) return { path: cfg.dm_path, why: 'dm' }
-  if (chatType !== 'private' && cfg.group_path) return { path: cfg.group_path, why: 'group' }
+  // OPT-IN DM split (unset → pub_path, the single-webhook behavior).
+  if (cfg.dm_path) return { path: cfg.dm_path, why: 'dm' }
   return { path: cfg.pub_path, why: 'pub' }
 }
 

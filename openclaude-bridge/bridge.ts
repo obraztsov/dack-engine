@@ -6,8 +6,7 @@
  *
  * Protocol = NDJSON over stdio:
  *   Rust → bridge (stdin):
- *     {"kind":"invoke","system_prompt":..,"user_prompt":..,"disallowed_tools":[..],
- *      "allowed_tools":null,"model":..}
+ *     {"kind":"invoke","system_prompt":..,"user_prompt":..,"disallowed_tools":[..],"model":..}
  *     {"kind":"decision","tool_use_id":..,"allow":bool,"message":..}   (per permission)
  *   bridge → Rust (stdout):
  *     {"kind":"permission","tool":..,"tool_use_id":..,"input":{..}}    (each canUseTool)
@@ -27,10 +26,10 @@ import { tryParseOutput } from './parse'
 
 // The SDK snapshots process.cwd() at MODULE-INIT and uses it for ALL tool/file path resolution
 // (getCwd → pwd → STATE.cwd; options.cwd is NOT honored on the programmatic query() path). So a
-// worker's relative writes (e.g. `solution.py`) would leak into the bridge's own dir instead of its
-// /workspace. We chdir to the agent's workdir (handed by the harness as DACK_BRIDGE_CWD — a worker's
-// workspace, or the duck's soul repo) BEFORE loading the SDK, then import it DYNAMICALLY so it
-// snapshots the right cwd. The bridge is spawned fresh per invoke, so this is safe.
+// relative file path would resolve against the bridge's own dir instead of the duck's soul repo. We
+// chdir to the agent's workdir (handed by the harness as DACK_BRIDGE_CWD — the duck's soul repo)
+// BEFORE loading the SDK, then import it DYNAMICALLY so it snapshots the right cwd. The bridge is
+// spawned fresh per invoke, so this is safe.
 if (process.env.DACK_BRIDGE_CWD) {
   try {
     process.chdir(process.env.DACK_BRIDGE_CWD)
@@ -65,13 +64,10 @@ const OUTPUT_INSTRUCTION =
   'MUST be ONLY a single JSON object (no prose, no markdown fence) with this shape: ' +
   '{"thought": string, ' +
   '"tag_notes": [{"tag": string, "note": string, "kind": "digest"|"memory"|null}]|null, ' +
-  '"spawn": {"agent": string, "brief": string}|null, ' +
   '"batons": [{"to_prompt": string, "gist": string, "priority": "low"|"normal"|"high"|"urgent"|null}]}. ' +
   '"batons" is your fan-out: ONE element to take a single next step, SEVERAL to do several things at ' +
   'once (each its OWN gist + destination, each gated independently by your trust ceiling), or [] to ' +
-  'stop. Each "to_prompt" must be one of the ids in your allowed-transitions context block. Set ' +
-  '"spawn" to delegate a job to a worker (only if your orientation lists it as available; the worker ' +
-  'runs detached and returns later), else null. ' +
+  'stop. Each "to_prompt" must be one of the ids in your allowed-transitions context block. ' +
   '"tag_notes" are optional short sticky notes on a conversation tag: prefer "kind": "digest" for ' +
   'routine observations (the digest folds them into long-term memory, then they retire — so they do not ' +
   'pile up in your context); use "kind": "memory" (the default when omitted) only for a durable fact ' +
@@ -115,19 +111,10 @@ async function runInvoke(inv: any) {
     // falls back to the bridge's cwd for pure-text runs.
     cwd: inv.cwd ?? process.cwd(),
     systemPrompt: { type: 'custom', content: `${inv.system_prompt}\n\n${OUTPUT_INSTRUCTION}` },
-    // No sub-agent defs (`inv.agents`) ⇒ disallow the sub-agent tool (`Task`/`Agent`). The SDK
-    // Docker-sandboxes each sub-agent; inside a DOCKER-isolated worker there is no docker daemon
-    // (no docker-in-docker, by design), so a sub-agent spawn dies with "failed to connect to the
-    // docker API" and takes the bridge with it. A docker worker is a SINGLE isolated agent; the duck
-    // (also no agents) never uses Task either. A HOST worker passes agents → these stay allowed.
-    disallowedTools: [
-      ...(inv.disallowed_tools ?? []),
-      // The SDK's Docker-sandboxed bash variant: it connects to the docker daemon, which doesn't exist
-      // inside a DACK-isolated worker container (no docker-in-docker) — disallow it so the model uses
-      // plain `Bash` (the harness container + the wall ARE the sandbox).
-      'SandboxedBash',
-      ...(inv.agents && Object.keys(inv.agents).length ? [] : ['Task', 'Agent']),
-    ],
+    // The SDK's sub-agent tools (`Task`/`Agent`) are UNCONDITIONALLY disallowed: the duck never
+    // delegates by spawning. Delegation is a brief posted to a Buzz agent (Hermes/Jarvis), whose
+    // results come back on Buzz as an ordinary untrusted wake.
+    disallowedTools: [...(inv.disallowed_tools ?? []), 'Task', 'Agent'],
     // The wall: relay every tool to Rust and block on its decision.
     canUseTool: async (name: string, input: unknown, opts?: { toolUseID?: string }) => {
       const tool_use_id = opts?.toolUseID ?? globalThis.crypto.randomUUID()
@@ -138,25 +125,15 @@ async function runInvoke(inv: any) {
       if (!decision.allow) {
         return { behavior: 'deny', message: decision.message ?? 'denied by DACK wall' }
       }
-      // Disable the SDK's OWN bash sandbox (which Docker-sandboxes some commands) — it dies inside a
-      // DACK-isolated worker container (no docker-in-docker). The wall already gated this call, and
-      // the harness container IS the sandbox, so the SDK's redundant one is both unwanted and broken.
-      const updatedInput =
-        name === 'Bash' || name === 'SandboxedBash'
-          ? { ...(input as any), dangerouslyDisableSandbox: true }
-          : (input as any)
-      return { behavior: 'allow', updatedInput }
+      return { behavior: 'allow', updatedInput: input as any }
     },
   }
   if (inv.model) options.model = inv.model
-  if (inv.allowed_tools) options.allowedTools = inv.allowed_tools
   // Sticky-session resume (the harness passes the session_id it wants to continue). Absent = fresh.
   if (inv.resume) options.resume = inv.resume
   // The duck's act-phase capabilities, assembled by the harness for this state (tokens injected
   // into headers/env). The wall still gates EVERY call (canUseTool → Rust), tier-classified.
   if (inv.mcp_servers && typeof inv.mcp_servers === 'object') options.mcpServers = inv.mcp_servers
-  // Sub-agent defs the worker may Task-spawn. Empty for the duck's states.
-  if (inv.agents && typeof inv.agents === 'object' && Object.keys(inv.agents).length) options.agents = inv.agents
 
   // First pass: the real invocation — tools live, the wall (canUseTool → Rust) gating every call.
   // `inv.media` (Phase 1: Telegram photos) rides the first turn only; the parse-fail recovery re-prompts text.

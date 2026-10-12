@@ -183,19 +183,6 @@ The engine + connector extensibility point. Swapping runtime/provider is one con
 > `DUCK_SESSION_DB` so sticky sessions (resume-by-id) persist across cycles, and `mcp_servers` supports
 > `expand` (deferred tool loading) — see the Capabilities table.
 
-### `runtime.worker_sandbox` — Docker isolation for delegated workers
-
-See [workers](workers.md). When enabled, an async worker whose agent def declares `isolation: docker`
-runs its bridge inside a container.
-
-| Field | Type | Default | Meaning |
-|---|---|---|---|
-| `enabled` | bool | `false` | `false` ⇒ workers run on the host. |
-| `image` | string | `""` | The pre-built worker image (built from `Dockerfile.worker`). |
-| `memory` | string | `2g` | Container memory cap. |
-| `pids_limit` | int | `256` | Container PID cap. |
-| `require` | bool | `true` | When Docker/the image is unavailable: `true` ⇒ hard-fail boot (the safety claim holds); `false` ⇒ warn + fall back to host. |
-
 ---
 
 ## Soul repo & push destinations

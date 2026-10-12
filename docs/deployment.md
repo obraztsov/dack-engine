@@ -136,7 +136,4 @@ they share nothing but the image and the host kernel.
 
 ## Notes
 
-- **Workers** (delegated subagents) run on the host *inside* the duck container by default
-  (`runtime.worker_sandbox.enabled: false`). Docker-isolated workers would be docker-in-docker and are
-  out of scope here.
 - **Clock**: the container inherits the host clock; the duck works in UTC — keep the host synced.

@@ -9,7 +9,6 @@ soul/
 ├── SOUL.md            # who the agent is — the top of every system prompt
 ├── prompts/           # state-prompts: one markdown file per step of a cycle
 ├── stimuli/           # duties: what wakes the agent (cron / webhook + sensor)
-├── agents/            # worker definitions the agent may delegate to
 ├── memory/            # long-term memory (durable notes; trust-gated writes)
 ├── skills/            # reference material / scripts the agent can read
 └── runlogs/           # short-term memory: the append-only log the harness writes
@@ -42,7 +41,6 @@ duty, decide what (if anything) to do, and either transition to `express` to act
 Return a structured result:
 - thought: your reasoning (logged, never published)
 - batons: [ { to_prompt, gist, priority? } ]   # your fan-out: 0, 1, or several branches
-- spawn: { agent, brief } | null               # optional: delegate a job to a worker
 - tag_notes: [ { tag, note } ]                  # optional short-term "sticky notes" (below)
 ```
 
@@ -81,8 +79,8 @@ read → reply steps (e.g. `telegram/perceive` + `telegram/express`); leave sett
 write memory) on the default write-lock. Replying/posting (an outward MCP call) and the runlog (SQLite,
 outside the lock) still work under a parallel step.
 
-The model always returns a structured result (a thought, an optional proposal/gist, an optional
-`spawn` for delegation, and a transition). The harness reads the transition and walks the machine.
+The model always returns a structured result (a thought, an optional proposal/gist, and a
+transition). The harness reads the transition and walks the machine.
 
 ## Duties (`stimuli/`)
 
@@ -133,10 +131,11 @@ coalesce: { mode: batch, window_sec: 60 }
 
 Coalescing keys on the candidate's dedup key (e.g. a chat id), so each conversation batches separately.
 
-## Workers (`agents/`)
+## Delegation
 
-Definitions for delegated subagents the agent may spawn from an act state. See
-[workers](workers.md).
+The agent does not spawn subagents. To delegate a job it posts a brief to another Buzz agent (e.g.
+Hermes) in the research channel, and the result comes back there as an untrusted stimulus. See
+[channels](channels.md) and `docs/design/workspace-and-documents.md`.
 
 ## Memory & skills
 

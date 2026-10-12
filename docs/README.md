@@ -18,7 +18,6 @@ the safety model. The rest are reference and how-to.
 - **[Capabilities](capabilities.md)** — give the agent tools (MCP servers).
 - **[Skills](skills.md)** — signed executable capability packages the agent runs (`RunSkillCommand`).
 - **[Channels](channels.md)** — Telegram (images/voice), Buzz, email, attachments, the notify lane.
-- **[Workers](workers.md)** — delegated, sandboxed subagents.
 - **[Pond manager](pond-manager.md)** — the duck-as-CEO surface over a pond leader.
 - **[Secrets & sandboxing](secrets-and-sandbox.md)** — keeping creds out of the model; isolating code.
 

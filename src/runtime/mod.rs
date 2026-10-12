@@ -140,25 +140,6 @@ pub struct InvocationRequest {
     /// prompt (operator `tier_policy` default, or a soul `model:` where override is allowed). `None`
     /// ⇒ the runtime client's configured `config.model`. The bridge maps it to `options.model`.
     pub model: Option<String>,
-    /// **Sub-agent definitions** the engine may spawn via the `Task` tool, keyed by name
-    /// → an SDK `options.agents` value ([`crate::agent_def::AgentDef::to_options_value`]). EMPTY for
-    /// the duck's consciousness states (no `Task` target); a **worker** invocation registers its
-    /// sub-helpers here so it can delegate plan/research/QA in-session. The bridge sets `options.agents`.
-    pub agents: std::collections::BTreeMap<String, serde_json::Value>,
-    /// **OS-isolate this invocation**: run the bridge in the runtime's worker sandbox
-    /// (Docker) instead of on the host. Set ONLY for delegated workers; the duck's states leave it
-    /// `false` (the duck is never containerized). No-op if the runtime has no worker backend
-    /// configured (falls back to host) — see `runtime.worker_sandbox`.
-    pub isolate: bool,
-    /// **Extra read-only mounts** for an isolated worker: the agent def's resolved
-    /// `volumes:` (host soul-subdir → guest path), all read-only. The writable `/workspace` is NOT
-    /// here — it's derived from `workdir`. Empty for the duck.
-    pub mounts: Vec<crate::sandbox::Mount>,
-    /// **Explicit tool allow-list** for the engine (`options.allowedTools`). `Some` pins the engine to
-    /// exactly these tools — a WORKER sets it to its agent def's `tools:` so the SDK does NOT offer its
-    /// full default toolset (some of which Docker-sandbox sub-work and die inside a container with no
-    /// docker daemon). `None` (the duck) ⇒ the engine default; the wall gates every call regardless.
-    pub allowed_tools: Option<Vec<String>>,
     /// **Per-invocation wall-clock budget OVERRIDE.** `None` ⇒ the runtime client's configured default
     /// (`invoke_timeout_secs`). The harness sets `Some` for a state that legitimately needs longer —
     /// e.g. **Reflect** (`reflect_invoke_timeout_secs`), the daily self-modification cycle, which may
@@ -217,12 +198,4 @@ pub trait RuntimeClient: Send + Sync {
         responder: std::sync::Arc<dyn ActionResponder>,
     ) -> Result<(AgentOutput, Option<SessionId>, Option<InvokeUsage>)>;
 
-    /// The guest working dir a containerized worker runs at (e.g. `/workspace`), or `None` if this
-    /// runtime has no worker isolation backend. The harness calls this to decide whether a
-    /// `docker`-isolation worker will ACTUALLY be containerized — so it can root the worker's wall at
-    /// the matching path (the guest `/workspace` when isolated, the host workspace when falling back).
-    /// Default `None` (mocks / host-only runtimes).
-    fn worker_guest_cwd(&self) -> Option<PathBuf> {
-        None
-    }
 }

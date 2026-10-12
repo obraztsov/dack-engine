@@ -15,13 +15,12 @@ pub enum Intent {
     Reply,
     Post,
     Research,
-    /// Hand a real, longer job to a keyless sandboxed worker. Declared in Perceive to
-    /// signal the intent; the actual [`SpawnRequest`] is honored only once the duck reaches Express.
+    /// Hand a job to another agent — on Buzz, by posting a brief (there are no in-duck workers).
     Delegate,
     Ignore,
     Noop,
     /// Catch-all for any intent label the model emits that we don't model explicitly. `intent` is
-    /// **descriptive only** — control flow is driven by `transition.to_prompt`/`spawn`, never by
+    /// **descriptive only** — control flow is driven by `transition.to_prompt`/`batons`, never by
     /// `intent` — so an unrecognized label must degrade here, NEVER hard-error the cycle.
     #[serde(other)]
     Other,
@@ -146,7 +145,7 @@ where
     Ok(kept)
 }
 
-/// Lenient salvage for an optional model-authored sub-object (`proposal`, `spawn`): a shape that
+/// Lenient salvage for an optional model-authored sub-object (`proposal`): a shape that
 /// doesn't parse degrades to `None` with a warn instead of failing the cycle. The harness treats
 /// both as optional already; absent-because-malformed is strictly better than a dropped cycle.
 fn de_lenient_opt<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
@@ -290,19 +289,6 @@ pub struct BatonIntent {
     pub reason: String,
 }
 
-/// A request to delegate a job to a **keyless sandboxed worker**. The agent names an
-/// `agents/<agent>.md` def + a one-shot `brief`; the harness launches the worker ASYNCHRONOUSLY
-/// (its own worker-spec sandbox, no soul/post/settle), and its summary returns later as an UNTRUSTED
-/// `worker_completion` stimulus (the return-firebreak). Honored only from an act state (Express) —
-/// the duck delegates, it does not become the worker. NOT the SDK `Task` tool (that's worker-only).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SpawnRequest {
-    /// The `agents/<agent>.md` definition to run (must resolve in the soul repo).
-    pub agent: String,
-    /// The task brief handed to the worker (untrusted-on-return; the duck decides what to publish).
-    pub brief: String,
-}
-
 /// A "sticky note" on a conversation tag — a short observation appended to the short-term tag-notes
 /// catalogue. The model returns just `{ tag, note }`; the HARNESS stamps `trust` (= the writing cycle's
 /// taint, unfakeable provenance) and the `timestamp` on append.
@@ -369,10 +355,6 @@ pub struct AgentOutput {
     pub tag_notes: Option<Vec<TagNote>>,
     #[serde(default, deserialize_with = "de_lenient_opt")]
     pub proposal: Option<Proposal>,
-    /// Optional worker delegation. Honored only from Express; launched async, returns as
-    /// an untrusted `worker_completion` stimulus. `None` (the common case) = no delegation.
-    #[serde(default, deserialize_with = "de_lenient_opt")]
-    pub spawn: Option<SpawnRequest>,
     /// Legacy single transition (still accepted). `fan_out()` folds it into `batons`.
     #[serde(default, deserialize_with = "de_lenient_transition")]
     pub transition: Transition,
@@ -424,7 +406,7 @@ mod tests {
         let out: AgentOutput = serde_json::from_value(serde_json::json!({
             "thought": "10th perceive cycle",
             "tag_notes": [{"tag": "standing-shitpost-0706l", "note": "n", "kind": "pub"}],
-            "batons": [], "spawn": null, "transition": {"to_prompt": null}
+            "batons": [], "transition": {"to_prompt": null}
         }))
         .expect("a hallucinated note kind must not fail the whole cycle parse");
         assert_eq!(out.tag_notes.unwrap()[0].kind, NoteKind::Memory);
@@ -512,20 +494,18 @@ mod tests {
     }
 
     /// Belt-and-braces for the remaining model-authored fields: none of them may kill the cycle —
-    /// worst case each degrades (empty thought, no proposal/spawn, terminate transition).
+    /// worst case each degrades (empty thought, no proposal, terminate transition).
     #[test]
     fn model_output_survives_shape_drift_on_every_field() {
         let out: AgentOutput = serde_json::from_value(serde_json::json!({
             "thought": null,
             "proposal": {"gist": "no intent field"},
-            "spawn": {"agent": "researcher"},
             "transition": "express",
             "batons": "not a list"
         }))
         .expect("no single malformed field may fail the parse");
         assert_eq!(out.thought, "", "null thought degrades to empty");
         assert!(out.proposal.is_none(), "unparseable proposal degrades to None");
-        assert!(out.spawn.is_none(), "spawn missing brief degrades to None");
         assert_eq!(out.transition.to_prompt.as_deref(), Some("express"), "bare-string transition maps to to_prompt");
         assert!(out.batons.is_empty(), "garbage batons degrade to empty");
 

@@ -1,7 +1,7 @@
 # Secrets & sandboxing
 
 Two concerns that the wall and the firebreak do *not* cover: keeping real credentials out of the
-model's reach, and bounding the arbitrary code the harness runs (sensors, workers).
+model's reach, and bounding the arbitrary code the harness runs (sensors).
 
 ## Where secrets live
 
@@ -107,14 +107,13 @@ The wall governs what the **agent** does. It does not touch the other code the h
 - **Sensors** — a duty's fetch script is arbitrary code, and sensors are Reflect-authored (the agent can
   write its own senses). It runs with a **read-scoped** environment: only `PATH` plus the explicitly
   `forwarded_env` names, plus any provider token the duty declared. No secret it didn't ask for.
-- **Workers** — delegated subagents run keyless, with no soul/post/settle access, in a throwaway
-  workspace (see [workers](workers.md)).
+- **Delegation is not code the harness runs.** The agent delegates a job by posting a brief to another
+  Buzz agent (e.g. Hermes); nothing is spawned in-duck, and the reply comes back as untrusted input.
 
-Both are spawned through a single **sandbox seam** (`src/sandbox/`). The default backend runs them on
-the host; a Docker backend maps an isolation policy (read-only rootfs, dropped capabilities, no host
-mount, bind-mounted workspace) to `docker run`. This is how a worker's shell becomes OS-confined, and
-where future sensor-container hardening slots in — without changing the harness logic that uses the
-seam.
+Sensors (and the bridge, and modules) are spawned through a single **sandbox seam** (`src/sandbox/`). The
+default backend runs them on the host; a Docker backend maps an isolation policy (read-only rootfs,
+dropped capabilities, no host mount) to `docker run`. This is where future sensor-container hardening
+slots in — without changing the harness logic that uses the seam.
 
 ## Provenance, not trust-by-default
 

@@ -12,7 +12,7 @@ test('multi-object (the live bitconnect drop) keeps the real transition via late
   // fix this fell back to to_prompt=null → the Telegram reply silently never sent.
   const text =
     '{"thought":"vibe","tag_notes":null,"proposal":{"intent":"reply","gist":"BITCONNEEEECT"}},' +
-    '{"thought":"vibe2","proposal":{"intent":"reply","gist":"BITCONNEEEECT"},"spawn":null,' +
+    '{"thought":"vibe2","proposal":{"intent":"reply","gist":"BITCONNEEEECT"},' +
     '"transition":{"to_prompt":"telegram/express","reason":"match energy"}}'
   const logs: string[] = []
   const out: any = parseOutput(text, (m) => logs.push(m))

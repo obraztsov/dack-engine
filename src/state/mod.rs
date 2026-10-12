@@ -53,7 +53,7 @@ pub enum ToolClass {
     /// a prompt-injected cycle could be steered to fetch `attacker/?leak=<secret>` or probe an internal
     /// address, and the request LEAVES regardless of the firebreak. Scoped to **Perceive only**
     /// (read-only context-gathering) — NOT Express/Settle/Reflect, so an injected ACT cycle can't reach
-    /// the network. The sandboxed worker keeps it (research in a throwaway workspace).
+    /// the network.
     Net,
     /// File write/edit — the single OpenClaude Write/Edit/NotebookEdit tool. **The path,
     /// not the tool, decides memory-vs-soul**: gated by `writable_dirs` (memory/ in
@@ -151,30 +151,8 @@ pub fn default_spec(state: ConsciousnessState) -> StateSpec {
             tool_scope: ToolScope {
                 allowed: vec![Read, FileWrite],
             },
-            writable_dirs: vec!["skills/", "stimuli/", "prompts/", "SOUL.md", "memory/", "agents/"],
+            writable_dirs: vec!["skills/", "stimuli/", "prompts/", "SOUL.md", "memory/"],
         },
-    }
-}
-
-/// The capability spec for a **worker** — keyless sandboxed compute the duck wields, NOT
-/// a consciousness state. Reuses [`StateSpec`] (the responder's shape); `state` is cosmetic here (a
-/// worker carries no Post/Settle MCP tools — `mcp_servers={}` — so the scope never emits a
-/// state-named deny). The harness runs it in its own `/workspace` and sets the responder's
-/// relativize root to that workspace, so the worker may Read/Write/Edit/Bash there and spawn SYNC
-/// sub-helpers (`Other` = the SDK `Task` tool) — but has **no Post/SettleTx** (no outward authority)
-/// and **cannot write the soul repo** (soul paths don't relativize into the workspace → denied; the
-/// soul-integrity tripwire is the backstop for any Bash write).
-pub fn worker_spec() -> StateSpec {
-    use ToolClass::*;
-    StateSpec {
-        state: ConsciousnessState::Express, // cosmetic; a worker is not a consciousness state (see doc)
-        prompt_path: "",
-        model: ModelTier::Mixed,
-        tool_scope: ToolScope {
-            allowed: vec![Read, Net, FileWrite, Shell, Other],
-        },
-        // "" = anything under the workspace (the responder's relativize root); the soul stays out.
-        writable_dirs: vec![""],
     }
 }
 
@@ -274,8 +252,6 @@ mod tests {
                 "{s:?} must NOT reach the network (WebFetch/WebSearch)"
             );
         }
-        // The sandboxed worker keeps network for research.
-        assert!(super::worker_spec().tool_scope.allows(ToolClass::Net), "worker may research online");
     }
 
     #[test]

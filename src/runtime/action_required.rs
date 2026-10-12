@@ -332,17 +332,14 @@ impl ActionResponder for StatePolicyResponder {
         // (1) Per-state class scoping — the first and primary gate.
         if !self.spec.tool_scope.allows(class) {
             // The duck has a strong coding-agent prior: it tries to DELEGATE by calling an
-            // `Agent`/`Task` tool. For the duck no such tool exists (only a worker, whose `Other`
-            // scope admits `Task`, ever reaches this allowed). Catch that exact confusion and teach
-            // the real mechanism — the `spawn` OUTPUT FIELD — instead of a bare "not in scope".
+            // `Agent`/`Task` tool. No such tool exists here (in-duck workers were removed 2026-10-13).
+            // Teach the real mechanism — a brief to another agent over Buzz — instead of a bare denial.
             if is_delegation_tool(&req.tool) {
                 return ActionDecision::Deny(format!(
-                    "there is no `{}` tool for you — you do NOT spawn a worker by calling a tool. \
-                     Delegation is a structured OUTPUT: in your Express step, return a `spawn` field \
-                     in your result JSON — `spawn: {{ \"agent\": \"coder\", \"brief\": \"<the job>\" }}` \
-                     — and stop. The harness then launches the keyless sandboxed worker for you, and \
-                     its summary returns later as a new wake you judge. Do NOT try to build it \
-                     yourself and do NOT keep searching for a tool; just return `spawn`.",
+                    "there is no `{}` tool for you — you do not spawn sub-agents. Delegation is a MESSAGE: \
+                     post a crisp, self-contained brief to an agent on Buzz (Hermes/Jarvis in `research`, \
+                     via the `buzz` tool in your express step) and fold in the result when it comes back \
+                     in that channel. Do NOT keep searching for a delegation tool.",
                     req.tool
                 ));
             }
@@ -439,8 +436,8 @@ impl ActionResponder for StatePolicyResponder {
 }
 
 /// Is this an agent/subagent-spawning tool (the SDK `Task`, or the harness `Agent`)? Used only to
-/// give a teaching deny when the DUCK reaches for one — a worker's `Other` scope admits these, so it
-/// never hits the deny. Matches the bare tool name (any `mcp__…__` prefix stripped), case-insensitive.
+/// give a teaching deny when the duck reaches for one. Matches the bare tool name (any `mcp__…__`
+/// prefix stripped), case-insensitive.
 fn is_delegation_tool(tool: &str) -> bool {
     let bare = tool.rsplit("__").next().unwrap_or(tool);
     bare.eq_ignore_ascii_case("Agent") || bare.eq_ignore_ascii_case("Task")
@@ -466,7 +463,7 @@ fn normalize_lexical(p: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{default_spec, worker_spec, ConsciousnessState};
+    use crate::state::{default_spec, ConsciousnessState};
     use serde_json::json;
 
     fn caps() -> (Vec<CapabilityPrefix>, Vec<CapabilityPrefix>) {
@@ -544,11 +541,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snip_denied_for_duck_allowed_for_worker() {
+    async fn snip_denied_for_every_duck_state() {
         // `snip` can delete the model's OWN grounding (the first user message / recall results — every user
         // message is snippable, no first-message protection), which caused a Reflect to trim its context
-        // and confabulate. DENIED for every duck state (falls to `Other`); a WORKER keeps it (its scope
-        // admits `Other`) for its own long agentic sessions.
+        // and confabulate. DENIED for every duck state (falls to `Other`).
         for state in [ConsciousnessState::Perceive, ConsciousnessState::Express, ConsciousnessState::Reflect] {
             let r = responder(state);
             assert!(matches!(
@@ -556,12 +552,6 @@ mod tests {
                 ActionDecision::Deny(_)
             ), "{state:?} must NOT snip its own context");
         }
-        let (post, settle) = caps();
-        let worker = StatePolicyResponder::with_capabilities(worker_spec(), post, settle);
-        assert!(matches!(
-            worker.decide(&req("snip", json!({"message_ids": ["ab12cd"]}))).await,
-            ActionDecision::Allow
-        ), "a worker keeps snip (its scope admits Other-class tools)");
     }
 
     #[tokio::test]
@@ -667,52 +657,23 @@ mod tests {
         assert!(r.acted_outward(), "an allowed post is an outward action");
     }
 
-    /// The WORKER sandbox: a worker may Bash + spawn sub-helpers (`Agent`/`Task`) + write
-    /// its `/workspace`, but has NO outward authority (Post/Settle) and CANNOT write the soul repo.
+    /// When the duck reaches for an `Agent`/`Task` tool to delegate — the strong coding-agent prior —
+    /// the deny doesn't just say "not in scope"; it teaches the real mechanism: a brief to a Buzz agent.
     #[tokio::test]
-    async fn worker_spec_sandbox_allows_workspace_denies_soul_and_outward() {
-        let ws = "/tmp/dack-ws-test";
-        // Configure the post/settle prefixes so they CLASSIFY — then the worker scope (which omits
-        // Post/SettleTx) is what denies them (a real worker also has mcp_servers={}, a second guard).
-        let (post, settle) = caps();
-        let r = StatePolicyResponder::with_capabilities(crate::state::worker_spec(), post, settle)
-            .with_repo_root(ws);
-        // Bash + sub-helper spawn (Agent/Task = Other) are IN a worker's scope.
-        assert!(matches!(r.decide(&req("Bash", json!({"command": "cargo build"}))).await, ActionDecision::Allow));
-        assert!(matches!(r.decide(&req("Agent", json!({"description": "research X"}))).await, ActionDecision::Allow));
-        // It writes its workspace...
-        assert!(matches!(
-            r.decide(&req("Write", json!({"file_path": "/tmp/dack-ws-test/src/main.rs", "contents": "fn main(){}"}))).await,
-            ActionDecision::Allow
-        ));
-        // but NOT the soul repo (outside the workspace → denied)...
-        assert!(matches!(
-            r.decide(&req("Write", json!({"file_path": "/tmp/dack-soul/SOUL.md", "contents": "x"}))).await,
-            ActionDecision::Deny(_)
-        ));
-        // and has NO outward authority (no Post/Settle in scope).
-        assert!(matches!(r.decide(&req("mcp__twitter__post", json!({"text": "as the duck"}))).await, ActionDecision::Deny(_)));
-        assert!(matches!(r.decide(&req("mcp__cove-trading__buy_token", json!({}))).await, ActionDecision::Deny(_)));
-    }
-
-    /// When the DUCK (here Express) reaches for an `Agent`/`Task` tool to delegate — the strong
-    /// coding-agent prior — the deny doesn't just say "not in scope"; it teaches the real mechanism:
-    /// return the `spawn` output field. (A worker, by contrast, is ALLOWED these — tested above.)
-    #[tokio::test]
-    async fn duck_agent_call_is_denied_with_spawn_field_guidance() {
+    async fn duck_agent_call_is_denied_with_buzz_delegation_guidance() {
         let r = responder(ConsciousnessState::Express);
         for tool in ["Agent", "Task", "mcp__whatever__Task"] {
             match r.decide(&req(tool, json!({"description": "build solution.py"}))).await {
                 ActionDecision::Deny(m) => {
-                    assert!(m.contains("spawn"), "{tool}: deny should teach the spawn field: {m}");
+                    assert!(m.contains("Buzz"), "{tool}: deny should teach delegation over Buzz: {m}");
                     assert!(!m.contains("class Other"), "{tool}: should be the teaching deny, not the bare one: {m}");
                 }
                 other => panic!("{tool}: expected a teaching Deny, got {other:?}"),
             }
         }
-        // A genuinely-unrelated out-of-scope tool still gets the plain scope deny (no spawn noise).
+        // A genuinely-unrelated out-of-scope tool still gets the plain scope deny (no delegation noise).
         match r.decide(&req("SomeRandomTool", json!({}))).await {
-            ActionDecision::Deny(m) => assert!(!m.contains("spawn"), "unrelated tool: {m}"),
+            ActionDecision::Deny(m) => assert!(!m.contains("Buzz"), "unrelated tool: {m}"),
             other => panic!("expected a Deny, got {other:?}"),
         }
     }

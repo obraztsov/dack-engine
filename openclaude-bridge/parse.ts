@@ -107,7 +107,7 @@ export function tryParseOutput(
   const objs = extractJsonObjects(t)
   if (objs.length === 1) return { ok: true, output: normalize(objs[0], text, log) }
   if (objs.length > 1) {
-    // Merge later-wins for scalar fields (thought/transition/spawn), but CONCATENATE the `batons`
+    // Merge later-wins for scalar fields (thought/transition), but CONCATENATE the `batons`
     // arrays across objects — the model sometimes splits its fan-out across several JSON objects, and
     // a plain later-wins merge would silently DROP the earlier objects' batons. `normalize` then drops
     // any EXACT-duplicate batons (the verbatim "writes it N times" degeneration artifact).

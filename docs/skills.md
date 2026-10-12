@@ -102,7 +102,7 @@ populate the same scope scalars; a missing scalar is a fail-closed deny.)
 `attachment` is the outbound-file twin: the model names a basename like `invoice.pdf`, and the harness
 resolves it against the media dir (basename strips any `../`, then realpath + store-prefix + regular-file
 checks), substituting the absolute path. So an outbound file can only ever be a **stored** file — one a
-client sent inbound, or one a worker returned — never an arbitrary host path. This mirrors the Telegram
+client sent inbound, or one a skill produced — never an arbitrary host path. This mirrors the Telegram
 `reply_document` confinement (`mcp/attachments.ts`); the Rust and TS egress paths confine identically.
 
 Because every value lands as a **separate `argv` element under `execve` (never `sh -c`)**, shell

@@ -15,6 +15,11 @@ removed) and the runtime/connector layer became a real extensibility seam.
 > Being prepared as a **release candidate** — the feature set is complete and unit-tested; a
 > live integration test is the remaining gate before a tagged release.
 
+### Removed
+
+- **In-duck subagent workers** (async Docker workers, sync sub-helpers, `agents/` definitions,
+  `worker_sandbox`) — delegation is to Buzz agents; see `docs/design/workspace-and-documents.md`.
+
 ### Memory
 
 - **Short-term memory is now a SQLite + FTS5 store** (`runlogs.sqlite`), replacing the old

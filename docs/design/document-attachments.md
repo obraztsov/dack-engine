@@ -33,6 +33,8 @@ the processing logic ultimately lives.
 
 Runtime/worker layer:
 
+> **Note (2026-10-13):** in-duck workers (the Docker worker rows below) were REMOVED — delegation is to Buzz agents; see `docs/design/workspace-and-documents.md`.
+
 | Layer | Documents today | Gap size |
 |---|---|---|
 | openclaude bridge | images only; non-image mislabeled `image/jpeg` (`bridge.ts:215-224`) | SMALL (add `document` branch) — but blocked by wire, below |

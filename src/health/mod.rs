@@ -325,7 +325,7 @@ impl HealthSnapshot {
             };
             s.push_str(&format!("  - {} [{} → {}]: {}\n", d.id, d.trigger, d.entry, status));
         }
-        // Synthesized stimuli not in the duty roster (reflect, back_online, workers).
+        // Synthesized stimuli not in the duty roster (reflect, back_online).
         for (id, h) in &self.stimuli {
             if shown.contains(id.as_str()) {
                 continue;

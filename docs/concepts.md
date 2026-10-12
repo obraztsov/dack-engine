@@ -46,8 +46,7 @@ only in certain states:
 - **Post** — a reversible capability MCP tool (e.g. `mcp__twitter__post`). Express only.
 - **SettleTx** — an irreversible capability MCP tool. Settle only.
 - **Shell** — raw Bash/REPL. Denied in every consciousness state (it would bypass the path gate). Real
-  capabilities are exposed as MCP tools with cleanly gateable names instead. (A delegated worker is the
-  exception — it runs in its own sandbox; see [workers](workers.md).)
+  capabilities are exposed as MCP tools with cleanly gateable names instead.
 
 This classification is **the wall**: every tool the model wants to call is relayed to the harness,
 which decides allow/deny by class and current state before the call executes.
@@ -96,8 +95,9 @@ with only that gist plus harness-trusted provenance annotations. Untrusted world
 into the acting states verbatim, so a prompt injection in an incoming message cannot directly drive a
 post, a trade, or a self-edit; at most it can shape a gist that the model itself authored.
 
-The same firebreak applies to delegated work: a worker's result re-enters the agent as a new,
-untrusted stimulus (`public`), to be judged like any other input — never as a trusted continuation.
+The same firebreak applies to delegated work: the agent delegates by posting a brief to another Buzz
+agent (e.g. Hermes), and that agent's reply re-enters as a new, untrusted stimulus, to be judged like
+any other input — never as a trusted continuation.
 
 ## Memory: short-term vs long-term
 

@@ -42,31 +42,16 @@ const ALWAYS_DISALLOWED: &[&str] = &["Bash", "PowerShell", "REPL", "KillShell"];
 /// The SDK-level `disallowedTools` for an invocation, derived from the running spec.
 ///
 /// The duck NEVER gets raw shell/exec: `Shell` is in no consciousness state's `tool_scope`, and we
-/// disallow these at the SDK layer too (defense-in-depth on top of the wall). A **worker**, though,
-/// is a sandboxed build agent whose spec DOES admit `Shell` — it must keep `Bash`. Its shell is
-/// bounded by the wall (`worker_spec` + the temp-workspace relativize root) and the throwaway
-/// workspace, not by stripping the tool here. Stripping it was a real bug: with `Bash` absent from
-/// the engine's tool registry, (1) `injectAgents` threw on any agent referencing `Bash` (aborting
-/// sub-helper injection) and (2) the worker model, having no native `Bash`, emitted text-format
-/// `<function=Bash>` tool calls that executed nothing — so the worker built nothing.
+/// disallow these at the SDK layer too (defense-in-depth on top of the wall). `TodoWrite` (task-list)
+/// and `snip` (context trimmer) are dead weight / actively harmful for the duck's consciousness states —
+/// TodoWrite was denied-nudge noise; `snip` let the model delete its OWN grounding (first user message /
+/// recall results) and confabulate a fake project in a Reflect (2026-07-16). Hidden too.
 fn disallowed_for(spec: &crate::state::StateSpec) -> Vec<String> {
-    // A WORKER is the only spec that admits `Shell` — the duck's consciousness states never do.
-    let is_worker = spec.tool_scope.allows(crate::state::ToolClass::Shell);
-    let mut out: Vec<String> = ALWAYS_DISALLOWED
-        .iter()
-        .filter(|t| !(is_worker && **t == "Bash"))
-        .map(|s| s.to_string())
-        .collect();
-    // `TodoWrite` (task-list) and `snip` (context trimmer) are dead weight / actively harmful for the
-    // duck's consciousness states — TodoWrite was denied-nudge noise; `snip` let the model delete its OWN
-    // grounding (first user message / recall results) and confabulate a fake project in a Reflect
-    // (2026-07-16). Hide both from the duck; a spawned WORKER (real multi-step build agent) KEEPS them.
-    if !is_worker {
-        out.push("TodoWrite".into());
-        out.push("snip".into());
-    }
+    let mut out: Vec<String> = ALWAYS_DISALLOWED.iter().map(|s| s.to_string()).collect();
+    out.push("TodoWrite".into());
+    out.push("snip".into());
     // Defense-in-depth: NETWORK egress (WebFetch/WebSearch = `Net`) is a distinct class scoped to
-    // Perceive (+ the worker). Where a state's scope does NOT admit `Net`, hide these at the SDK layer
+    // Perceive. Where a state's scope does NOT admit `Net`, hide these at the SDK layer
     // too — so an Express/Settle/Reflect cycle isn't even offered the network (the wall denies it
     // regardless, but not offering it stops an injected model from trying / burning a turn).
     if !spec.tool_scope.allows(crate::state::ToolClass::Net) {
@@ -96,9 +81,6 @@ enum ToBridge<'a> {
         /// **Deferred server names** (subset of `mcp_servers`): their tools are announced via `find_tools`
         /// rather than sent inline. Honored only by the duck-loop bridge; the OpenClaude bridge ignores it.
         mcp_deferred: &'a [String],
-        /// Sub-agent defs the engine may `Task`-spawn → `options.agents`. Empty for the
-        /// duck's states; a worker registers its sub-helpers here.
-        agents: &'a std::collections::BTreeMap<String, serde_json::Value>,
         /// **Untrusted image attachments** for a Perceive turn (Phase 1: Telegram photos). The bridge
         /// reads each `path`, base64s it, and builds an SDK image content-block. Empty ⇒ the bridge takes
         /// the plain-string prompt path (unchanged).
@@ -178,10 +160,6 @@ pub struct OpenClaudeClient {
     /// memory/skill writes land while the rest of the box stays out of reach.
     pub sandbox: Arc<dyn Sandbox>,
     pub policy: IsolationPolicy,
-    /// **Worker isolation backend**. `None` ⇒ delegated workers run on the host (today's
-    /// behavior). `Some` ⇒ a `req.isolate` invocation runs the bridge in this backend (Docker),
-    /// guest-relative. The duck (`isolate:false`) NEVER touches it. Built from `runtime.worker_sandbox`.
-    pub worker: Option<WorkerBackend>,
     /// Wall-clock budget for one whole invocation (incl. the wall round-trips). A hung LLM/bridge
     /// would otherwise freeze the single-flight loop forever; on elapse `invoke` returns a
     /// `Runtime` error (dispatch logs + continues) and `kill_on_drop` reaps the child.
@@ -189,19 +167,6 @@ pub struct OpenClaudeClient {
     /// Shared runtime health registry — where this client records each invocation's MCP connect
     /// outcomes (liveness). `None` in tests / mock runtimes that don't connect real servers.
     pub health: Option<Arc<crate::health::HealthRegistry>>,
-}
-
-/// The container backend for delegated workers: the [`Sandbox`] (Docker), the
-/// [`IsolationPolicy`] (image/net/caps), the in-IMAGE bridge `command`, and the guest `cwd`
-/// (`/workspace`) the workspace is bind-mounted at. Cloned per-invocation; cheap (Arcs + small vecs).
-#[derive(Clone)]
-pub struct WorkerBackend {
-    pub sandbox: Arc<dyn Sandbox>,
-    pub policy: IsolationPolicy,
-    /// In-image bridge invocation, e.g. `["bun","run","/app/openclaude-bridge/bridge.ts"]`.
-    pub command: Vec<String>,
-    /// Guest working dir the workspace mounts at and the bridge chdir's to, e.g. `/workspace`.
-    pub cwd: PathBuf,
 }
 
 impl OpenClaudeClient {
@@ -221,40 +186,15 @@ impl OpenClaudeClient {
             model_via_env,
             sandbox: Arc::new(HostSandbox),
             policy: IsolationPolicy::host_passthrough(),
-            worker: None, // host workers by default; the CLI sets a Docker backend when configured
             timeout,
             health: None, // the CLI attaches the shared registry via `with_health`
         }
-    }
-
-    /// Attach (or clear) the worker isolation backend — the CLI builds it from `runtime.worker_sandbox`.
-    pub fn with_worker(mut self, worker: Option<WorkerBackend>) -> Self {
-        self.worker = worker;
-        self
     }
 
     /// Attach the shared health registry so MCP connect outcomes are recorded per invocation.
     pub fn with_health(mut self, health: Arc<crate::health::HealthRegistry>) -> Self {
         self.health = Some(health);
         self
-    }
-
-    /// The NARROWED env a containerized worker receives — ONLY the model-channel creds/flags from the
-    /// client env (gateway or Anthropic). The duck's ambient/forwarded env and host `PATH`/`HOME` are
-    /// deliberately excluded (the container has its own toolchain + PATH); `OPENAI_MODEL` and
-    /// `DACK_BRIDGE_CWD` are added by `invoke`. Least privilege: the worker can call the model, nothing more.
-    fn worker_env(&self) -> std::collections::BTreeMap<String, String> {
-        const KEYS: &[&str] = &[
-            "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE", "CLAUDE_CODE_USE_OPENAI",
-            "OPENAI_API_FORMAT", // wire API (chat_completions|responses) — keep workers on the same surface
-            "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN",
-            "DISABLE_AUTO_COMPACT", // behaviour flag (not a secret) — keep the SDK's compaction off here too
-        ];
-        self.env
-            .iter()
-            .filter(|(k, _)| KEYS.contains(&k.as_str()))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
     }
 
     /// Render context blocks into one user turn with **visible trust framing**:
@@ -298,10 +238,6 @@ fn resolve_model_env(
 
 #[async_trait]
 impl RuntimeClient for OpenClaudeClient {
-    fn worker_guest_cwd(&self) -> Option<PathBuf> {
-        self.worker.as_ref().map(|w| w.cwd.clone())
-    }
-
     async fn invoke(
         &self,
         req: InvocationRequest,
@@ -313,50 +249,9 @@ impl RuntimeClient for OpenClaudeClient {
         let (openai_model_env, options_model) =
             resolve_model_env(self.model_via_env, req.model.as_deref(), self.model.as_deref());
 
-        // a delegated worker (`req.isolate`) with a configured backend runs the bridge in a
-        // CONTAINER, everything GUEST-relative — the workspace is bind-mounted at the guest cwd,
-        // `DACK_BRIDGE_CWD` IS that guest cwd, and the caller set the wall's repo_root to the SAME guest
-        // path (the SDK inside the container emits container-absolute paths; the three must agree or
-        // writes fail to relativize → denied). Env is NARROWED to the model channel. The duck
-        // (`isolate:false`) takes the host path below — byte-for-byte today's behavior (workdir mounted
-        // rw, the harness env inherited; the bridge chdir's to `DACK_BRIDGE_CWD` before loading the SDK).
-        let worker = if req.isolate { self.worker.as_ref() } else { None };
-        let (sandbox, spec): (&Arc<dyn Sandbox>, ProcessSpec) = match worker {
-            Some(w) => {
-                let host_ws = req.workdir.clone().unwrap_or_else(|| PathBuf::from("."));
-                let guest = w.cwd.clone();
-                let mut env = self.worker_env();
-                if let Some(m) = &openai_model_env {
-                    env.insert("OPENAI_MODEL".to_string(), m.clone());
-                }
-                env.insert("DACK_BRIDGE_CWD".to_string(), guest.to_string_lossy().into_owned());
-                // The SDK writes its config (`~/.openclaude.json`) at init — but the container rootfs
-                // is `--read-only`, so point `HOME` at the writable `/tmp` tmpfs (else EROFS on /root).
-                env.insert("HOME".to_string(), "/tmp".to_string());
-                // Tell the SDK it is ALREADY in a sandbox so it does NOT enable its own (Docker-based)
-                // bash sandbox — which can't run inside this container (no docker-in-docker) and dies
-                // with "failed to connect to the docker API". DACK's container IS the sandbox.
-                env.insert("IS_SANDBOX".to_string(), "1".to_string());
-                env.extend(req.secret_env.clone()); // empty for a worker today, honored if ever set
-                let mut mounts =
-                    vec![Mount { host: host_ws.clone(), guest: guest.clone(), writable: true }];
-                mounts.extend(req.mounts.iter().cloned()); // the agent's read-only `volumes:`
-                // Container name = the workspace dir basename (a unique run-id) so the harness can
-                // reap it by name (`kill_on_drop` only kills the local `docker` client).
-                let name = host_ws.file_name().map(|n| n.to_string_lossy().into_owned());
-                let spec = ProcessSpec {
-                    command: w.command.clone(),
-                    cwd: guest,
-                    env,
-                    clear_env: false,
-                    kind: ExecKind::Worker,
-                    mounts,
-                    policy: w.policy.clone(),
-                    name,
-                };
-                (&w.sandbox, spec)
-            }
-            None => {
+        // The bridge runs on the host, workdir (the soul) mounted rw, the harness env inherited; the
+        // bridge chdir's to `DACK_BRIDGE_CWD` before loading the SDK.
+        let spec: ProcessSpec = {
                 let mut env: std::collections::BTreeMap<String, String> =
                     self.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
                 env.extend(req.secret_env.clone());
@@ -380,10 +275,10 @@ impl RuntimeClient for OpenClaudeClient {
                     policy: self.policy.clone(),
                     name: None,
                 };
-                (&self.sandbox, spec)
-            }
+                spec
         };
-        let mut child = sandbox
+        let mut child = self
+            .sandbox
             .command(&spec)?
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -407,7 +302,7 @@ impl RuntimeClient for OpenClaudeClient {
             system_prompt: &req.system_prompt,
             user_prompt: Self::render_blocks(&req.blocks),
             disallowed_tools: disallowed_for(&req.spec),
-            allowed_tools: req.allowed_tools.clone(),
+            allowed_tools: None, // no pinned allow-list for the duck (kept on the wire for the bridges)
             // Catalog path only — None on the gateway (the model went via OPENAI_MODEL above).
             model: options_model.as_deref(),
             cwd: req.workdir.as_deref().and_then(|p| p.to_str()),
@@ -415,7 +310,6 @@ impl RuntimeClient for OpenClaudeClient {
             resume: req.session.as_ref().map(|s| s.0.as_str()),
             mcp_servers: &req.mcp_servers,
             mcp_deferred: &req.mcp_deferred,
-            agents: &req.agents,
             media: &req.media,
         };
 
@@ -511,26 +405,15 @@ async fn write_line<W: AsyncWriteExt + Unpin>(w: &mut W, msg: &ToBridge<'_>) -> 
 mod tests {
     use super::*;
     use crate::runtime::ContextBlock;
-    use crate::state::{default_spec, worker_spec, ConsciousnessState};
+    use crate::state::{default_spec, ConsciousnessState};
     use std::sync::Mutex;
 
-    /// The duck never gets raw shell (Bash stays disallowed at the SDK layer); a WORKER (whose spec
-    /// admits `Shell`) keeps Bash so its native tool calls actually execute. Other exec tools stay off.
+    /// The duck never gets raw shell/exec at the SDK layer, nor TodoWrite/snip.
     #[test]
-    fn disallowed_tools_strips_bash_for_duck_keeps_it_for_worker() {
+    fn disallowed_tools_strip_shell_and_noise_for_the_duck() {
         let duck = disallowed_for(&default_spec(ConsciousnessState::Express));
-        assert!(duck.contains(&"Bash".to_string()), "the duck must NOT get Bash");
-
-        let worker = disallowed_for(&worker_spec());
-        assert!(!worker.contains(&"Bash".to_string()), "a worker MUST keep Bash");
-        // The other exec tools remain disallowed even for a worker (it builds with Bash, not these).
-        assert!(worker.contains(&"PowerShell".to_string()));
-        assert!(worker.contains(&"KillShell".to_string()));
-        // TodoWrite + snip: hidden from the duck (noise / context-trim confabulation risk), kept for a
-        // worker (task tracking / long agentic sessions).
-        for t in ["TodoWrite", "snip"] {
+        for t in ["Bash", "PowerShell", "KillShell", "TodoWrite", "snip"] {
             assert!(duck.contains(&t.to_string()), "the duck must NOT get {t}");
-            assert!(!worker.contains(&t.to_string()), "a worker keeps {t}");
         }
     }
 
@@ -540,7 +423,6 @@ mod tests {
     #[test]
     fn invoke_serializes_mcp_deferred_as_snake_case_array() {
         let servers = std::collections::BTreeMap::new();
-        let agents = std::collections::BTreeMap::new();
         let deferred = vec!["cove".to_string(), "rootai".to_string()];
         let invoke = ToBridge::Invoke {
             system_prompt: "s",
@@ -552,7 +434,6 @@ mod tests {
             resume: None,
             mcp_servers: &servers,
             mcp_deferred: &deferred,
-            agents: &agents,
             media: &[],
         };
         let v = serde_json::to_value(&invoke).unwrap();
@@ -571,7 +452,6 @@ mod tests {
             resume: None,
             mcp_servers: &servers,
             mcp_deferred: &empty,
-            agents: &agents,
             media: &[],
         };
         assert_eq!(serde_json::to_value(&invoke2).unwrap()["mcp_deferred"], serde_json::json!([]));
@@ -640,7 +520,6 @@ mod tests {
             model_via_env: false,
             sandbox: Arc::new(HostSandbox),
             policy: IsolationPolicy::host_passthrough(),
-            worker: None,
             timeout: Duration::from_secs(30),
             health: None,
         }
@@ -661,10 +540,6 @@ mod tests {
             mcp_servers: Default::default(),
             mcp_deferred: Vec::new(),
             model: None,
-            agents: Default::default(),
-            isolate: false,
-            mounts: Vec::new(),
-            allowed_tools: None,
             timeout: None,
             media: Vec::new(),
         }
@@ -731,7 +606,7 @@ mod tests {
         assert!(recall.last_ok.is_some());
     }
 
-    // ── Docker-isolated workers ────────────────────────────────────────────────
+    // ── invoke → sandbox spec ────────────────────────────────────────────────
 
     /// Records the [`ProcessSpec`] it's handed, then runs a fixed mock bridge so the NDJSON protocol
     /// completes — lets us assert the spec the runtime builds WITHOUT a real Docker daemon (it ignores
@@ -752,9 +627,8 @@ mod tests {
     const RESULT_MOCK: &str = "#!/bin/sh\nread invoke\n\
         printf '{\"kind\":\"result\",\"output\":{\"thought\":\"ok\",\"transition\":{\"to_prompt\":null}}}\\n'\n";
 
-    /// A client whose sandbox (and, optionally, worker backend) is a [`RecordingSandbox`]. The env
-    /// carries a gateway cred (must cross to a worker) + `DACK_HANDLE` (a duck-ambient var that must NOT).
-    fn recording_client(tag: &str, with_worker: bool) -> (OpenClaudeClient, Arc<RecordingSandbox>) {
+    /// A client whose sandbox is a [`RecordingSandbox`]; the env carries a gateway cred + `DACK_HANDLE`.
+    fn recording_client(tag: &str) -> (OpenClaudeClient, Arc<RecordingSandbox>) {
         let dir = std::env::temp_dir().join(format!("dack-recsb-{}-{}", tag, std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mock.sh");
@@ -768,13 +642,7 @@ mod tests {
         let mut env = HashMap::new();
         env.insert("OPENAI_API_KEY".into(), "sk-test".into());
         env.insert("CLAUDE_CODE_USE_OPENAI".into(), "1".into());
-        env.insert("DACK_HANDLE".into(), "duck".into()); // ambient — must NOT reach the worker
-        let worker = with_worker.then(|| WorkerBackend {
-            sandbox: rec.clone(),
-            policy: IsolationPolicy::locked_down("dack/worker:test"),
-            command: vec!["bun".into(), "run".into(), "/app/openclaude-bridge/bridge.ts".into()],
-            cwd: PathBuf::from("/workspace"),
-        });
+        env.insert("DACK_HANDLE".into(), "duck".into());
         let client = OpenClaudeClient {
             command: vec!["bun".into(), "run".into(), "bridge.ts".into()],
             cwd: Some(PathBuf::from("/bridge")),
@@ -783,16 +651,15 @@ mod tests {
             model_via_env: true,
             sandbox: rec.clone(),
             policy: IsolationPolicy::host_passthrough(),
-            worker,
             timeout: Duration::from_secs(30),
             health: None,
         };
         (client, rec)
     }
 
-    fn worker_req(workdir: &str, isolate: bool, mounts: Vec<Mount>) -> InvocationRequest {
+    fn duck_req(workdir: &str) -> InvocationRequest {
         InvocationRequest {
-            spec: crate::state::worker_spec(),
+            spec: default_spec(ConsciousnessState::Express),
             system_prompt: "agent prompt".into(),
             blocks: vec![],
             session: None,
@@ -801,58 +668,16 @@ mod tests {
             mcp_servers: Default::default(),
             mcp_deferred: Vec::new(),
             model: None,
-            agents: Default::default(),
-            isolate,
-            mounts,
-            allowed_tools: None,
             timeout: None,
             media: Vec::new(),
         }
     }
 
-    /// The crux: an isolated worker runs from the in-image command at the GUEST `/workspace`, with the
-    /// workspace bind-mounted rw + the agent's ro volumes, a reap-`--name`, and a NARROWED env.
-    #[tokio::test]
-    async fn worker_invoke_builds_guest_spec_with_narrowed_env() {
-        let (client, rec) = recording_client("wspec", true);
-        let mounts = vec![Mount {
-            host: PathBuf::from("/soul/memory"),
-            guest: PathBuf::from("/mnt/memory"),
-            writable: false,
-        }];
-        let req = worker_req("/soul/workspaces/dack-worker-coder-1-0", true, mounts);
-        client
-            .invoke(req, Arc::new(Recorder { asked: Mutex::new(vec![]), allow: true }))
-            .await
-            .unwrap();
-        let spec = rec.last.lock().unwrap().clone().unwrap();
-        assert_eq!(spec.kind, ExecKind::Worker);
-        assert_eq!(spec.command, vec!["bun", "run", "/app/openclaude-bridge/bridge.ts"]);
-        assert_eq!(spec.cwd, PathBuf::from("/workspace"));
-        assert_eq!(spec.policy.image, "dack/worker:test");
-        // mount[0] = workspace rw at the guest cwd; mount[1] = the agent's ro volume.
-        assert_eq!(spec.mounts[0].host, PathBuf::from("/soul/workspaces/dack-worker-coder-1-0"));
-        assert_eq!(spec.mounts[0].guest, PathBuf::from("/workspace"));
-        assert!(spec.mounts[0].writable);
-        assert_eq!(spec.mounts[1].guest, PathBuf::from("/mnt/memory"));
-        assert!(!spec.mounts[1].writable);
-        // Reap name = the workspace basename.
-        assert_eq!(spec.name.as_deref(), Some("dack-worker-coder-1-0"));
-        // GUEST-path triple: DACK_BRIDGE_CWD == the guest cwd (or writes wouldn't relativize).
-        assert_eq!(spec.env.get("DACK_BRIDGE_CWD").map(String::as_str), Some("/workspace"));
-        // HOME → the writable /tmp tmpfs (the SDK writes ~/.openclaude.json; rootfs is --read-only).
-        assert_eq!(spec.env.get("HOME").map(String::as_str), Some("/tmp"));
-        // Narrowed env: the gateway cred crosses; the duck's ambient env does NOT.
-        assert_eq!(spec.env.get("OPENAI_API_KEY").map(String::as_str), Some("sk-test"));
-        assert!(!spec.env.contains_key("DACK_HANDLE"), "ambient duck env must not enter the container");
-    }
-
-    /// Back-compat guard: `isolate:false` (the duck) takes the host path — host command, host==guest
-    /// mount, the FULL ambient env, no container name. Unchanged from before .
+    /// The duck's invoke: host command, host==guest mount of the soul, the FULL ambient env, no container.
     #[tokio::test]
     async fn host_invoke_keeps_full_env_and_host_mount() {
-        let (client, rec) = recording_client("hspec", true); // worker present, but isolate:false
-        let req = worker_req("/soul", false, vec![]);
+        let (client, rec) = recording_client("hspec");
+        let req = duck_req("/soul");
         client
             .invoke(req, Arc::new(Recorder { asked: Mutex::new(vec![]), allow: true }))
             .await
@@ -865,20 +690,6 @@ mod tests {
         assert!(spec.env.contains_key("DACK_HANDLE"), "host path inherits the full ambient env");
     }
 
-    /// `isolate:true` but no worker backend configured ⇒ host fallback (the CLI preflight already
-    /// hard-failed the boot if `require`-d Docker was missing; here the operator chose host fallback).
-    #[tokio::test]
-    async fn isolate_without_worker_backend_falls_back_to_host() {
-        let (client, rec) = recording_client("fb", false); // worker: None
-        let req = worker_req("/soul/ws", true, vec![]);
-        client
-            .invoke(req, Arc::new(Recorder { asked: Mutex::new(vec![]), allow: true }))
-            .await
-            .unwrap();
-        let spec = rec.last.lock().unwrap().clone().unwrap();
-        assert_eq!(spec.kind, ExecKind::Agent, "no backend → host path");
-        assert!(spec.name.is_none());
-    }
 
     #[tokio::test]
     async fn invoke_times_out_on_a_hung_bridge() {

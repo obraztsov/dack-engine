@@ -140,7 +140,7 @@ by hand — tweak a prompt, add a duty, fix memory — the tripwire would revert
 `dack reconcile` first: it commits your tracked edits as the operator, so the tripwire treats them as
 intended.
 
-Files the soul gitignores (worker `workspaces/`, secrets) are invisible to the tripwire and never
+Files the soul gitignores (`runlogs/`, secrets) are invisible to the tripwire and never
 reverted.
 
 ## Reconfiguring a running duck (remote-authoritative soul)
@@ -170,14 +170,9 @@ bounds how fast the agent changes itself.
 Long-running channel adapters run as `modules` under the supervisor — they start and stop with
 `dack run`, restart on failure, and need no separate process management. See [channels](channels.md).
 
-## Workers
-
-Delegated workers run on the host by default. To OS-isolate them in Docker, build the worker image and
-enable `runtime.worker_sandbox`; see [workers](workers.md). Worker `workspaces/` are swept at boot.
-
 ## Production checklist
 
-- Gitignore `dack.config.yaml`, `/identities/`, `/secrets/`, and the soul's `workspaces/`.
+- Gitignore `dack.config.yaml`, `/identities/`, `/secrets/`, and the soul's `runlogs/`.
 - Run `dack run` under a supervisor with a restart policy.
 - Set `soul_remotes` + `identities.soul` to push the soul off-box for attributable history (a plain-git
   remote is author-attributable; list several for redundancy).

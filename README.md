@@ -55,7 +55,6 @@ Full walkthrough: **[docs/getting-started.md](docs/getting-started.md)**.
 | [Capabilities](docs/capabilities.md) | Give the agent tools (MCP servers) |
 | [Skills](docs/skills.md) | Signed executable capability packages (`RunSkillCommand`) |
 | [Channels](docs/channels.md) | Telegram (incl. images/voice), Buzz, email, attachments, notify |
-| [Workers](docs/workers.md) | Delegated, sandboxed subagents |
 | [Pond manager](docs/pond-manager.md) | The duck-as-CEO surface over a pond leader |
 | [Operations](docs/operations.md) | Daemon lifecycle, soul repos, identities, health |
 | [Deployment](docs/deployment.md) | Containerized + multi-duck (image = code, per-duck volume) |
@@ -85,7 +84,7 @@ Release notes live in **[CHANGELOG.md](CHANGELOG.md)**.
 The harness is functional and runs in production: the full ingestion → consciousness loop, the
 trust/state model, MCP capabilities, **signed executable skills**, channels (Telegram — with images and
 voice —, Buzz, email, and X), **bidirectional file attachments**, a separate **operational-notification**
-lane, delegated workers, and a signed soul repo. It is **multithreaded** (independent conversations
+lane, and a signed soul repo. It is **multithreaded** (independent conversations
 process concurrently; a conversation and any memory-writing cycle serialize), keeps short-term memory in a
 **SQLite** runlog, and ships a **containerized, multi-duck** deployment (one image, a directory per duck).
 The runtime is wired for OpenClaude over any OpenAI-compatible endpoint (an in-house `duck-loop` engine is

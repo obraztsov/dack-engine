@@ -192,13 +192,6 @@ secrets:
 #       BUZZ_BIN: /usr/local/bin/buzz             #   buzz connector: the buzz CLI path…
 #       BUZZ_RELAY_URL: "https://buzz.a.pond.city" #  …and the relay (buzz_key secret → BUZZ_PRIVATE_KEY).
 
-# ── Delegated workers (Docker isolation) ─────────────────────────────────────────────────────────
-# When enabled, an agent def with `isolation: docker` runs its worker's bridge in a container. Build
-# the image first: `docker build -f Dockerfile.worker -t dack/worker:latest .`. See docs/workers.md.
-# runtime.worker_sandbox:               # (nest under `runtime:` above)
-#   enabled: false
-#   image: dack/worker:latest
-
 # ── Soul push destinations + identities ──────────────────────────────────────────────────────────
 # The soul is ONE local git repo; `soul_remotes` is the LIST of places the harness pushes it (a plain
 # `git push`) after each cycle. Several entries = redundancy (a reliable primary + best-effort

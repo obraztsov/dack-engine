@@ -92,10 +92,11 @@ model via `OPENAI_MODEL`, so you point it at any OpenAI-compatible endpoint. (A 
 
 ## The sandbox seam
 
-Subprocesses (sensors, the bridge, modules, workers) are spawned through a `Sandbox` trait
+Subprocesses (sensors, the bridge, modules) are spawned through a `Sandbox` trait
 (`src/sandbox/`). The default `HostSandbox` runs them directly; a `DockerSandbox` maps an isolation
-policy to `docker run` flags. This is how delegated **workers** get OS-level isolation
-(see [workers](workers.md)) and where future sensor/container hardening slots in.
+policy to `docker run` flags. This is where future sensor/container hardening slots in. Delegation
+is not a subprocess: the agent delegates by posting a brief to another Buzz agent (e.g. Hermes), and
+the result comes back on Buzz as an ordinary untrusted stimulus.
 
 ## The soul repo
 
@@ -164,7 +165,7 @@ tools.
 | `src/sensor/` | run a duty's fetch script under a read-scoped sandbox |
 | `src/bus/` | normalize → coalesce → seed trust → enqueue |
 | `src/queue/` | embedded SQLite queue (durable, leased, coalescing, debounce) |
-| `src/harness/` | the consciousness loop, dispatch, the wall integration, modules, workers, Reflect |
+| `src/harness/` | the consciousness loop, dispatch, the wall integration, modules, Reflect |
 | `src/state/` + `src/state_prompt.rs` | consciousness states, tool classes, state-prompt parsing |
 | `src/runtime/` | the `RuntimeClient` seam + the OpenClaude bridge driver + the wall responder |
 | `src/sandbox/` | the `Sandbox` seam (host / docker) |

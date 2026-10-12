@@ -72,7 +72,7 @@ pub fn classify_tool(
         }
 
         // NETWORK egress — reaches an arbitrary external URL / a search provider. Its OWN class
-        // (`Net`), scoped to Perceive only (+ the sandboxed worker) — an exfil/SSRF/callback surface an
+        // (`Net`), scoped to Perceive only — an exfil/SSRF/callback surface an
         // injected ACT cycle must never reach, so it is NOT lumped with local reads.
         "WebFetch" | "WebSearch" => (ToolClass::Net, None),
 
@@ -83,7 +83,7 @@ pub fn classify_tool(
         // NB: `snip` (the SDK context trimmer) is deliberately NOT here — it falls to `Other` → denied for
         // the duck. Tried allowing it (Read, 2026-07-10) and reverted (2026-07-16): the model snipped its
         // OWN grounding (the first user message / recall results — every user message is snippable, no
-        // first-message protection) and confabulated a whole fake project in a Reflect. Workers keep it
+        // first-message protection) and confabulated a whole fake project in a Reflect. Denied
         // (their scope admits `Other`); the duck must not trim its own context. See `disallowed_for`.
 
         // File writes — the path decides memory vs soul (gated by writable_dirs).
@@ -157,7 +157,7 @@ mod tests {
         assert_eq!(c, ToolClass::FileWrite);
         assert_eq!(p.as_deref(), Some("memory/log.md"));
         // `snip` (the SDK's context trimmer) → `Other`: DENIED for the duck (it snipped its own grounding
-        // and confabulated). A worker keeps it because its scope admits `Other`.
+        // and confabulated).
         assert_eq!(classify_tool("snip", &json!({"message_ids": ["ab12cd"]}), &settle(), &post(), &read()).0, ToolClass::Other);
     }
 

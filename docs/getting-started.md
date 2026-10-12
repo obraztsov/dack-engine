@@ -14,8 +14,8 @@ required.
 - **A model endpoint** — an OpenAI-compatible gateway (base URL + key + a model id). Any provider that
   speaks the OpenAI chat API works.
 - *Optional:* **python3** — only if you enable the built-in X/Twitter capability or its duties (the
-  provider scripts are stdlib-only, no `pip`). **Docker** — only if you turn on sandboxed workers
-  (`runtime.worker_sandbox`); the daemon itself never runs in a container.
+  provider scripts are stdlib-only, no `pip`). Docker is only needed for the containerized deployment
+  (see [deployment](deployment.md)); the daemon itself runs fine on the host.
 
 Identities are native Ed25519 keys created with `dack keygen` — no external key-management tool required.
 

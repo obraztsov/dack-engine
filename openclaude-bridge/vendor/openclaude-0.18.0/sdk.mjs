@@ -240259,7 +240259,10 @@ async function* openaiStreamToAnthropic(response, model2, signal) {
             }
           }
         }
-        if (!hasEmittedFinalUsage && chunkUsage && (chunk.choices?.length ?? 0) === 0 && lastStopReason !== null) {
+        // DACK patch (2026-10-13): OpenRouter sends the final `usage` on a TRAILING chunk that repeats the
+        // choice's finish_reason (swallowed above by hasProcessedFinishReason) instead of an empty-choices
+        // chunk — so without this the result usage read 0 and the harness lost all token/cost accounting.
+        if (!hasEmittedFinalUsage && chunkUsage && lastStopReason !== null) {
           yield {
             type: "message_delta",
             delta: { stop_reason: lastStopReason, stop_sequence: null },

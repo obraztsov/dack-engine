@@ -43,7 +43,71 @@ export function openRoutesStore(path: string): Database {
     configured INTEGER NOT NULL DEFAULT 0,
     seen_at    INTEGER NOT NULL
   )`)
+  // Emoji REACTIONS (kind:7) seen on the relay — the ingress polls them per channel, the react MCP records its
+  // own. Keyed by the reaction event id; `target_id` is the message reacted to. Read back onto the wake spine
+  // and into `own_replies`, so a 👀 from Jarvis on a task post reads as the acknowledgement it is.
+  db.exec(`CREATE TABLE IF NOT EXISTS reactions (
+    event_id   TEXT PRIMARY KEY,
+    target_id  TEXT NOT NULL,
+    channel    TEXT NOT NULL,
+    pubkey     TEXT NOT NULL,
+    emoji      TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    seen_at    INTEGER NOT NULL
+  )`)
+  db.exec('CREATE INDEX IF NOT EXISTS reactions_target ON reactions (target_id)')
   return db
+}
+
+// ── reactions ──────────────────────────────────────────────────────────────────────────────────────
+
+export type ReactionRow = { event_id: string; target_id: string; channel: string; pubkey: string; emoji: string; created_at: number }
+/** One message's reactions, folded per emoji: who (pubkeys) reacted with what, oldest emoji first. */
+export type ReactionSummary = { emoji: string; count: number; by: string[] }
+
+/** Record reactions (idempotent on the reaction event id). A kind:7 whose target is unknown is kept too —
+ *  the message it points at may be older than the poll window, and `own_replies` reads by target. */
+export function upsertReactions(db: Database, rows: ReactionRow[], now = Math.floor(Date.now() / 1000)): number {
+  if (!rows.length) return 0
+  let n = 0
+  const tx = db.transaction((rs: ReactionRow[]) => {
+    const q = db.query(
+      `INSERT INTO reactions (event_id, target_id, channel, pubkey, emoji, created_at, seen_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(event_id) DO NOTHING`,
+    )
+    for (const r of rs) {
+      if (!r.event_id || !r.target_id || !r.emoji) continue
+      n += q.run(r.event_id, r.target_id, r.channel, r.pubkey, r.emoji.slice(0, 32), r.created_at, now).changes
+    }
+  })
+  tx(rows)
+  return n
+}
+
+/** Forget a reaction by (target, pubkey, emoji) — used when the duck removes its own. */
+export function deleteReaction(db: Database, targetId: string, pubkey: string, emoji: string): number {
+  return db.run('DELETE FROM reactions WHERE target_id = ? AND pubkey = ? AND emoji = ?', [targetId, pubkey, emoji]).changes
+}
+
+export function reactionsFor(db: Database, targetId: string): ReactionRow[] {
+  return db.query('SELECT event_id, target_id, channel, pubkey, emoji, created_at FROM reactions WHERE target_id = ? ORDER BY created_at').all(targetId) as ReactionRow[]
+}
+
+/** Pure: fold rows into `[{emoji, count, by}]`; `label` renders a pubkey (a name, "you", a prefix). */
+export function summarizeReactions(rows: ReactionRow[], label: (pubkey: string) => string = (p) => p.slice(0, 8)): ReactionSummary[] {
+  const order: string[] = []
+  const by = new Map<string, Set<string>>()
+  for (const r of [...rows].sort((a, b) => a.created_at - b.created_at)) {
+    if (!by.has(r.emoji)) {
+      by.set(r.emoji, new Set())
+      order.push(r.emoji)
+    }
+    by.get(r.emoji)!.add(r.pubkey)
+  }
+  return order.map((emoji) => {
+    const who = [...by.get(emoji)!]
+    return { emoji, count: who.length, by: who.map(label) }
+  })
 }
 
 // ── channel index ──────────────────────────────────────────────────────────────────────────────────

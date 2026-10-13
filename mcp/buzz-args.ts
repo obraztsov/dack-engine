@@ -225,6 +225,7 @@ export const READ_ALLOW = new Set([
   'users get',
   'feed get',
   'mem ls', 'mem get',
+  'reactions get',
 ])
 
 /** Every verb word in the buzz CLI that MUTATES. Used as a backstop scan over the naive positional path:

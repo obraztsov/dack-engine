@@ -19,6 +19,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
 import { execBuzz } from './buzz-exec'
 import { openChannelIndex, resolveOne } from './buzz-channels'
+import { openRoutesStore, reactionsFor, summarizeReactions, type ReactionSummary } from './ingress-routes'
 
 export type ThreadEv = { id: string; pubkey: string; content: string; created_at: number; tags?: string[][] }
 
@@ -45,11 +46,11 @@ export type OwnRepliesSummary = {
   thread_root: string
   you_spoke: boolean
   own_count: number
-  /** Your most recent replies, oldest → newest. */
-  own: { id: string; at: string; reply_to: string | null; content: string }[]
+  /** Your most recent replies, oldest → newest. `reactions` (when any): who acknowledged it with what. */
+  own: { id: string; at: string; reply_to: string | null; content: string; reactions?: ReactionSummary[] }[]
   last_own_at: string | null
   /** What others posted AFTER your last reply — the only thing a new reply could be answering. */
-  since_your_last: { count: number; from_others: { id: string; from: string; at: string; content: string }[] }
+  since_your_last: { count: number; from_others: { id: string; from: string; at: string; content: string; reactions?: ReactionSummary[] }[] }
   hint: string
 }
 
@@ -57,27 +58,33 @@ export function ownRepliesSummary(
   evs: ThreadEv[],
   self: string,
   root: string,
-  opts: { maxOwn?: number; maxOthers?: number; clipOwn?: number; clipOthers?: number } = {},
+  opts: { maxOwn?: number; maxOthers?: number; clipOwn?: number; clipOthers?: number; reactionsOf?: (id: string) => ReactionSummary[] } = {},
 ): OwnRepliesSummary {
-  const { maxOwn = 5, maxOthers = 6, clipOwn = 600, clipOthers = 240 } = opts
+  const { maxOwn = 5, maxOthers = 6, clipOwn = 600, clipOthers = 240, reactionsOf = () => [] } = opts
+  const withReactions = <T extends { id: string }>(o: T): T & { reactions?: ReactionSummary[] } => {
+    const r = reactionsOf(o.id)
+    return r.length ? { ...o, reactions: r } : o
+  }
   const sorted = [...evs].sort((a, b) => a.created_at - b.created_at || a.id.localeCompare(b.id))
   const mine = sorted.filter((e) => e.pubkey === self)
   const last = mine.length ? mine[mine.length - 1] : null
   const after = last ? sorted.filter((e) => e.pubkey !== self && e.created_at >= last.created_at && e.id !== last.id) : []
+  const lastReactions = last ? reactionsOf(last.id).filter((r) => r.by.some((b) => b !== 'you')) : []
+  const acked = lastReactions.length ? ` (your last post was acknowledged with ${lastReactions.map((r) => r.emoji).join(' ')} — that is the reply)` : ''
   const hint = !last
     ? 'you have not posted in this thread'
     : after.length === 0
-      ? 'NOTHING arrived after your last reply — a reply now would repeat yourself; `[]` unless you have something new'
+      ? `NOTHING arrived after your last reply${acked} — a reply now would repeat yourself; \`[]\` unless you have something new`
       : `${after.length} message(s) from others since your last reply — answer only what THEY add, not the earlier questions you already covered`
   return {
     thread_root: root,
     you_spoke: mine.length > 0,
     own_count: mine.length,
-    own: mine.slice(-maxOwn).map((e) => ({ id: e.id, at: iso(e.created_at), reply_to: replyTarget(e), content: clip(e.content ?? '', clipOwn) })),
+    own: mine.slice(-maxOwn).map((e) => withReactions({ id: e.id, at: iso(e.created_at), reply_to: replyTarget(e), content: clip(e.content ?? '', clipOwn) })),
     last_own_at: last ? iso(last.created_at) : null,
     since_your_last: {
       count: after.length,
-      from_others: after.slice(-maxOthers).map((e) => ({ id: e.id, from: e.pubkey.slice(0, 8), at: iso(e.created_at), content: clip(e.content ?? '', clipOthers) })),
+      from_others: after.slice(-maxOthers).map((e) => withReactions({ id: e.id, from: e.pubkey.slice(0, 8), at: iso(e.created_at), content: clip(e.content ?? '', clipOthers) })),
     },
     hint,
   }
@@ -119,7 +126,11 @@ export function registerOwnRepliesTool(server: McpServer, tag: string): void {
       if (!r.ok) return asText(r)
       const evs = parseThreadEvents(r.out ?? '')
       if (!evs.length) return asText({ ok: false, error: 'thread unreadable or empty (is `channel` the channel this thread lives in?)' })
-      const s = ownRepliesSummary(evs, SELF, root)
+      // Reactions from the shared store (the ingress polls kind:7): a 👀 on your task post is the acknowledgement.
+      const routesDb = process.env.INGRESS_ROUTES_DB
+      const rstore = routesDb ? openRoutesStore(routesDb) : null
+      const reactionsOf = rstore ? (id: string) => summarizeReactions(reactionsFor(rstore, id), (p) => (p === SELF ? 'you' : p.slice(0, 8))) : undefined
+      const s = ownRepliesSummary(evs, SELF, root, { reactionsOf })
       console.error(`[${tag}] own_replies root=${root.slice(0, 8)}… own=${s.own_count} since=${s.since_your_last.count}`)
       return asText({ ok: true, ...s })
     },

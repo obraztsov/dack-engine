@@ -16,7 +16,7 @@
  * BUZZ_PRIVATE_KEY is injected by the module's `buzz_key` secret; never logged.
  */
 
-import { openRoutesStore, lookupArm, upsertChannels } from './ingress-routes'
+import { openRoutesStore, lookupArm, upsertChannels, upsertReactions, reactionsFor, summarizeReactions, type ReactionSummary } from './ingress-routes'
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
 import { join, isAbsolute, resolve as resolvePath } from 'node:path'
 
@@ -200,9 +200,12 @@ function resolveName(pubkey: string): string {
   return name
 }
 
-type SpineEv = { id: string; from: string; from_name: string; content: string; created_at: number; attachments?: MediaMeta[] }
+type SpineEv = { id: string; from: string; from_name: string; content: string; created_at: number; attachments?: MediaMeta[]; reactions?: ReactionSummary[] }
 const compactEv = (e: Ev): SpineEv => {
   const attachments = parseImeta(e) // P3: an ancestor's images are fetchable too (media_get by sha)
+  // Reactions seen on this message (kind:7, polled into the routes store): a 👀 from a worker on a task post
+  // IS its acknowledgement — present only when there are any, so a reaction-less wake is byte-for-byte unchanged.
+  const reactions = summarizeReactions(reactionsFor(routes, e.id), (p) => (p === cfg.self_pubkey ? 'you' : resolveName(p)))
   return {
     id: e.id,
     from: e.pubkey,
@@ -210,6 +213,7 @@ const compactEv = (e: Ev): SpineEv => {
     content: e.content,
     created_at: e.created_at,
     ...(attachments.length ? { attachments } : {}),
+    ...(reactions.length ? { reactions } : {}),
   }
 }
 
@@ -436,6 +440,29 @@ async function pollChannel(ch: { id: string; name?: string }): Promise<void> {
   saveCursor()
 }
 
+/** Poll the channel's REACTIONS (kind:7) into the shared store. Never a wake — a reaction is information the
+ *  next wake reads off its spine / `own_replies` (a 👀 on your task post = acknowledged, don't ping for it).
+ *  Own cursor key: a reaction's time must not move the message cursor. */
+function pollReactions(ch: { id: string; name?: string }): void {
+  const key = `${ch.id}:reactions`
+  const first = cursor[key] === undefined
+  const since = first ? Math.floor(Date.now() / 1000) - cfg.first_run_lookback_secs : cursor[key]
+  const evs: Ev[] = buzz(['messages', 'get', '--channel', ch.id, '--since', String(since), '--kinds', '7']) ?? []
+  if (!Array.isArray(evs) || !evs.length) return
+  const rows = evs
+    .filter((e) => e && e.kind === 7 && typeof e.id === 'string')
+    .map((e) => ({ event_id: e.id, target_id: eRefs(e).at(-1)?.id ?? '', channel: ch.id, pubkey: e.pubkey, emoji: (e.content ?? '').trim(), created_at: e.created_at }))
+    .filter((r) => r.target_id && r.emoji)
+  try {
+    const n = upsertReactions(routes, rows)
+    if (n) log(`${n} reaction(s) in ${ch.name ?? ch.id.slice(0, 8)}: ${rows.slice(-n).map((r) => `${r.emoji} ${r.pubkey.slice(0, 8)}→${r.target_id.slice(0, 8)}`).join(', ')}`)
+  } catch (e) {
+    log('reactions write failed:', (e as Error).message)
+  }
+  for (const e of evs) if (e.created_at > (cursor[key] ?? 0)) cursor[key] = e.created_at
+  saveCursor()
+}
+
 // ── main loop ────────────────────────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
@@ -447,12 +474,15 @@ async function main(): Promise<void> {
     for (const ev of Array.isArray(evs) ? evs : []) if (ev.pubkey === cfg.self_pubkey) rememberOwn(ev.id)
   }
   let sinceDiscover = 0
+  let tick = 0
   for (;;) {
     if (sinceDiscover >= cfg.discover_interval_secs) {
       discover()
       sinceDiscover = 0
     }
     for (const ch of channels) await pollChannel(ch)
+    // Reactions every 3rd tick (~30s): cheap awareness, never a wake.
+    if (tick++ % 3 === 0) for (const ch of channels) pollReactions(ch)
     await new Promise((r) => setTimeout(r, cfg.poll_interval_secs * 1000))
     sinceDiscover += cfg.poll_interval_secs
   }

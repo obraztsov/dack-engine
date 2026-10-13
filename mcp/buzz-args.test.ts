@@ -225,3 +225,59 @@ test('confineHostPathFlags: read flags resolve inside the workspace, outside ref
   expect(confineHostPathFlags(['media', 'get', 'abc', '-o', 'outbox/x'], resolve)).toMatchObject({ ok: false }) // a WRITE flag: media_fetch owns it
   expect(confineHostPathFlags(['messages', 'send', '--content', 'no files'], resolve)).toMatchObject({ ok: true, files: [] })
 })
+
+import { coerceArgs } from './buzz-args'
+
+test('coerceArgs: a real array passes through untouched', () => {
+  const r = coerceArgs(['messages', 'send', '--channel', 'research', '--content', 'hi'])
+  expect(r).toEqual({ ok: true, args: ['messages', 'send', '--channel', 'research', '--content', 'hi'], repaired: false })
+})
+
+test('REGRESSION: the live model ships `args` as a JSON string once --content is long (2026-10-13, 11 lost sends)', () => {
+  // Shape 1 — the array serialised as a string (verbatim prefix/suffix of a failed research ack).
+  const s1 = '["messages", "send", "--channel", "research", "--reply-to", "2901653c425dc05701b57ccd4b517f0b69d80202c605f8db8e1034fe79c83ee1", "--content", "Acked — skill update received.\\n\\nNo further research needed on TBA signer; delegation is closed."]'
+  const r1 = coerceArgs(s1)
+  expect(r1.ok).toBe(true)
+  if (r1.ok) {
+    expect(r1.repaired).toBe(true)
+    expect(r1.args.slice(0, 4)).toEqual(['messages', 'send', '--channel', 'research'])
+    expect(r1.args[6]).toBe('--content')
+    expect(r1.args[7]).toContain('delegation is closed.')
+    expect(r1.args[7]).toContain('\n\n') // escapes decoded, newlines preserved
+  }
+  // Shape 2 — a flag written as an object key (colon for a comma): the OPERATOR DECISION PACKET that
+  // never reached c-level that morning.
+  const s2 = '["messages", "send", "--channel", "c-level", "--content": "OPERATOR DECISION PACKET - Agent Token Distributor deploy (expected today). (1) F7 chain id, boundary held (no deploys, no contract edits)."]'
+  const r2 = coerceArgs(s2)
+  expect(r2.ok).toBe(true)
+  if (r2.ok) {
+    expect(r2.args).toHaveLength(6)
+    expect(r2.args[4]).toBe('--content')
+    expect(r2.args[5]).toStartWith('OPERATOR DECISION PACKET')
+    // the colon inside the body stays a colon — only `"--flag":` is rewritten
+    expect(r2.args[5]).toContain('(1) F7 chain id, boundary held')
+  }
+  // Shape 2 with a --reply-to AFTER the colon-keyed content (also observed).
+  const s3 = '["messages", "send", "--channel", "research", "--content": "@jarvis — denied on FORM, not intent.", "--reply-to", "a80804a31bf9d282799555d455f228684908de1e77cbf0e4a80804a31bf9d282"]'
+  const r3 = coerceArgs(s3)
+  expect(r3.ok).toBe(true)
+  if (r3.ok) expect(r3.args).toEqual(['messages', 'send', '--channel', 'research', '--content', '@jarvis — denied on FORM, not intent.', '--reply-to', 'a80804a31bf9d282799555d455f228684908de1e77cbf0e4a80804a31bf9d282'])
+  // A stray `}` before the closing bracket (one observed send ended `."}]`).
+  const s4 = '["messages", "send", "--channel", "research", "--content", "Need to calibrate c-level on timelines."}]'
+  const r4 = coerceArgs(s4)
+  expect(r4.ok).toBe(true)
+  if (r4.ok) expect(r4.args[5]).toBe('Need to calibrate c-level on timelines.')
+})
+
+test('coerceArgs refuses what it cannot make an argv of — nothing is guessed', () => {
+  expect(coerceArgs('messages send --channel research').ok).toBe(false) // bare string: no shell-splitting
+  expect(coerceArgs('["messages", "send", ').ok).toBe(false) // truncated JSON
+  expect(coerceArgs('[]').ok).toBe(false)
+  expect(coerceArgs(['messages', '']).ok).toBe(false)
+  expect(coerceArgs([1, 2]).ok).toBe(false)
+  expect(coerceArgs({ args: ['messages'] }).ok).toBe(false)
+  expect(coerceArgs(new Array(41).fill('x')).ok).toBe(false)
+  const r = coerceArgs('{"content": "hi"}')
+  expect(r.ok).toBe(false)
+  if (!r.ok) expect(r.error).toContain('JSON ARRAY of strings')
+})

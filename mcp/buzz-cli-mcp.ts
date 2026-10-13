@@ -28,7 +28,7 @@ import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { resolveSendable } from './attachments'
 import { execBuzz, stripIdentityFlags, BUZZ_BIN, BUZZ_RELAY, type BuzzResult } from './buzz-exec'
-import { DEFAULT_DENY, deniedVerb, confineHostPathFlags, applySendDefaults, resolveChannelFlags, flagValue } from './buzz-args'
+import { DEFAULT_DENY, deniedVerb, confineHostPathFlags, applySendDefaults, resolveChannelFlags, flagValue, coerceArgs } from './buzz-args'
 import { registerOwnRepliesTool } from './buzz-thread'
 import { openChannelIndex, resolveOne } from './buzz-channels'
 
@@ -90,9 +90,15 @@ server.registerTool(
       (CHANNELS?.directory
         ? ` Address channels by NAME: \`--channel research\` (a name is resolved to its id; an unknown name is refused, nothing sent). Channels: ${CHANNELS.directory}.`
         : ''),
-    inputSchema: { args: z.array(z.string().min(1)).min(1).max(40) },
+    // An array by contract; a JSON string is tolerated and repaired (`coerceArgs`) because the live model
+    // ships long sends that way and the SDK's schema check would otherwise drop the act unseen.
+    inputSchema: { args: z.union([z.array(z.string().min(1)).min(1).max(40), z.string().min(1)]) },
   },
-  async ({ args }: { args: string[] }) => {
+  async ({ args: raw }: { args: string[] | string }) => {
+    const c = coerceArgs(raw)
+    if (!c.ok) return asText({ ok: false, error: c.error })
+    if (c.repaired) console.error(`[buzz-cli] args arrived as a string — repaired to ${c.args.length} items`)
+    const args = c.args
     const d = deniedVerb(args, DENY)
     if (d) return asText({ ok: false, error: `buzz verb "${d}" is not allowed (irreversible/admin). Ask the operator if you need it.` })
     // File-reading flags (`--file`, `--patch-file`, `--body-file`) are CONFINED to the workspace: a workspace

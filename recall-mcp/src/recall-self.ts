@@ -43,7 +43,7 @@ server.registerTool(
       "`page.cursor` for older. `min_trust` (self|org|public) floors out lower-trust chats. Or pass " +
       '`from_ts`/`to_ts` (unix secs) for an explicit window instead of `days`.',
     inputSchema: {
-      days: z.number().int().optional(),
+      days: z.number().positive().optional(), // fractional tolerated (model sent 0.5), clamp floors at 1
       from_ts: z.number().int().optional(),
       to_ts: z.number().int().optional(),
       min_trust: z.string().optional(),
@@ -142,16 +142,26 @@ server.registerTool(
       'Read your typed tag-notes — the "sticky notes" you leave for yourself. `kind`: `memory` (operating ' +
       'memory, per chat) or `digest` (pending items for a digest job); omit for both. `tag` reads one ' +
       "chat/topic; `include_expired: true` also shows already-delivered digest notes; `min_trust` floors " +
-      'by subject trust. Newest first, each with its kind + trust + when + delivered flag.',
+      'by subject trust. Newest first, each with its kind + trust + when + delivered flag. Paged: `limit` ' +
+      '(default 60, max 200) + `offset`; `total`/`has_more` tell you what is left — narrow with `tag`/`kind` ' +
+      'rather than reading everything.',
     inputSchema: {
       kind: z.enum(['memory', 'digest']).optional(),
       tag: z.string().optional(),
       include_expired: z.boolean().optional(),
       min_trust: z.string().optional(),
+      limit: z.number().int().optional(),
+      offset: z.number().int().nonnegative().optional(),
     },
   },
-  async ({ kind, tag, include_expired, min_trust }) =>
-    asText({ ok: true, notes: tagNotes(db, { kind, tag, includeExpired: include_expired, minTrust: min_trust }) }),
+  // Paged: an unbounded dump ran to 34–40k tokens on the loopers (2026-10-13), which the SDK spills to a
+  // file the model then cannot read back (25k cap) — the duck got NOTHING instead of too much.
+  async ({ kind, tag, include_expired, min_trust, limit, offset }) => {
+    const all = tagNotes(db, { kind, tag, includeExpired: include_expired, minTrust: min_trust })
+    const start = offset ?? 0
+    const notes = all.slice(start, start + clamp(limit, 60, 200))
+    return asText({ ok: true, total: all.length, offset: start, returned: notes.length, has_more: start + notes.length < all.length, notes })
+  },
 )
 
 server.registerTool(

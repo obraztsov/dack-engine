@@ -250,3 +250,39 @@ export function readOnlyVerb(args: string[]): string | null {
   if (naive.some((tok) => WRITE_WORDS.has(tok))) return null
   return path
 }
+
+/**
+ * Coerce the model's `args` into a clean argv. The schema asks for an ARRAY of strings, but the live
+ * model (mimo-v2.5-pro) regularly ships it as a JSON **string** once `--content` gets long — eleven
+ * sends failed overnight 2026-10-12/13 on `data/args must be array`, an operator decision packet among
+ * them, and each cost a retry round-trip or the whole act. Two shapes were observed, both repaired here:
+ *   1. the array serialised as a string: `'["messages","send","--channel","research","--content","…"]'`;
+ *   2. the same with a flag written as an object key: `'[…, "--content": "…"]'` (a colon for a comma).
+ * Anything that does not come back as a non-empty array of non-empty strings is refused with the exact
+ * shape to send — nothing is guessed, no verb or flag is ever invented. Pure; unit-tested.
+ */
+export const ARGS_SHAPE = 'args must be a JSON ARRAY of strings, e.g. ["messages","send","--channel","research","--content","text"]'
+export type CoercedArgs = { ok: true; args: string[]; repaired: boolean } | { ok: false; error: string }
+export function coerceArgs(input: unknown, max = 40): CoercedArgs {
+  const accept = (v: unknown, repaired: boolean): CoercedArgs => {
+    if (!Array.isArray(v) || v.length === 0 || v.length > max) return { ok: false, error: `${ARGS_SHAPE} (1–${max} items)` }
+    if (!v.every((a) => typeof a === 'string' && a.length > 0)) return { ok: false, error: `${ARGS_SHAPE} (every item a non-empty string)` }
+    return { ok: true, args: v as string[], repaired }
+  }
+  if (Array.isArray(input)) return accept(input, false)
+  if (typeof input !== 'string') return { ok: false, error: ARGS_SHAPE }
+  const s = input.trim()
+  if (!s.startsWith('[')) return { ok: false, error: `${ARGS_SHAPE} — got a bare string, not an array` }
+  try {
+    return accept(JSON.parse(s), true)
+  } catch {
+    /* fall through to the observed-malformation repairs */
+  }
+  // `"--flag": "value"` → `"--flag", "value"`; a stray `}` closing the array → `]`.
+  const repaired = s.replace(/"(-{1,2}[A-Za-z][\w-]*)"\s*:\s*/g, '"$1", ').replace(/"\s*\}\s*\]\s*$/, '"]')
+  try {
+    return accept(JSON.parse(repaired), true)
+  } catch {
+    return { ok: false, error: `${ARGS_SHAPE} — the string sent was not valid JSON` }
+  }
+}

@@ -105,6 +105,8 @@ function loadConfig(): Config {
 
 const cfg = loadConfig()
 const routes = openRoutesStore(cfg.routes_db)
+/** Max chars of an AMBIENT item's content (see `ChannelCfg.ambient_path`); a digest glance, not the record. */
+const AMBIENT_CONTENT_MAX = 700
 const log = (...a: unknown[]) => console.error('[buzz-ingress]', ...a)
 
 // ── buzz-cli (one-shot, JSON out) ──────────────────────────────────────────────────────────────────
@@ -396,7 +398,10 @@ async function post(ch: { id: string; name?: string }, ev: Ev, kind: 'mention' |
     event_id: ev.id,
     root,
     from: { pubkey: ev.pubkey, name: resolveName(ev.pubkey) },
-    content: ev.content,
+    // An ambient item is a glance, not the record: cap it so a 30-minute room batch of 40 worker posts
+    // stays a readable digest (the duck fetches `messages thread --event <root>` for the full text).
+    content: ambient && ev.content.length > AMBIENT_CONTENT_MAX ? ev.content.slice(0, AMBIENT_CONTENT_MAX) + ' …' : ev.content,
+    ...(ambient && ev.content.length > AMBIENT_CONTENT_MAX ? { content_truncated: true } : {}),
     // Media the trigger message carries (imeta): the duck perceives it exists (mime/dim/size/filename). Only
     // present when the message has attachments, so non-media wakes are byte-for-byte unchanged.
     ...(attachments.length ? { attachments } : {}),

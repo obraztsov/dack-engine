@@ -11,6 +11,8 @@
  *   4. POSTs a normalized stimulus to the harness's localhost webhook at a TIER-specific path
  *      (`/buzz/<tier>`). The path's tier (harness `webhooks:` map) is the seed trust; per-channel config
  *      only overrides it. All Buzz specifics live here; the Rust core just sees "a localhost webhook fired".
+ *      A `wake:'all'` room may name an `ambient_path`: overheard traffic (no mention / reply / armed thread)
+ *      goes there keyed per channel, so one slow batched duty digests the room while direct traffic stays fast.
  *
  * P0 (this file): discover + poll + detect + POST (wake & reply). Thread-spine context is P1.
  * BUZZ_PRIVATE_KEY is injected by the module's `buzz_key` secret; never logged.
@@ -32,6 +34,14 @@ interface ChannelCfg {
   // untagged question is SEEN; pair with the lane rule in the prompt so it doesn't become louder monologue);
   // 'mention' = only @-mentions / replies to own (the global `wake_on` default).
   wake?: 'all' | 'mention'
+  // AMBIENT routing (only meaningful with `wake: 'all'`): a message that is NOT a mention, NOT a reply to
+  // one of the duck's own posts and NOT in a thread the duck armed is "ambient" — overheard room traffic
+  // (a worker's progress stream, two peers talking). With `ambient_path` set, such messages are POSTed to
+  // that harness webhook path (e.g. "/buzz/org-ambient") instead of `/buzz/<tier>`, keyed PER CHANNEL
+  // (`dedup_key: buzz:chan:<id>`) and without a spine, so the duty behind that path can batch the whole
+  // room into one wake every N minutes while mentions / replies / armed threads stay on the fast path.
+  // The path's tier still comes from the harness `webhooks:` map — this never changes trust.
+  ambient_path?: string
 }
 interface Config {
   relay: string
@@ -370,12 +380,19 @@ async function post(ch: { id: string; name?: string }, ev: Ev, kind: 'mention' |
   // whole exchange lands under one runlog tag. Lookup is by thread ROOT, so every reply in the thread
   // inherits the arm, not just direct replies to our post.
   const arm = lookupArm(routes, root)
+  // AMBIENT? Overheard traffic in a `wake:'all'` room — not addressed to the duck, not a reply to it, not in
+  // a thread it armed — goes to the channel's `ambient_path` (when configured), keyed per CHANNEL so the
+  // harness folds the whole room into one slow batch; no spine (a digest reads items, the duck can
+  // `messages thread` anything it wants to see in full). Everything else stays per-thread on `/buzz/<tier>`.
+  const ambientPath = kind === 'message' && !arm ? cfgFor(ch)?.ambient_path : undefined
+  const ambient = !!ambientPath
   const attachments = parseImeta(ev) // P0: media awareness — metadata for every attachment (all mimes)
-  const media = prefetchMedia(attachments) // P2: passively fetched thumb(s)/image(s) the duck SEES on wake
-  prefetchDocsInto(attachments, ch.name) // fetch non-image docs into the workspace inbox → stamp `file` (a workspace path)
+  const media = ambient ? [] : prefetchMedia(attachments) // P2: passively fetched thumb(s)/image(s) the duck SEES on wake
+  if (!ambient) prefetchDocsInto(attachments, ch.name) // fetch non-image docs into the workspace inbox → stamp `file` (a workspace path)
   const body = {
     channel: { id: ch.id, name: ch.name ?? null },
     trigger: kind,
+    ...(ambient ? { ambient: true } : {}),
     event_id: ev.id,
     root,
     from: { pubkey: ev.pubkey, name: resolveName(ev.pubkey) },
@@ -387,8 +404,9 @@ async function post(ch: { id: string; name?: string }, ev: Ev, kind: 'mention' |
     // these onto the Perceive goal turn so the duck SEES them. Absent unless `media_prefetch` is enabled.
     ...(media.length ? { media } : {}),
     // The ancestor spine (root → … → trigger); `truncated` ⇒ a deeper middle the duck can `thread_get`.
-    spine,
-    truncated,
+    // An ambient item carries NO spine (keeps a 30-minute room batch small; `root` is there to fetch it).
+    spine: ambient ? [] : spine,
+    truncated: ambient ? false : truncated,
     // ADAPTER-AGNOSTIC reply routing as TOP-LEVEL scalars — the harness's reply-scope reads top-level
     // scalar fields (same source as scope_env) and injects them into a reply skill's `ref` args, so the duck
     // writes only the content and the harness destination-locks the target. Slack/Discord adapters fill the
@@ -396,17 +414,19 @@ async function post(ch: { id: string; name?: string }, ev: Ev, kind: 'mention' |
     conversation: ch.id,
     in_reply_to: ev.id,
     created_at: ev.created_at,
-    // Per-thread key: coalescing + sticky session fold a thread's activity into one wake.
-    dedup_key: `buzz:${root}`,
+    // Per-thread key: coalescing + sticky session fold a thread's activity into one wake. Ambient traffic is
+    // keyed per CHANNEL instead, so the whole room folds into the slow batch behind `ambient_path`.
+    dedup_key: ambient ? `buzz:chan:${ch.id}` : `buzz:${root}`,
     ...(arm ? { entry_hint: arm.entry_hint, tags: arm.tags, armed: { by: arm.armed_by.slice(0, 8), expires_at: arm.expires_at } } : {}),
   }
+  const path = ambientPath ?? `/buzz/${tier}`
   try {
-    const r = await fetch(`${cfg.harness_webhook}/buzz/${tier}`, {
+    const r = await fetch(`${cfg.harness_webhook}${path}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     })
-    log(`${kind} in ${ch.name ?? ch.id.slice(0, 8)} from ${ev.pubkey.slice(0, 8)} → /buzz/${tier}${arm ? ` [armed:${arm.entry_hint} ${arm.tags.join(',')}]` : ''} (${r.status})`)
+    log(`${ambient ? 'ambient' : kind} in ${ch.name ?? ch.id.slice(0, 8)} from ${ev.pubkey.slice(0, 8)} → ${path}${arm ? ` [armed:${arm.entry_hint} ${arm.tags.join(',')}]` : ''} (${r.status})`)
   } catch (e) {
     log('forward failed:', e)
   }

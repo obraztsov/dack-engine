@@ -8,12 +8,26 @@ describe('ingress cursor', () => {
     expect(s.seen.size).toBe(0)
   })
 
-  test('new shape round-trips and prunes seen ids by age at save time', () => {
-    const s = parseCursorState(JSON.stringify({ cursor: { c: 100 }, seen: { old: 10, fresh: 95 } }))
-    expect(s.seen.get('old')).toBe(10)
-    const out = JSON.parse(serializeCursorState(s, 100, 60))
-    expect(out).toEqual({ cursor: { c: 100 }, seen: { fresh: 95 } })
+  test('new shape round-trips; seen ids are pruned relative to the cursor, never by wall-clock age', () => {
+    // Channel cursor 1000, tolerance 120: a poll re-fetches created_at >= 880, so 'late' (900) must survive even if it
+    // is hours old by the clock; 'old' (700) can never be re-fetched and goes.
+    const s = parseCursorState(JSON.stringify({ cursor: { c: 1000, 'c:reactions': 5 }, seen: { old: 700, late: 900 } }))
+    const out = JSON.parse(serializeCursorState(s, 120))
+    expect(out).toEqual({ cursor: { c: 1000, 'c:reactions': 5 }, seen: { late: 900 } })
     expect(s.seen.has('old')).toBe(false)
+  })
+
+  test('the lowest message cursor sets the floor; maxIds drops the oldest', () => {
+    const s = parseCursorState(JSON.stringify({ cursor: { quiet: 500, busy: 5000 }, seen: { a: 400, b: 450, c: 4990, d: 5000 } }))
+    let out = JSON.parse(serializeCursorState(s, 120))
+    expect(Object.keys(out.seen).sort()).toEqual(['a', 'b', 'c', 'd']) // floor = 500-120-60 = 320 keeps all
+    out = JSON.parse(serializeCursorState(s, 120, 2))
+    expect(Object.keys(out.seen).sort()).toEqual(['c', 'd'])
+  })
+
+  test('no cursor yet → nothing pruned', () => {
+    const s = parseCursorState(JSON.stringify({ cursor: {}, seen: { x: 1 } }))
+    expect(JSON.parse(serializeCursorState(s, 120)).seen).toEqual({ x: 1 })
   })
 
   test('garbage or empty input yields an empty state', () => {

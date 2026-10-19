@@ -62,8 +62,8 @@ interface Config {
   // post advanced — without this window they are never fetched. Dedup is by persisted event id, so re-reading
   // is free of double wakes. Size it well above the worst clock skew you tolerate among peers.
   clock_skew_tolerance_secs: number
-  // How long forwarded event ids are remembered (pruned at save time, relative to the last save).
-  seen_retention_secs: number
+  // Upper bound on remembered forwarded ids (ids a poll can no longer re-fetch are pruned anyway).
+  seen_max_ids: number
   wake_on: string[] // ["mention","reply_to_own"]
   own_ids_window: number
   default_trust: string
@@ -94,7 +94,7 @@ const DEFAULTS: Config = {
   cursor_file: 'buzz-ingress.cursor',
   first_run_lookback_secs: 3600,
   clock_skew_tolerance_secs: 120,
-  seen_retention_secs: 3600,
+  seen_max_ids: 5000,
   wake_on: ['mention', 'reply_to_own'],
   own_ids_window: 500,
   default_trust: 'public',
@@ -346,7 +346,7 @@ function buildSpine(ev: Ev): { spine: SpineEv[]; truncated: boolean; root: strin
 const cursorState = parseCursorState(existsSync(cfg.cursor_file) ? readFileSync(cfg.cursor_file, 'utf8') : null)
 const cursor: Record<string, number> = cursorState.cursor
 const seen: Map<string, number> = cursorState.seen // forwarded event id → created_at
-const saveCursor = () => writeFileSync(cfg.cursor_file, serializeCursorState(cursorState, Math.floor(Date.now() / 1000), cfg.seen_retention_secs))
+const saveCursor = () => writeFileSync(cfg.cursor_file, serializeCursorState(cursorState, cfg.clock_skew_tolerance_secs, cfg.seen_max_ids))
 const ownIds = new Set<string>() // rolling window of the duck's own message ids (for reply-to-own)
 
 function rememberOwn(id: string): void {

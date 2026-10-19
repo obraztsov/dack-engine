@@ -3,8 +3,11 @@
  * the sibling of telegram-ingress: buzz-cli is one-shot, so this owns the poll loop. It:
  *   1. DISCOVERS the channels the duck is a member of (`channels list`) — membership IS the whitelist, so
  *      any channel/DM the duck is added to is watched automatically (config only OVERRIDES trust).
- *   2. POLLS each channel's history (`messages get --channel <id> --since <cursor>`) — full kind:9 events
- *      with p/e tags (the relay's `--types mentions` is NOT self-filtered, so we match tags ourselves).
+ *   2. POLLS each channel's history (`messages get --channel <id> --since <cursor - skew tolerance>`) — full
+ *      kind:9 events with p/e tags (the relay's `--types mentions` is NOT self-filtered, so we match tags
+ *      ourselves). `created_at` is the SENDER's clock: a slow-clocked peer's events can be stamped before the
+ *      cursor our own post just advanced, so the poll re-reads a tolerance window and dedups on a persisted
+ *      seen-id set (ingress-cursor.ts) instead of trusting one timeline across clocks.
  *   3. Detects a WAKE trigger — a MENTION (the duck's pubkey in the event's p-tags; a DM p-tags the
  *      recipient, so DMs are mentions) or a REPLY-TO-OWN (a reply/root e-tag → one of the duck's own recent
  *      message ids — the multi-agent coordination path, which carries no p-tag).
@@ -19,6 +22,7 @@
  */
 
 import { openRoutesStore, lookupArm, upsertChannels, upsertReactions, reactionsFor, summarizeReactions, type ReactionSummary } from './ingress-routes'
+import { parseCursorState, serializeCursorState, sinceFor } from './ingress-cursor'
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
 import { join, isAbsolute, resolve as resolvePath } from 'node:path'
 
@@ -53,6 +57,13 @@ interface Config {
   discover_interval_secs: number
   cursor_file: string
   first_run_lookback_secs: number
+  // Re-read this many seconds BEHIND the channel cursor on every poll. `created_at` is stamped by the sender's
+  // clock, so a peer running slow (pond-jarvis: −15 s) publishes events already "older" than the cursor our own
+  // post advanced — without this window they are never fetched. Dedup is by persisted event id, so re-reading
+  // is free of double wakes. Size it well above the worst clock skew you tolerate among peers.
+  clock_skew_tolerance_secs: number
+  // How long forwarded event ids are remembered (pruned at save time, relative to the last save).
+  seen_retention_secs: number
   wake_on: string[] // ["mention","reply_to_own"]
   own_ids_window: number
   default_trust: string
@@ -82,6 +93,8 @@ const DEFAULTS: Config = {
   discover_interval_secs: 60,
   cursor_file: 'buzz-ingress.cursor',
   first_run_lookback_secs: 3600,
+  clock_skew_tolerance_secs: 120,
+  seen_retention_secs: 3600,
   wake_on: ['mention', 'reply_to_own'],
   own_ids_window: 500,
   default_trust: 'public',
@@ -327,10 +340,14 @@ function buildSpine(ev: Ev): { spine: SpineEv[]; truncated: boolean; root: strin
 
 // ── cursor + own-id state ──────────────────────────────────────────────────────────────────────────
 
-let cursor: Record<string, number> = existsSync(cfg.cursor_file) ? JSON.parse(readFileSync(cfg.cursor_file, 'utf8')) : {}
-const saveCursor = () => writeFileSync(cfg.cursor_file, JSON.stringify(cursor))
+// Cursor (newest created_at per key) + the PERSISTED set of forwarded event ids. The poll deliberately re-reads
+// `clock_skew_tolerance_secs` behind the cursor, so the seen-set — not the timeline — is what prevents a double
+// wake; persisting it also stops a restart from replaying the window.
+const cursorState = parseCursorState(existsSync(cfg.cursor_file) ? readFileSync(cfg.cursor_file, 'utf8') : null)
+const cursor: Record<string, number> = cursorState.cursor
+const seen: Map<string, number> = cursorState.seen // forwarded event id → created_at
+const saveCursor = () => writeFileSync(cfg.cursor_file, serializeCursorState(cursorState, Math.floor(Date.now() / 1000), cfg.seen_retention_secs))
 const ownIds = new Set<string>() // rolling window of the duck's own message ids (for reply-to-own)
-const seen = new Set<string>() // event ids already forwarded (in-process dedup)
 
 function rememberOwn(id: string): void {
   ownIds.add(id)
@@ -438,8 +455,7 @@ async function post(ch: { id: string; name?: string }, ev: Ev, kind: 'mention' |
 }
 
 async function pollChannel(ch: { id: string; name?: string }): Promise<void> {
-  const first = cursor[ch.id] === undefined
-  const since = first ? Math.floor(Date.now() / 1000) - cfg.first_run_lookback_secs : cursor[ch.id]
+  const since = sinceFor(cursor[ch.id], Math.floor(Date.now() / 1000), cfg.clock_skew_tolerance_secs, cfg.first_run_lookback_secs)
   const evs: Ev[] = buzz(['messages', 'get', '--channel', ch.id, '--since', String(since)]) ?? []
   if (!Array.isArray(evs)) return
   // Oldest → newest so a thread's cursor advances monotonically.
@@ -458,7 +474,7 @@ async function pollChannel(ch: { id: string; name?: string }): Promise<void> {
     // the duck SEES it — a peer's untagged question used to be invisible here.
     const isAll = cfgFor(ch)?.wake === 'all'
     if (isMention || isReply || isAll) {
-      seen.add(ev.id)
+      seen.set(ev.id, ev.created_at)
       await post(ch, ev, isMention ? 'mention' : isReply ? 'reply_to_own' : 'message')
     }
   }
@@ -470,8 +486,8 @@ async function pollChannel(ch: { id: string; name?: string }): Promise<void> {
  *  Own cursor key: a reaction's time must not move the message cursor. */
 function pollReactions(ch: { id: string; name?: string }): void {
   const key = `${ch.id}:reactions`
-  const first = cursor[key] === undefined
-  const since = first ? Math.floor(Date.now() / 1000) - cfg.first_run_lookback_secs : cursor[key]
+  // Same skew window as messages; the store's INSERT … ON CONFLICT DO NOTHING is the dedup (only new rows count).
+  const since = sinceFor(cursor[key], Math.floor(Date.now() / 1000), cfg.clock_skew_tolerance_secs, cfg.first_run_lookback_secs)
   const evs: Ev[] = buzz(['messages', 'get', '--channel', ch.id, '--since', String(since), '--kinds', '7']) ?? []
   if (!Array.isArray(evs) || !evs.length) return
   const rows = evs

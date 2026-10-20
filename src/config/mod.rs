@@ -243,6 +243,9 @@ fn default_reflect_interval() -> i64 {
 fn default_queue_max_depth() -> Option<usize> {
     Some(10_000)
 }
+fn default_session_max_context_tokens() -> Option<u64> {
+    Some(256_000)
+}
 fn default_session_ttl() -> i64 {
     3_600 // one hour idle before a sticky session is dropped.
 }
@@ -545,6 +548,19 @@ pub enum Connector {
         /// tool-calling) but is a distinct request/stream path, so default to chat completions.
         #[serde(default)]
         api_format: ApiFormat,
+        /// **Context window per model** (tokens) → `CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS` (a JSON map the
+        /// SDK matches by exact model name, else longest prefix). The SDK only knows its own catalog: a
+        /// model name it does not recognise gets a **128k fallback window**, and the SDK refuses to resume
+        /// a sticky session past that window minus its reserves (~105k) with a synthetic "Prompt is too
+        /// long" — no API call, the cycle is lost, and the session stays dead until the idle TTL. Set the
+        /// provider's real window here so `session_max_context_tokens` is what bounds a session.
+        /// Example: `{ deepseek-flash: 1048576 }`.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        context_windows: BTreeMap<String, u64>,
+        /// **Fallback context window** (tokens) for models absent from both the SDK catalog and
+        /// `context_windows` → `CLAUDE_CODE_OPENAI_FALLBACK_CONTEXT_WINDOW` (the SDK's own default is 128k).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fallback_context_window: Option<u64>,
     },
     /// Native Anthropic catalog: the model is `options.model`. NOT YET WIRED (`cli::run` rejects it).
     Anthropic {
@@ -578,7 +594,7 @@ impl ApiFormat {
 
 impl Default for Connector {
     fn default() -> Self {
-        Connector::OpenaiCompatible { api_url: None, api_key: None, api_format: ApiFormat::ChatCompletions }
+        Connector::OpenaiCompatible { api_url: None, api_key: None, api_format: ApiFormat::ChatCompletions, context_windows: BTreeMap::new(), fallback_context_window: None }
     }
 }
 
@@ -594,7 +610,7 @@ impl Connector {
     /// cred falls through to whatever the forwarded env supplies. The key never reaches agent context.
     pub fn env_overrides(&self) -> Vec<(String, String)> {
         match self {
-            Connector::OpenaiCompatible { api_url, api_key, api_format } => {
+            Connector::OpenaiCompatible { api_url, api_key, api_format, context_windows, fallback_context_window } => {
                 // The OpenAI-compat path REQUIRES this flag; the connector owns it (no env reliance).
                 // OPENAI_API_FORMAT is set explicitly (default `chat_completions`) so the wire API is
                 // deterministic — the connector owns it, not ambient env.
@@ -607,6 +623,17 @@ impl Connector {
                 }
                 if let Some(k) = api_key {
                     env.push(("OPENAI_API_KEY".to_string(), k.clone()));
+                }
+                // The model's context window, so the SDK's pre-flight limit reflects the provider rather
+                // than its 128k unknown-model fallback (a BTreeMap serialises in a stable key order).
+                if !context_windows.is_empty() {
+                    env.push((
+                        "CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS".to_string(),
+                        serde_json::to_string(context_windows).expect("a map of strings to integers is always JSON"),
+                    ));
+                }
+                if let Some(w) = fallback_context_window {
+                    env.push(("CLAUDE_CODE_OPENAI_FALLBACK_CONTEXT_WINDOW".to_string(), w.to_string()));
                 }
                 env
             }
@@ -713,8 +740,13 @@ pub struct DackConfig {
     /// **Sticky-session context-size cap** (tokens): after a resume whose context (input + cache-read
     /// tokens) exceeds this, the session is EVICTED so the next wake starts fresh — bounding cost and the
     /// bloat that drives confabulation (a fresh session reconstructs via the conversation runlog view).
-    /// `None` (default) = size-eviction off (only the idle TTL applies). Set it in the operator config.
-    #[serde(default)]
+    /// **Default 256k**: a session that is never evicted grows until the SDK refuses to resume it
+    /// ("Prompt is too long" without an API call) and then EVERY wake on that thread is lost until the
+    /// idle TTL — a busy thread never idles, so the duck goes deaf there. The cap must sit BELOW the
+    /// window the SDK applies to the model (its catalog value, `runtime.connector.context_windows`, or
+    /// the 128k unknown-model fallback) minus ~25k of SDK reserves. `null` = off (only the idle TTL
+    /// applies) — not recommended.
+    #[serde(default = "default_session_max_context_tokens")]
     pub session_max_context_tokens: Option<u64>,
     /// **Max concurrent consciousness cycles** — the bounded worker pool for the multithreaded dispatch
     /// loop. `1` (DEFAULT) = single-flight, byte-identical to the pre-MT serial behavior. `>1` runs
@@ -1376,11 +1408,11 @@ secrets:
     #[test]
     fn connector_channel_and_empty_creds_fall_through() {
         // opengateway → OPENAI_MODEL env channel; anthropic → options.model.
-        assert!(Connector::OpenaiCompatible { api_url: None, api_key: None, api_format: ApiFormat::ChatCompletions }.model_via_openai_env());
+        assert!(Connector::OpenaiCompatible { api_url: None, api_key: None, api_format: ApiFormat::ChatCompletions, context_windows: BTreeMap::new(), fallback_context_window: None }.model_via_openai_env());
         assert!(!Connector::Anthropic { api_key: None }.model_via_openai_env());
         // With no inline creds, opengateway still sets the required flag + the wire-API format but no
         // base-URL/key (those fall through to the forwarded env). Default format = chat_completions.
-        let ov = Connector::OpenaiCompatible { api_url: None, api_key: None, api_format: ApiFormat::ChatCompletions }.env_overrides();
+        let ov = Connector::OpenaiCompatible { api_url: None, api_key: None, api_format: ApiFormat::ChatCompletions, context_windows: BTreeMap::new(), fallback_context_window: None }.env_overrides();
         assert_eq!(
             ov,
             vec![
@@ -1389,8 +1421,40 @@ secrets:
             ]
         );
         // The responses toggle flips only OPENAI_API_FORMAT.
-        let ovr = Connector::OpenaiCompatible { api_url: None, api_key: None, api_format: ApiFormat::Responses }.env_overrides();
+        let ovr = Connector::OpenaiCompatible { api_url: None, api_key: None, api_format: ApiFormat::Responses, context_windows: BTreeMap::new(), fallback_context_window: None }.env_overrides();
         assert!(ovr.contains(&("OPENAI_API_FORMAT".to_string(), "responses".to_string())));
+    }
+
+    #[test]
+    fn connector_context_windows_reach_the_sdk_as_json_env() {
+        // A model the SDK does not know gets its 128k fallback window and refuses to resume a session past
+        // ~105k ("Prompt is too long", no API call). The connector forwards the provider's real window as
+        // the SDK's JSON map env (stable key order) + the optional fallback override.
+        let cfg = DackConfig::from_yaml(
+            "operator_did: \"did:x\"\nruntime:\n  connector: { type: openai-compatible, api_url: \"https://api.deepseek.com/v1\", context_windows: { deepseek-flash: 1048576, deepseek-v4-pro: 1048576 }, fallback_context_window: 200000 }\n",
+        )
+        .unwrap();
+        let ov = cfg.runtime.connector.env_overrides();
+        assert!(ov.contains(&(
+            "CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS".to_string(),
+            "{\"deepseek-flash\":1048576,\"deepseek-v4-pro\":1048576}".to_string()
+        )));
+        assert!(ov.contains(&("CLAUDE_CODE_OPENAI_FALLBACK_CONTEXT_WINDOW".to_string(), "200000".to_string())));
+        // Absent → no env at all (the SDK keeps its own catalog/fallback); the round-trip stays clean.
+        let plain = DackConfig::from_yaml("operator_did: \"did:x\"\n").unwrap();
+        assert!(!plain.runtime.connector.env_overrides().iter().any(|(k, _)| k.starts_with("CLAUDE_CODE_OPENAI_")));
+    }
+
+    #[test]
+    fn session_cap_defaults_to_256k_and_null_turns_it_off() {
+        // The cap is on by default so an un-tuned config can never grow a sticky session until the SDK
+        // refuses to resume it; an explicit `null` still turns size-eviction off.
+        let cfg = DackConfig::from_yaml("operator_did: \"did:x\"\n").unwrap();
+        assert_eq!(cfg.session_max_context_tokens, Some(256_000));
+        let off = DackConfig::from_yaml("operator_did: \"did:x\"\nsession_max_context_tokens: null\n").unwrap();
+        assert_eq!(off.session_max_context_tokens, None);
+        let set = DackConfig::from_yaml("operator_did: \"did:x\"\nsession_max_context_tokens: 800000\n").unwrap();
+        assert_eq!(set.session_max_context_tokens, Some(800_000));
     }
 
     #[test]

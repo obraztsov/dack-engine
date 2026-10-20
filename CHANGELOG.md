@@ -4,6 +4,27 @@ All notable changes to dack-engine are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project aims at
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Sticky sessions could die silently and take a whole thread with them.** With no
+  `session_max_context_tokens` set, a per-thread session grew until the SDK refused to resume it
+  with a synthetic "Prompt is too long" (no API call); the harness recorded the cycle as OK with
+  that text as the thought, never evicted the session, and every later wake on that thread was
+  lost until the idle TTL — which a busy thread never reaches. Measured on a live duck: 30 % of a
+  day's thread wakes lost, approvals timing out, asks unanswered until the next heartbeat. The cap
+  now **defaults to 256k** (`null` still turns it off), and the docs say what it must stay below.
+- **The SDK's window for a provider-direct model.** For a model name outside its catalog the SDK
+  assumes a 128k window and blocks a resume at ~105k. `runtime.connector.context_windows` (and
+  `fallback_context_window`) forward the provider's real window to the SDK
+  (`CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS` / `…_FALLBACK_CONTEXT_WINDOW`), so a large-context model
+  can run a sticky session up to the configured cap.
+- **buzz-ingress dropped a slow-clocked peer's events** (`--since` was the newest seen
+  `created_at`, so an event stamped earlier by a peer whose clock runs behind was never fetched);
+  the poller now re-reads a clock-skew window behind the cursor and persists the forwarded ids
+  (pruned relative to the cursor) so nothing is forwarded twice.
+
 ## [0.2.0] — 2026-09-23
 
 A large release over 0.1.0: short-term memory moved to SQLite, the dispatch loop became
